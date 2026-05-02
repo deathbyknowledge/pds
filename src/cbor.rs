@@ -81,6 +81,18 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_json_object_records() {
+        let record = serde_json::json!({
+            "$type": "app.gsv.feed.post",
+            "text": "hello"
+        });
+        let bytes = encode_dag_cbor(&record).unwrap();
+        let decoded: serde_json::Value = decode_dag_cbor(&bytes).unwrap();
+
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
     fn encoded_block_includes_matching_cid() {
         let record = SimpleRecord {
             record_type: "app.gsv.feed.post".to_string(),

@@ -4,11 +4,15 @@ pub mod cid;
 pub mod commit;
 pub mod data_model;
 pub mod diagnostics;
+pub mod do_schema;
 pub mod model;
 pub mod mst;
 pub mod repo;
 pub mod service;
 pub mod storage;
+
+#[cfg(target_arch = "wasm32")]
+mod do_store;
 
 #[cfg(target_arch = "wasm32")]
 mod worker_entry;

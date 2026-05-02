@@ -5,15 +5,21 @@ use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::cid::{dag_cbor_cid, verify_repo_block_cid, Cid, CidError};
-use crate::data_model::{Nsid, RepoPath};
+use crate::data_model::{DataModelError, Nsid, RepoPath};
 
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error(transparent)]
     Cid(#[from] CidError),
 
+    #[error(transparent)]
+    DataModel(#[from] DataModelError),
+
     #[error("block `{cid}` already exists with different bytes")]
     ConflictingBlock { cid: Cid },
+
+    #[error("storage backend error: {0}")]
+    Backend(String),
 }
 
 pub trait RepoBlockStore {

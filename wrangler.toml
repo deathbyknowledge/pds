@@ -6,6 +6,15 @@ workers_dev = false
 [build]
 command = "worker-build --release ."
 
+[durable_objects]
+bindings = [
+  { name = "REPO_OBJECTS", class_name = "RepoObject" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RepoObject"]
+
 [observability]
 [observability.logs]
 enabled = true
