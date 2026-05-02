@@ -938,6 +938,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde-wasm-bindgen",
+ "serde_bytes",
  "serde_ipld_dagcbor",
  "serde_json",
  "sha2",

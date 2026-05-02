@@ -1,6 +1,7 @@
 pub mod car;
 pub mod cbor;
 pub mod cid;
+pub mod commit;
 pub mod data_model;
 pub mod diagnostics;
 pub mod model;
