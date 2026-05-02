@@ -10,6 +10,7 @@ pub mod mst;
 pub mod repo;
 pub mod service;
 pub mod storage;
+pub mod xrpc;
 
 #[cfg(target_arch = "wasm32")]
 mod do_store;

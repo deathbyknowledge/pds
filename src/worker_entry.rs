@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -6,10 +8,17 @@ use worker::{
     State,
 };
 
+use crate::cid::parse_cid;
 use crate::commit::{CommitSigner, Did, RepoRev};
-use crate::data_model::{Nsid, RepoPath};
+use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{RepoStateRow, SqlRepoStore};
 use crate::repo::{RepoError, RepoMutation, SignedRepository};
+use crate::xrpc::{
+    at_uri, optional_param, parse_list_records_params, required_param, route_xrpc_method,
+    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_LIST_RECORDS, SERVER_DESCRIBE_SERVER,
+    SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD,
+};
+use crate::xrpc::{XrpcError, XrpcRoute};
 
 #[event(fetch)]
 async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<Response> {
@@ -19,6 +28,33 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
         .trim_start_matches('/')
         .split('/')
         .collect::<Vec<_>>();
+
+    if parts.len() >= 2 && parts[0] == "xrpc" && !parts[1].is_empty() {
+        let query = query_pairs(&url);
+        return match route_xrpc_method(parts[1], &query) {
+            Ok(XrpcRoute::Worker) => describe_server(&url),
+            Ok(XrpcRoute::RepoObject { name }) => {
+                let namespace = env.durable_object("REPO_OBJECTS")?;
+                let id = namespace.id_from_name(&name)?;
+                let stub = id.get_stub()?;
+                stub.fetch_with_request(req).await
+            }
+            Ok(XrpcRoute::Unsupported) => json_response(
+                404,
+                &json!({
+                    "error": "MethodNotFound",
+                    "message": format!("unsupported XRPC method `{}`", parts[1]),
+                }),
+            ),
+            Err(error) => json_response(
+                400,
+                &json!({
+                    "error": "InvalidRequest",
+                    "message": error.to_string(),
+                }),
+            ),
+        };
+    }
 
     if parts.len() >= 2 && parts[0] == "repos" && !parts[1].is_empty() {
         let namespace = env.durable_object("REPO_OBJECTS")?;
@@ -40,7 +76,12 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "recordUpdate": "PUT /repos/:name/records",
                 "recordDelete": "DELETE /repos/:name/records",
                 "recordRead": "GET /repos/:name/records?path=collection/rkey",
-                "recordList": "GET /repos/:name/records?collection=nsid"
+                "recordList": "GET /repos/:name/records?collection=nsid",
+                "xrpcDescribeServer": "GET /xrpc/com.atproto.server.describeServer",
+                "xrpcDescribeRepo": "GET /xrpc/com.atproto.repo.describeRepo?repo=:repo",
+                "xrpcGetRecord": "GET /xrpc/com.atproto.repo.getRecord?repo=:repo&collection=:nsid&rkey=:rkey",
+                "xrpcListRecords": "GET /xrpc/com.atproto.repo.listRecords?repo=:repo&collection=:nsid",
+                "xrpcGetLatestCommit": "GET /xrpc/com.atproto.sync.getLatestCommit?did=:did"
             }
         }),
     )
@@ -89,6 +130,10 @@ impl RepoObject {
             .trim_start_matches('/')
             .split('/')
             .collect::<Vec<_>>();
+        if parts.len() >= 2 && parts[0] == "xrpc" && !parts[1].is_empty() {
+            return self.handle_xrpc(req.method(), parts[1], &url).await;
+        }
+
         let action = parts.get(2).copied().unwrap_or("");
 
         match (req.method(), action) {
@@ -104,6 +149,27 @@ impl RepoObject {
 
     fn store(&self) -> SqlRepoStore {
         SqlRepoStore::new(self.sql.clone())
+    }
+
+    async fn handle_xrpc(
+        &self,
+        method: Method,
+        xrpc_method: &str,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        if method != Method::Get {
+            return Err(HttpError::new(405, "method not allowed"));
+        }
+
+        match xrpc_method {
+            REPO_DESCRIBE_REPO => self.xrpc_describe_repo(url).await,
+            REPO_GET_RECORD => self.xrpc_get_record(url).await,
+            REPO_LIST_RECORDS => self.xrpc_list_records(url).await,
+            SYNC_GET_LATEST_COMMIT => self.xrpc_get_latest_commit(url),
+            SYNC_GET_RECORD => self.xrpc_get_sync_record(url),
+            SERVER_DESCRIBE_SERVER => describe_server(url).map_err(HttpError::worker),
+            _ => Err(HttpError::new(404, "unsupported XRPC method")),
+        }
     }
 
     fn status(&self) -> Result<Response, HttpError> {
@@ -124,6 +190,169 @@ impl RepoObject {
             }),
         )
         .map_err(HttpError::worker)
+    }
+
+    async fn xrpc_describe_repo(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let repo_param = required_param(&params, "repo").map_err(HttpError::xrpc)?;
+        let (state, mut repo) = self.open_repo_with_state()?;
+        let entries = repo.entries().await.map_err(HttpError::repo)?;
+        let collections = entries
+            .into_iter()
+            .map(|entry| entry.path.collection.to_string())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        json_response(
+            200,
+            &json!({
+                "handle": repo_param,
+                "did": state.did.to_string(),
+                "didDoc": did_document(state.did.as_str(), &request_origin(url)),
+                "collections": collections,
+                "handleIsCorrect": false,
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    async fn xrpc_get_record(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        required_param(&params, "repo").map_err(HttpError::xrpc)?;
+        let collection = Nsid::new(required_param(&params, "collection").map_err(HttpError::xrpc)?)
+            .map_err(HttpError::bad_request)?;
+        let rkey = RecordKey::new(required_param(&params, "rkey").map_err(HttpError::xrpc)?)
+            .map_err(HttpError::bad_request)?;
+        let expected_cid = optional_param(&params, "cid")
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_cid(&value).map_err(HttpError::bad_request))
+            .transpose()?;
+        let path = RepoPath::new(collection, rkey);
+
+        let (state, mut repo) = self.open_repo_with_state()?;
+        let Some(stored) = repo
+            .get_record::<Value>(&path)
+            .await
+            .map_err(HttpError::repo)?
+        else {
+            return Err(HttpError::new(404, "record not found"));
+        };
+        if expected_cid.is_some_and(|cid| cid != stored.cid) {
+            return Err(HttpError::new(404, "record not found"));
+        }
+
+        json_response(
+            200,
+            &json!({
+                "uri": at_uri(
+                    state.did.as_str(),
+                    stored.path.collection.as_str(),
+                    stored.path.rkey.as_str()
+                ),
+                "cid": stored.cid.to_string(),
+                "value": stored.record,
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    async fn xrpc_list_records(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        required_param(&params, "repo").map_err(HttpError::xrpc)?;
+        let list_params = parse_list_records_params(&params).map_err(HttpError::xrpc)?;
+        let collection = Nsid::new(list_params.collection).map_err(HttpError::bad_request)?;
+        let (state, mut repo) = self.open_repo_with_state()?;
+        let mut entries = repo
+            .entries_for_collection(&collection)
+            .await
+            .map_err(HttpError::repo)?;
+        if list_params.reverse {
+            entries.reverse();
+        }
+
+        let start = list_params
+            .cursor
+            .as_deref()
+            .and_then(|cursor| {
+                entries
+                    .iter()
+                    .position(|entry| entry.path.as_mst_key() == cursor)
+            })
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let entry_count = entries.len();
+        let selected = entries
+            .into_iter()
+            .skip(start)
+            .take(list_params.limit)
+            .collect::<Vec<_>>();
+        let next_cursor = if entry_count > start + selected.len() {
+            selected.last().map(|entry| entry.path.as_mst_key())
+        } else {
+            None
+        };
+
+        let mut records = Vec::with_capacity(selected.len());
+        for entry in &selected {
+            let Some(stored) = repo
+                .get_record::<Value>(&entry.path)
+                .await
+                .map_err(HttpError::repo)?
+            else {
+                return Err(HttpError::new(
+                    500,
+                    "record index points to a missing MST entry",
+                ));
+            };
+            records.push(json!({
+                "uri": at_uri(
+                    state.did.as_str(),
+                    stored.path.collection.as_str(),
+                    stored.path.rkey.as_str()
+                ),
+                "cid": stored.cid.to_string(),
+                "value": stored.record,
+            }));
+        }
+
+        json_response(
+            200,
+            &json!({
+                "records": records,
+                "cursor": next_cursor,
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn xrpc_get_latest_commit(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
+        let state = self.repo_state()?;
+        if state.did.as_str() != did {
+            return Err(HttpError::new(404, "repo not found"));
+        }
+
+        json_response(
+            200,
+            &json!({
+                "cid": state.latest_commit.to_string(),
+                "rev": state.latest_rev.to_string(),
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn xrpc_get_sync_record(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        required_param(&params, "did").map_err(HttpError::xrpc)?;
+        required_param(&params, "collection").map_err(HttpError::xrpc)?;
+        required_param(&params, "rkey").map_err(HttpError::xrpc)?;
+        Err(HttpError::new(
+            501,
+            "com.atproto.sync.getRecord requires CAR proof export, which is not implemented yet",
+        ))
     }
 
     async fn init(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -261,11 +490,29 @@ impl RepoObject {
     }
 
     fn open_repo(&self) -> Result<SignedRepository<SqlRepoStore>, HttpError> {
+        let (_, repo) = self.open_repo_with_state()?;
+        Ok(repo)
+    }
+
+    fn open_repo_with_state(
+        &self,
+    ) -> Result<(RepoStateRow, SignedRepository<SqlRepoStore>), HttpError> {
         let store = self.store();
-        let Some(state) = store.get_repo_state().map_err(HttpError::worker)? else {
-            return Err(HttpError::new(404, "repo not initialized"));
-        };
-        SignedRepository::open(store, state.latest_commit).map_err(HttpError::repo)
+        let state = self.repo_state_from(&store)?;
+        let repo = SignedRepository::open(store, state.latest_commit).map_err(HttpError::repo)?;
+        Ok((state, repo))
+    }
+
+    fn repo_state(&self) -> Result<RepoStateRow, HttpError> {
+        let store = self.store();
+        self.repo_state_from(&store)
+    }
+
+    fn repo_state_from(&self, store: &SqlRepoStore) -> Result<RepoStateRow, HttpError> {
+        store
+            .get_repo_state()
+            .map_err(HttpError::worker)?
+            .ok_or_else(|| HttpError::new(404, "repo not initialized"))
     }
 
     fn persist_mutation(
@@ -336,6 +583,10 @@ impl HttpError {
         Self::new(500, error.to_string())
     }
 
+    fn xrpc(error: XrpcError) -> Self {
+        Self::new(400, error.to_string())
+    }
+
     fn repo(error: RepoError) -> Self {
         match error {
             RepoError::RecordAlreadyExists { .. } => Self::new(409, error.to_string()),
@@ -360,6 +611,51 @@ fn mutation_response(path: &RepoPath, mutation: &RepoMutation) -> Value {
         "mstRoot": mutation.mst_root.to_string(),
         "prev": mutation.commit.prev.map(|cid| cid.to_string()),
     })
+}
+
+fn describe_server(_url: &worker::Url) -> worker::Result<Response> {
+    json_response(
+        200,
+        &json!({
+            "did": "did:gsv:pds",
+            "availableUserDomains": [],
+            "inviteCodeRequired": false,
+            "phoneVerificationRequired": false,
+            "links": {},
+            "contact": {},
+        }),
+    )
+}
+
+fn did_document(did: &str, service_endpoint: &str) -> Value {
+    json!({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        "id": did,
+        "service": [{
+            "id": "#atproto_pds",
+            "type": "AtprotoPersonalDataServer",
+            "serviceEndpoint": service_endpoint,
+        }],
+    })
+}
+
+fn query_pairs(url: &worker::Url) -> Vec<(String, String)> {
+    url.query_pairs()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+fn request_origin(url: &worker::Url) -> String {
+    let mut origin = format!(
+        "{}://{}",
+        url.scheme(),
+        url.host_str().unwrap_or("localhost")
+    );
+    if let Some(port) = url.port() {
+        origin.push(':');
+        origin.push_str(&port.to_string());
+    }
+    origin
 }
 
 fn json_response(status: u16, value: &impl Serialize) -> worker::Result<Response> {

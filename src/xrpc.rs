@@ -1,0 +1,240 @@
+//! XRPC routing and query parameter helpers.
+
+use thiserror::Error;
+
+pub const SERVER_DESCRIBE_SERVER: &str = "com.atproto.server.describeServer";
+pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
+pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
+pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
+pub const SYNC_GET_LATEST_COMMIT: &str = "com.atproto.sync.getLatestCommit";
+pub const SYNC_GET_RECORD: &str = "com.atproto.sync.getRecord";
+
+const DEFAULT_LIST_LIMIT: usize = 50;
+const MAX_LIST_LIMIT: usize = 100;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum XrpcRoute {
+    Worker,
+    RepoObject { name: String },
+    Unsupported,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListRecordsParams {
+    pub collection: String,
+    pub limit: usize,
+    pub cursor: Option<String>,
+    pub reverse: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum XrpcError {
+    #[error("missing required query parameter `{param}`")]
+    MissingParam { param: &'static str },
+
+    #[error("empty query parameter `{param}`")]
+    EmptyParam { param: &'static str },
+
+    #[error("invalid limit `{value}`: expected an integer from 1 to {max}")]
+    InvalidLimit { value: String, max: usize },
+
+    #[error("invalid boolean `{param}` value `{value}`: expected `true` or `false`")]
+    InvalidBoolean { param: &'static str, value: String },
+}
+
+pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<XrpcRoute, XrpcError> {
+    match method {
+        SERVER_DESCRIBE_SERVER => Ok(XrpcRoute::Worker),
+        REPO_DESCRIBE_REPO | REPO_GET_RECORD | REPO_LIST_RECORDS => {
+            let repo = required_param(query, "repo")?;
+            Ok(XrpcRoute::RepoObject {
+                name: repo_object_name_from_identifier(&repo),
+            })
+        }
+        SYNC_GET_LATEST_COMMIT | SYNC_GET_RECORD => {
+            let did = required_param(query, "did")?;
+            Ok(XrpcRoute::RepoObject {
+                name: repo_object_name_from_identifier(&did),
+            })
+        }
+        _ => Ok(XrpcRoute::Unsupported),
+    }
+}
+
+pub fn parse_list_records_params(
+    query: &[(String, String)],
+) -> Result<ListRecordsParams, XrpcError> {
+    Ok(ListRecordsParams {
+        collection: required_param(query, "collection")?,
+        limit: parse_limit(optional_param(query, "limit").as_deref())?,
+        cursor: optional_param(query, "cursor").filter(|value| !value.is_empty()),
+        reverse: parse_bool_param(query, "reverse")?,
+    })
+}
+
+pub fn required_param(
+    query: &[(String, String)],
+    param: &'static str,
+) -> Result<String, XrpcError> {
+    let value = query
+        .iter()
+        .find(|(key, _)| key == param)
+        .map(|(_, value)| value.trim().to_string())
+        .ok_or(XrpcError::MissingParam { param })?;
+    if value.is_empty() {
+        return Err(XrpcError::EmptyParam { param });
+    }
+    Ok(value)
+}
+
+pub fn optional_param(query: &[(String, String)], param: &str) -> Option<String> {
+    query
+        .iter()
+        .find(|(key, _)| key == param)
+        .map(|(_, value)| value.to_string())
+}
+
+pub fn repo_object_name_from_identifier(identifier: &str) -> String {
+    identifier
+        .strip_prefix("did:gsv:")
+        .unwrap_or(identifier)
+        .to_string()
+}
+
+pub fn at_uri(did: &str, collection: &str, rkey: &str) -> String {
+    format!("at://{did}/{collection}/{rkey}")
+}
+
+fn parse_limit(value: Option<&str>) -> Result<usize, XrpcError> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_LIST_LIMIT);
+    };
+
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| XrpcError::InvalidLimit {
+            value: value.to_string(),
+            max: MAX_LIST_LIMIT,
+        })?;
+    if !(1..=MAX_LIST_LIMIT).contains(&limit) {
+        return Err(XrpcError::InvalidLimit {
+            value: value.to_string(),
+            max: MAX_LIST_LIMIT,
+        });
+    }
+    Ok(limit)
+}
+
+fn parse_bool_param(query: &[(String, String)], param: &'static str) -> Result<bool, XrpcError> {
+    match optional_param(query, param).as_deref() {
+        None | Some("") | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(value) => Err(XrpcError::InvalidBoolean {
+            param,
+            value: value.to_string(),
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn query(params: &[(&str, &str)]) -> Vec<(String, String)> {
+        params
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn routes_server_describe_to_worker() {
+        assert_eq!(
+            route_xrpc_method(SERVER_DESCRIBE_SERVER, &[]).unwrap(),
+            XrpcRoute::Worker
+        );
+    }
+
+    #[test]
+    fn routes_repo_methods_to_repo_object_by_repo() {
+        assert_eq!(
+            route_xrpc_method(REPO_GET_RECORD, &query(&[("repo", "alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn routes_gsv_dids_to_their_local_repo_name() {
+        assert_eq!(
+            route_xrpc_method(SYNC_GET_LATEST_COMMIT, &query(&[("did", "did:gsv:alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn requires_repo_identifier_for_repo_methods() {
+        assert_eq!(
+            route_xrpc_method(REPO_LIST_RECORDS, &[]).unwrap_err(),
+            XrpcError::MissingParam { param: "repo" }
+        );
+    }
+
+    #[test]
+    fn parses_list_records_defaults() {
+        assert_eq!(
+            parse_list_records_params(&query(&[("collection", "app.gsv.feed.post")])).unwrap(),
+            ListRecordsParams {
+                collection: "app.gsv.feed.post".to_string(),
+                limit: 50,
+                cursor: None,
+                reverse: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_list_records_cursor_limit_and_reverse() {
+        assert_eq!(
+            parse_list_records_params(&query(&[
+                ("collection", "app.gsv.feed.post"),
+                ("cursor", "app.gsv.feed.post/1"),
+                ("limit", "2"),
+                ("reverse", "true"),
+            ]))
+            .unwrap(),
+            ListRecordsParams {
+                collection: "app.gsv.feed.post".to_string(),
+                limit: 2,
+                cursor: Some("app.gsv.feed.post/1".to_string()),
+                reverse: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_list_limits() {
+        assert_eq!(
+            parse_list_records_params(&query(&[
+                ("collection", "app.gsv.feed.post"),
+                ("limit", "101"),
+            ]))
+            .unwrap_err(),
+            XrpcError::InvalidLimit {
+                value: "101".to_string(),
+                max: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn builds_at_uris() {
+        assert_eq!(
+            at_uri("did:gsv:alice", "app.gsv.feed.post", "one"),
+            "at://did:gsv:alice/app.gsv.feed.post/one"
+        );
+    }
+}
