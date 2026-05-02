@@ -8,6 +8,7 @@ pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
 pub const SYNC_GET_LATEST_COMMIT: &str = "com.atproto.sync.getLatestCommit";
 pub const SYNC_GET_RECORD: &str = "com.atproto.sync.getRecord";
+pub const SYNC_GET_REPO: &str = "com.atproto.sync.getRepo";
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 100;
@@ -51,7 +52,7 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
                 name: repo_object_name_from_identifier(&repo),
             })
         }
-        SYNC_GET_LATEST_COMMIT | SYNC_GET_RECORD => {
+        SYNC_GET_LATEST_COMMIT | SYNC_GET_RECORD | SYNC_GET_REPO => {
             let did = required_param(query, "did")?;
             Ok(XrpcRoute::RepoObject {
                 name: repo_object_name_from_identifier(&did),
@@ -169,6 +170,22 @@ mod tests {
     fn routes_gsv_dids_to_their_local_repo_name() {
         assert_eq!(
             route_xrpc_method(SYNC_GET_LATEST_COMMIT, &query(&[("did", "did:gsv:alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn routes_sync_car_methods_to_repo_object_by_did() {
+        assert_eq!(
+            route_xrpc_method(SYNC_GET_REPO, &query(&[("did", "did:gsv:alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            route_xrpc_method(SYNC_GET_RECORD, &query(&[("did", "did:gsv:alice")])).unwrap(),
             XrpcRoute::RepoObject {
                 name: "alice".to_string()
             }

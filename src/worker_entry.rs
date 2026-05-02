@@ -8,6 +8,7 @@ use worker::{
     State,
 };
 
+use crate::car::{encode_car_from_store, CarError};
 use crate::cid::parse_cid;
 use crate::commit::{CommitSigner, Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
@@ -16,7 +17,7 @@ use crate::repo::{RepoError, RepoMutation, SignedRepository};
 use crate::xrpc::{
     at_uri, optional_param, parse_list_records_params, required_param, route_xrpc_method,
     REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_LIST_RECORDS, SERVER_DESCRIBE_SERVER,
-    SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD,
+    SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
 };
 use crate::xrpc::{XrpcError, XrpcRoute};
 
@@ -81,7 +82,9 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcDescribeRepo": "GET /xrpc/com.atproto.repo.describeRepo?repo=:repo",
                 "xrpcGetRecord": "GET /xrpc/com.atproto.repo.getRecord?repo=:repo&collection=:nsid&rkey=:rkey",
                 "xrpcListRecords": "GET /xrpc/com.atproto.repo.listRecords?repo=:repo&collection=:nsid",
-                "xrpcGetLatestCommit": "GET /xrpc/com.atproto.sync.getLatestCommit?did=:did"
+                "xrpcGetLatestCommit": "GET /xrpc/com.atproto.sync.getLatestCommit?did=:did",
+                "xrpcSyncGetRecord": "GET /xrpc/com.atproto.sync.getRecord?did=:did&collection=:nsid&rkey=:rkey",
+                "xrpcSyncGetRepo": "GET /xrpc/com.atproto.sync.getRepo?did=:did"
             }
         }),
     )
@@ -166,7 +169,8 @@ impl RepoObject {
             REPO_GET_RECORD => self.xrpc_get_record(url).await,
             REPO_LIST_RECORDS => self.xrpc_list_records(url).await,
             SYNC_GET_LATEST_COMMIT => self.xrpc_get_latest_commit(url),
-            SYNC_GET_RECORD => self.xrpc_get_sync_record(url),
+            SYNC_GET_RECORD => self.xrpc_get_sync_record(url).await,
+            SYNC_GET_REPO => self.xrpc_get_repo(url).await,
             SERVER_DESCRIBE_SERVER => describe_server(url).map_err(HttpError::worker),
             _ => Err(HttpError::new(404, "unsupported XRPC method")),
         }
@@ -344,15 +348,42 @@ impl RepoObject {
         .map_err(HttpError::worker)
     }
 
-    fn xrpc_get_sync_record(&self, url: &worker::Url) -> Result<Response, HttpError> {
+    async fn xrpc_get_sync_record(&self, url: &worker::Url) -> Result<Response, HttpError> {
         let params = query_pairs(url);
-        required_param(&params, "did").map_err(HttpError::xrpc)?;
-        required_param(&params, "collection").map_err(HttpError::xrpc)?;
-        required_param(&params, "rkey").map_err(HttpError::xrpc)?;
-        Err(HttpError::new(
-            501,
-            "com.atproto.sync.getRecord requires CAR proof export, which is not implemented yet",
-        ))
+        let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
+        let collection = Nsid::new(required_param(&params, "collection").map_err(HttpError::xrpc)?)
+            .map_err(HttpError::bad_request)?;
+        let rkey = RecordKey::new(required_param(&params, "rkey").map_err(HttpError::xrpc)?)
+            .map_err(HttpError::bad_request)?;
+        let path = RepoPath::new(collection, rkey);
+        let (state, mut repo) = self.open_repo_with_state()?;
+        ensure_repo_did(&state, &did)?;
+
+        let cids = repo
+            .extract_record_cids(&path)
+            .await
+            .map_err(HttpError::repo)?;
+        let car = encode_car_from_store(&[state.latest_commit], cids, repo.storage())
+            .map_err(HttpError::car)?;
+        car_response(car).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_get_repo(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
+        if optional_param(&params, "since").is_some_and(|value| !value.is_empty()) {
+            return Err(HttpError::new(
+                501,
+                "com.atproto.sync.getRepo diff export is not implemented yet",
+            ));
+        }
+
+        let (state, mut repo) = self.open_repo_with_state()?;
+        ensure_repo_did(&state, &did)?;
+        let cids = repo.export_cids().await.map_err(HttpError::repo)?;
+        let car = encode_car_from_store(&[state.latest_commit], cids, repo.storage())
+            .map_err(HttpError::car)?;
+        car_response(car).map_err(HttpError::worker)
     }
 
     async fn init(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -587,6 +618,13 @@ impl HttpError {
         Self::new(400, error.to_string())
     }
 
+    fn car(error: CarError) -> Self {
+        match error {
+            CarError::MissingBlock { .. } => Self::new(500, error.to_string()),
+            _ => Self::worker(error),
+        }
+    }
+
     fn repo(error: RepoError) -> Self {
         match error {
             RepoError::RecordAlreadyExists { .. } => Self::new(409, error.to_string()),
@@ -656,6 +694,23 @@ fn request_origin(url: &worker::Url) -> String {
         origin.push_str(&port.to_string());
     }
     origin
+}
+
+fn ensure_repo_did(state: &RepoStateRow, did: &str) -> Result<(), HttpError> {
+    if state.did.as_str() == did {
+        Ok(())
+    } else {
+        Err(HttpError::new(404, "repo not found"))
+    }
+}
+
+fn car_response(bytes: Vec<u8>) -> worker::Result<Response> {
+    let mut response = Response::from_bytes(bytes)?;
+    response
+        .headers_mut()
+        .set("content-type", "application/vnd.ipld.car")?;
+    set_cors(&mut response)?;
+    Ok(response)
 }
 
 fn json_response(status: u16, value: &impl Serialize) -> worker::Result<Response> {

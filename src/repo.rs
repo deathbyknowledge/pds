@@ -255,6 +255,15 @@ where
         Ok(cids)
     }
 
+    pub async fn extract_record_cids(&mut self, path: &RepoPath) -> Result<Vec<Cid>, RepoError> {
+        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
+        let result = tree.extract_path_cids(path).await?;
+
+        let mut cids = vec![self.latest.cid];
+        cids.extend(result);
+        Ok(cids)
+    }
+
     fn commit_root(
         &mut self,
         mst_root: Cid,
@@ -844,6 +853,41 @@ mod tests {
                 let bytes = repo.storage().get_block(&cid).unwrap().unwrap();
                 verify_repo_block_cid(&cid, &bytes).unwrap();
             }
+        });
+    }
+
+    #[test]
+    fn signed_repo_extracts_record_proof_blocks() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            let mutation = repo
+                .create_record(path("a"), &record("hello"), rev("3jqfcqzm3fo3j"), &signer)
+                .await
+                .unwrap();
+
+            let extracted = repo.extract_record_cids(&path("a")).await.unwrap();
+
+            assert!(extracted.contains(&repo.latest_commit_cid()));
+            assert!(extracted.contains(&repo.mst_root()));
+            assert!(extracted.contains(&mutation.record_cid.unwrap()));
+            for cid in extracted {
+                let bytes = repo.storage().get_block(&cid).unwrap().unwrap();
+                verify_repo_block_cid(&cid, &bytes).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn signed_repo_extracts_non_existence_proof_without_record_block() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+
+            let extracted = repo.extract_record_cids(&path("missing")).await.unwrap();
+
+            assert!(extracted.contains(&repo.latest_commit_cid()));
+            assert!(extracted.contains(&repo.mst_root()));
+            assert_eq!(extracted.len(), 2);
         });
     }
 

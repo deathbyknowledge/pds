@@ -137,6 +137,13 @@ where
         Ok(tree.export().try_collect().await?)
     }
 
+    pub async fn extract_path_cids(&mut self, path: &RepoPath) -> Result<Vec<Cid>, MstError> {
+        let mut tree = self.open_atrium_tree();
+        let key = path.as_mst_key();
+        let cids = tree.extract_path(&key).await?.collect();
+        Ok(cids)
+    }
+
     fn open_atrium_tree(&self) -> Tree<SharedBlockStore<S>> {
         Tree::open(self.storage.clone(), self.root)
     }
