@@ -32,6 +32,19 @@ pub trait RepoBlockStore {
     }
 }
 
+impl<T> RepoBlockStore for &mut T
+where
+    T: RepoBlockStore + ?Sized,
+{
+    fn put_block_with_cid(&mut self, cid: Cid, bytes: Vec<u8>) -> Result<(), StorageError> {
+        (**self).put_block_with_cid(cid, bytes)
+    }
+
+    fn get_block(&self, cid: &Cid) -> Result<Option<Vec<u8>>, StorageError> {
+        (**self).get_block(cid)
+    }
+}
+
 pub trait RepoRecordIndex {
     fn put_record_pointer(&mut self, path: RepoPath, cid: Cid)
         -> Result<Option<Cid>, StorageError>;
@@ -42,6 +55,34 @@ pub trait RepoRecordIndex {
 
     fn list_record_pointers(&self, collection: &Nsid)
         -> Result<Vec<(RepoPath, Cid)>, StorageError>;
+}
+
+impl<T> RepoRecordIndex for &mut T
+where
+    T: RepoRecordIndex + ?Sized,
+{
+    fn put_record_pointer(
+        &mut self,
+        path: RepoPath,
+        cid: Cid,
+    ) -> Result<Option<Cid>, StorageError> {
+        (**self).put_record_pointer(path, cid)
+    }
+
+    fn get_record_pointer(&self, path: &RepoPath) -> Result<Option<Cid>, StorageError> {
+        (**self).get_record_pointer(path)
+    }
+
+    fn delete_record_pointer(&mut self, path: &RepoPath) -> Result<Option<Cid>, StorageError> {
+        (**self).delete_record_pointer(path)
+    }
+
+    fn list_record_pointers(
+        &self,
+        collection: &Nsid,
+    ) -> Result<Vec<(RepoPath, Cid)>, StorageError> {
+        (**self).list_record_pointers(collection)
+    }
 }
 
 #[derive(Clone, Debug, Default)]

@@ -6,7 +6,11 @@ use thiserror::Error;
 
 use crate::cbor::{decode_dag_cbor, encode_block, CborError};
 use crate::cid::Cid;
+use crate::commit::{
+    CommitBlock, CommitError, CommitSigner, Did, RepoRev, SignedCommit, UnsignedCommit,
+};
 use crate::data_model::{Nsid, RepoPath};
+use crate::mst::{MerkleSearchTree, MstEntry, MstError};
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 
 #[derive(Debug, Error)]
@@ -17,6 +21,12 @@ pub enum RepoError {
     #[error(transparent)]
     Storage(#[from] StorageError),
 
+    #[error(transparent)]
+    Commit(#[from] CommitError),
+
+    #[error(transparent)]
+    Mst(#[from] MstError),
+
     #[error("record already exists at `{path}`")]
     RecordAlreadyExists { path: RepoPath },
 
@@ -25,6 +35,9 @@ pub enum RepoError {
 
     #[error("record `{path}` points to missing block `{cid}`")]
     MissingRecordBlock { path: RepoPath, cid: Cid },
+
+    #[error("commit `{cid}` does not exist")]
+    MissingCommit { cid: Cid },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +51,14 @@ pub struct StoredRecord<T> {
 pub struct RecordListItem {
     pub path: RepoPath,
     pub cid: Cid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoMutation {
+    pub commit_cid: Cid,
+    pub commit: SignedCommit,
+    pub mst_root: Cid,
+    pub record_cid: Option<Cid>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +81,227 @@ impl<S> Repository<S> {
 
     pub fn into_storage(self) -> S {
         self.storage
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SignedRepository<S> {
+    storage: S,
+    latest: CommitBlock,
+}
+
+impl<S> SignedRepository<S> {
+    pub fn latest_commit_cid(&self) -> Cid {
+        self.latest.cid
+    }
+
+    pub fn latest_commit(&self) -> &SignedCommit {
+        &self.latest.commit
+    }
+
+    pub fn mst_root(&self) -> Cid {
+        self.latest.commit.data
+    }
+
+    pub fn storage(&self) -> &S {
+        &self.storage
+    }
+
+    pub fn storage_mut(&mut self) -> &mut S {
+        &mut self.storage
+    }
+
+    pub fn into_storage(self) -> S {
+        self.storage
+    }
+}
+
+impl<S> SignedRepository<S>
+where
+    S: RepoBlockStore,
+{
+    pub fn open(storage: S, latest_commit_cid: Cid) -> Result<Self, RepoError> {
+        let Some(latest) = CommitBlock::read_from(&storage, &latest_commit_cid)? else {
+            return Err(RepoError::MissingCommit {
+                cid: latest_commit_cid,
+            });
+        };
+
+        Ok(Self { storage, latest })
+    }
+}
+
+impl<S> SignedRepository<S>
+where
+    S: RepoBlockStore + RepoRecordIndex + Send,
+{
+    pub async fn create(
+        storage: S,
+        did: Did,
+        rev: RepoRev,
+        signer: &impl CommitSigner,
+    ) -> Result<Self, RepoError> {
+        let mut storage = storage;
+        let data = {
+            let tree = MerkleSearchTree::create(&mut storage).await?;
+            tree.root()
+        };
+        let signed = UnsignedCommit::new(did, data, rev, None).sign_with(signer)?;
+        let latest = signed.write_to(&mut storage)?;
+
+        Ok(Self { storage, latest })
+    }
+
+    pub async fn create_record<T: Serialize>(
+        &mut self,
+        path: RepoPath,
+        record: &T,
+        rev: RepoRev,
+        signer: &impl CommitSigner,
+    ) -> Result<RepoMutation, RepoError> {
+        if self.mst_get(&path).await?.is_some() {
+            return Err(RepoError::RecordAlreadyExists { path });
+        }
+
+        let block = encode_block(record)?;
+        self.storage_mut()
+            .put_block_with_cid(block.cid, block.bytes.clone())?;
+        let mst_root = self.mst_add(path.clone(), block.cid).await?;
+        let mutation = self.commit_root(mst_root, Some(block.cid), rev, signer)?;
+        self.storage_mut().put_record_pointer(path, block.cid)?;
+
+        Ok(mutation)
+    }
+
+    pub async fn update_record<T: Serialize>(
+        &mut self,
+        path: RepoPath,
+        record: &T,
+        rev: RepoRev,
+        signer: &impl CommitSigner,
+    ) -> Result<RepoMutation, RepoError> {
+        if self.mst_get(&path).await?.is_none() {
+            return Err(RepoError::RecordNotFound { path });
+        }
+
+        let block = encode_block(record)?;
+        self.storage_mut()
+            .put_block_with_cid(block.cid, block.bytes.clone())?;
+        let mst_root = self.mst_update(path.clone(), block.cid).await?;
+        let mutation = self.commit_root(mst_root, Some(block.cid), rev, signer)?;
+        self.storage_mut().put_record_pointer(path, block.cid)?;
+
+        Ok(mutation)
+    }
+
+    pub async fn delete_record(
+        &mut self,
+        path: &RepoPath,
+        rev: RepoRev,
+        signer: &impl CommitSigner,
+    ) -> Result<RepoMutation, RepoError> {
+        if self.mst_get(path).await?.is_none() {
+            return Err(RepoError::RecordNotFound { path: path.clone() });
+        }
+
+        let mst_root = self.mst_delete(path).await?;
+        let mutation = self.commit_root(mst_root, None, rev, signer)?;
+        self.storage_mut().delete_record_pointer(path)?;
+
+        Ok(mutation)
+    }
+
+    pub async fn get_record<T: DeserializeOwned>(
+        &mut self,
+        path: &RepoPath,
+    ) -> Result<Option<StoredRecord<T>>, RepoError> {
+        let Some(cid) = self.mst_get(path).await? else {
+            return Ok(None);
+        };
+        let Some(bytes) = self.storage().get_block(&cid)? else {
+            return Err(RepoError::MissingRecordBlock {
+                path: path.clone(),
+                cid,
+            });
+        };
+        let record = decode_dag_cbor(&bytes)?;
+
+        Ok(Some(StoredRecord {
+            path: path.clone(),
+            cid,
+            record,
+        }))
+    }
+
+    pub async fn entries(&mut self) -> Result<Vec<MstEntry>, RepoError> {
+        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
+        Ok(tree.entries().await?)
+    }
+
+    pub async fn entries_for_collection(
+        &mut self,
+        collection: &Nsid,
+    ) -> Result<Vec<MstEntry>, RepoError> {
+        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
+        Ok(tree.entries_for_collection(collection).await?)
+    }
+
+    pub async fn export_cids(&mut self) -> Result<Vec<Cid>, RepoError> {
+        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
+        let result = tree.export_cids().await?;
+
+        let mut cids = vec![self.latest.cid];
+        cids.extend(result);
+        Ok(cids)
+    }
+
+    fn commit_root(
+        &mut self,
+        mst_root: Cid,
+        record_cid: Option<Cid>,
+        rev: RepoRev,
+        signer: &impl CommitSigner,
+    ) -> Result<RepoMutation, RepoError> {
+        let unsigned = self
+            .latest
+            .commit
+            .next_unsigned(self.latest.cid, mst_root, rev);
+        let signed = unsigned.sign_with(signer)?;
+        let latest = signed.write_to(self.storage_mut())?;
+        self.latest = latest.clone();
+
+        Ok(RepoMutation {
+            commit_cid: latest.cid,
+            commit: latest.commit,
+            mst_root,
+            record_cid,
+        })
+    }
+
+    async fn mst_add(&mut self, path: RepoPath, cid: Cid) -> Result<Cid, RepoError> {
+        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
+        tree.add(path, cid).await?;
+        let root = tree.root();
+        Ok(root)
+    }
+
+    async fn mst_update(&mut self, path: RepoPath, cid: Cid) -> Result<Cid, RepoError> {
+        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
+        tree.update(path, cid).await?;
+        let root = tree.root();
+        Ok(root)
+    }
+
+    async fn mst_delete(&mut self, path: &RepoPath) -> Result<Cid, RepoError> {
+        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
+        tree.delete(path).await?;
+        let root = tree.root();
+        Ok(root)
+    }
+
+    async fn mst_get(&mut self, path: &RepoPath) -> Result<Option<Cid>, RepoError> {
+        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
+        Ok(tree.get(path).await?)
     }
 }
 
@@ -138,9 +380,13 @@ where
 
 #[cfg(test)]
 mod tests {
+    use futures_executor::block_on;
     use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
 
     use super::*;
+    use crate::cid::verify_repo_block_cid;
+    use crate::commit::{CommitBlock, CommitSigner};
     use crate::storage::MemoryRepoStore;
 
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +405,48 @@ mod tests {
 
     fn path(rkey: &str) -> RepoPath {
         RepoPath::parse(&format!("app.gsv.record/{rkey}")).unwrap()
+    }
+
+    fn other_path(rkey: &str) -> RepoPath {
+        RepoPath::parse(&format!("app.gsv.other/{rkey}")).unwrap()
+    }
+
+    fn did() -> Did {
+        Did::new("did:gsv:alice").unwrap()
+    }
+
+    fn rev(value: &str) -> RepoRev {
+        RepoRev::new(value).unwrap()
+    }
+
+    struct HashSigner(&'static [u8]);
+
+    impl CommitSigner for HashSigner {
+        fn sign_commit(&self, signable_bytes: &[u8]) -> Result<Vec<u8>, String> {
+            let mut hasher = Sha256::new();
+            hasher.update(self.0);
+            hasher.update(signable_bytes);
+            Ok(hasher.finalize().to_vec())
+        }
+    }
+
+    struct FailingSigner;
+
+    impl CommitSigner for FailingSigner {
+        fn sign_commit(&self, _signable_bytes: &[u8]) -> Result<Vec<u8>, String> {
+            Err("missing key".to_string())
+        }
+    }
+
+    async fn signed_repo() -> SignedRepository<MemoryRepoStore> {
+        SignedRepository::create(
+            MemoryRepoStore::new(),
+            did(),
+            rev("3jqfcqzm3fo2j"),
+            &HashSigner(b"repo-key"),
+        )
+        .await
+        .unwrap()
     }
 
     #[test]
@@ -262,5 +550,328 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn signed_repo_create_writes_empty_mst_and_initial_commit() {
+        block_on(async {
+            let repo = signed_repo().await;
+
+            assert_eq!(repo.latest_commit().did, did());
+            assert_eq!(repo.latest_commit().prev, None);
+            assert_eq!(repo.latest_commit().rev, rev("3jqfcqzm3fo2j"));
+            assert_eq!(repo.latest_commit().data, repo.mst_root());
+            assert!(repo.storage().has_block(&repo.mst_root()).unwrap());
+            assert!(repo.storage().has_block(&repo.latest_commit_cid()).unwrap());
+            assert_eq!(repo.storage().record_count(), 0);
+            assert_eq!(repo.storage().block_count(), 2);
+        });
+    }
+
+    #[test]
+    fn signed_create_record_updates_record_mst_and_commit() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            let initial_commit = repo.latest_commit_cid();
+            let initial_root = repo.mst_root();
+            let path = path("a");
+
+            let mutation = repo
+                .create_record(
+                    path.clone(),
+                    &record("hello"),
+                    rev("3jqfcqzm3fo3j"),
+                    &signer,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(mutation.commit_cid, repo.latest_commit_cid());
+            assert_eq!(mutation.commit.prev, Some(initial_commit));
+            assert_eq!(mutation.commit.rev, rev("3jqfcqzm3fo3j"));
+            assert_eq!(mutation.mst_root, repo.mst_root());
+            assert_ne!(mutation.mst_root, initial_root);
+            assert_eq!(
+                repo.storage().get_record_pointer(&path).unwrap(),
+                mutation.record_cid
+            );
+
+            let stored = repo.get_record::<TestRecord>(&path).await.unwrap().unwrap();
+            assert_eq!(stored.path, path);
+            assert_eq!(Some(stored.cid), mutation.record_cid);
+            assert_eq!(stored.record, record("hello"));
+        });
+    }
+
+    #[test]
+    fn signed_update_record_links_prev_and_keeps_old_record_block() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            let path = path("a");
+            let first = repo
+                .create_record(path.clone(), &record("old"), rev("3jqfcqzm3fo3j"), &signer)
+                .await
+                .unwrap();
+            let old_record_cid = first.record_cid.unwrap();
+            let block_count_after_create = repo.storage().block_count();
+
+            let second = repo
+                .update_record(path.clone(), &record("new"), rev("3jqfcqzm3fo4j"), &signer)
+                .await
+                .unwrap();
+
+            assert_eq!(second.commit.prev, Some(first.commit_cid));
+            assert_ne!(second.record_cid, Some(old_record_cid));
+            assert!(repo.storage().has_block(&old_record_cid).unwrap());
+            assert!(repo.storage().block_count() > block_count_after_create);
+
+            let stored = repo.get_record::<TestRecord>(&path).await.unwrap().unwrap();
+            assert_eq!(Some(stored.cid), second.record_cid);
+            assert_eq!(stored.record, record("new"));
+        });
+    }
+
+    #[test]
+    fn signed_delete_record_removes_mst_entry_but_keeps_old_block() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            let path = path("a");
+            let first = repo
+                .create_record(
+                    path.clone(),
+                    &record("hello"),
+                    rev("3jqfcqzm3fo3j"),
+                    &signer,
+                )
+                .await
+                .unwrap();
+            let old_record_cid = first.record_cid.unwrap();
+
+            let delete = repo
+                .delete_record(&path, rev("3jqfcqzm3fo4j"), &signer)
+                .await
+                .unwrap();
+
+            assert_eq!(delete.commit.prev, Some(first.commit_cid));
+            assert_eq!(delete.record_cid, None);
+            assert_eq!(repo.storage().get_record_pointer(&path).unwrap(), None);
+            assert!(repo.storage().has_block(&old_record_cid).unwrap());
+            assert!(repo
+                .get_record::<TestRecord>(&path)
+                .await
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn signed_repo_reopens_from_latest_commit() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            let path = path("a");
+            let mutation = repo
+                .create_record(
+                    path.clone(),
+                    &record("hello"),
+                    rev("3jqfcqzm3fo3j"),
+                    &signer,
+                )
+                .await
+                .unwrap();
+            let storage = repo.into_storage();
+            let mut reopened = SignedRepository::open(storage, mutation.commit_cid).unwrap();
+
+            assert_eq!(reopened.latest_commit_cid(), mutation.commit_cid);
+            assert_eq!(reopened.mst_root(), mutation.mst_root);
+            assert_eq!(
+                reopened
+                    .get_record::<TestRecord>(&path)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .record,
+                record("hello")
+            );
+        });
+    }
+
+    #[test]
+    fn signed_repo_rejects_invalid_mutations_without_new_commit() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            let existing_path = path("a");
+            repo.create_record(
+                existing_path.clone(),
+                &record("hello"),
+                rev("3jqfcqzm3fo3j"),
+                &signer,
+            )
+            .await
+            .unwrap();
+            let latest = repo.latest_commit_cid();
+
+            assert!(matches!(
+                repo.create_record(
+                    existing_path.clone(),
+                    &record("again"),
+                    rev("3jqfcqzm3fo4j"),
+                    &signer
+                )
+                .await,
+                Err(RepoError::RecordAlreadyExists { .. })
+            ));
+            assert!(matches!(
+                repo.update_record(
+                    path("missing"),
+                    &record("nope"),
+                    rev("3jqfcqzm3fo4j"),
+                    &signer
+                )
+                .await,
+                Err(RepoError::RecordNotFound { .. })
+            ));
+            assert!(matches!(
+                repo.delete_record(&path("missing"), rev("3jqfcqzm3fo4j"), &signer)
+                    .await,
+                Err(RepoError::RecordNotFound { .. })
+            ));
+
+            assert_eq!(repo.latest_commit_cid(), latest);
+        });
+    }
+
+    #[test]
+    fn signed_repo_signer_failure_does_not_advance_committed_view() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let latest = repo.latest_commit_cid();
+            let root = repo.mst_root();
+            let path = path("a");
+
+            assert!(matches!(
+                repo.create_record(path.clone(), &record("hello"), rev("3jqfcqzm3fo3j"), &FailingSigner)
+                    .await,
+                Err(RepoError::Commit(CommitError::Signing(message))) if message == "missing key"
+            ));
+
+            assert_eq!(repo.latest_commit_cid(), latest);
+            assert_eq!(repo.mst_root(), root);
+            assert_eq!(repo.storage().get_record_pointer(&path).unwrap(), None);
+            assert!(repo
+                .get_record::<TestRecord>(&path)
+                .await
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn signed_repo_entries_follow_mst_after_multiple_mutations() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            repo.create_record(path("a"), &record("a"), rev("3jqfcqzm3fo3j"), &signer)
+                .await
+                .unwrap();
+            let b = repo
+                .create_record(path("b"), &record("b"), rev("3jqfcqzm3fo4j"), &signer)
+                .await
+                .unwrap();
+            let other = repo
+                .create_record(
+                    other_path("a"),
+                    &record("other"),
+                    rev("3jqfcqzm3fo5j"),
+                    &signer,
+                )
+                .await
+                .unwrap();
+            let b_updated = repo
+                .update_record(path("b"), &record("b2"), rev("3jqfcqzm3fo6j"), &signer)
+                .await
+                .unwrap();
+            repo.delete_record(&path("a"), rev("3jqfcqzm3fo7j"), &signer)
+                .await
+                .unwrap();
+
+            assert_ne!(b.record_cid, b_updated.record_cid);
+            assert_eq!(
+                repo.entries().await.unwrap(),
+                vec![
+                    MstEntry {
+                        path: other_path("a"),
+                        cid: other.record_cid.unwrap(),
+                    },
+                    MstEntry {
+                        path: path("b"),
+                        cid: b_updated.record_cid.unwrap(),
+                    },
+                ]
+            );
+            assert_eq!(
+                repo.entries_for_collection(&Nsid::new("app.gsv.record").unwrap())
+                    .await
+                    .unwrap(),
+                vec![MstEntry {
+                    path: path("b"),
+                    cid: b_updated.record_cid.unwrap(),
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn signed_repo_exported_blocks_are_content_addressed() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            let mutation = repo
+                .create_record(path("a"), &record("hello"), rev("3jqfcqzm3fo3j"), &signer)
+                .await
+                .unwrap();
+
+            let exported = repo.export_cids().await.unwrap();
+
+            assert!(exported.contains(&repo.latest_commit_cid()));
+            assert!(exported.contains(&repo.mst_root()));
+            assert!(exported.contains(&mutation.record_cid.unwrap()));
+            for cid in exported {
+                let bytes = repo.storage().get_block(&cid).unwrap().unwrap();
+                verify_repo_block_cid(&cid, &bytes).unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn signed_repo_commit_blocks_form_prev_chain() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            let initial = repo.latest_commit_cid();
+            let first = repo
+                .create_record(path("a"), &record("a"), rev("3jqfcqzm3fo3j"), &signer)
+                .await
+                .unwrap();
+            let second = repo
+                .update_record(path("a"), &record("b"), rev("3jqfcqzm3fo4j"), &signer)
+                .await
+                .unwrap();
+
+            let first_block = CommitBlock::read_from(repo.storage(), &first.commit_cid)
+                .unwrap()
+                .unwrap();
+            let second_block = CommitBlock::read_from(repo.storage(), &second.commit_cid)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(first_block.commit.prev, Some(initial));
+            assert_eq!(second_block.commit.prev, Some(first.commit_cid));
+            assert_eq!(second_block.commit.data, second.mst_root);
+        });
     }
 }

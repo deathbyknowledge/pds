@@ -51,7 +51,7 @@ impl<S> std::fmt::Debug for MerkleSearchTree<S> {
 
 impl<S> MerkleSearchTree<S>
 where
-    S: RepoBlockStore + Send + 'static,
+    S: RepoBlockStore + Send,
 {
     pub async fn create(storage: S) -> Result<Self, MstError> {
         let storage = SharedBlockStore::new(storage);
@@ -184,7 +184,7 @@ impl<S> SharedBlockStore<S> {
 
 impl<S> AsyncBlockStoreRead for SharedBlockStore<S>
 where
-    S: RepoBlockStore + Send + 'static,
+    S: RepoBlockStore + Send,
 {
     fn read_block_into(
         &mut self,
@@ -209,7 +209,7 @@ where
 
 impl<S> AsyncBlockStoreWrite for SharedBlockStore<S>
 where
-    S: RepoBlockStore + Send + 'static,
+    S: RepoBlockStore + Send,
 {
     fn write_block(
         &mut self,
