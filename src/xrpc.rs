@@ -7,6 +7,7 @@ pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
 pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
 pub const SYNC_GET_LATEST_COMMIT: &str = "com.atproto.sync.getLatestCommit";
+pub const SYNC_GET_REPO_STATUS: &str = "com.atproto.sync.getRepoStatus";
 pub const SYNC_GET_RECORD: &str = "com.atproto.sync.getRecord";
 pub const SYNC_GET_REPO: &str = "com.atproto.sync.getRepo";
 
@@ -52,7 +53,7 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
                 name: repo_object_name_from_identifier(&repo),
             })
         }
-        SYNC_GET_LATEST_COMMIT | SYNC_GET_RECORD | SYNC_GET_REPO => {
+        SYNC_GET_LATEST_COMMIT | SYNC_GET_REPO_STATUS | SYNC_GET_RECORD | SYNC_GET_REPO => {
             let did = required_param(query, "did")?;
             Ok(XrpcRoute::RepoObject {
                 name: repo_object_name_from_identifier(&did),
@@ -98,6 +99,7 @@ pub fn optional_param(query: &[(String, String)], param: &str) -> Option<String>
 pub fn repo_object_name_from_identifier(identifier: &str) -> String {
     identifier
         .strip_prefix("did:gsv:")
+        .or_else(|| identifier.strip_prefix("did:web:"))
         .unwrap_or(identifier)
         .to_string()
 }
@@ -177,6 +179,20 @@ mod tests {
     }
 
     #[test]
+    fn routes_hostname_did_web_to_their_local_repo_name() {
+        assert_eq!(
+            route_xrpc_method(
+                SYNC_GET_LATEST_COMMIT,
+                &query(&[("did", "did:web:pds.example.com")])
+            )
+            .unwrap(),
+            XrpcRoute::RepoObject {
+                name: "pds.example.com".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn routes_sync_car_methods_to_repo_object_by_did() {
         assert_eq!(
             route_xrpc_method(SYNC_GET_REPO, &query(&[("did", "did:gsv:alice")])).unwrap(),
@@ -188,6 +204,20 @@ mod tests {
             route_xrpc_method(SYNC_GET_RECORD, &query(&[("did", "did:gsv:alice")])).unwrap(),
             XrpcRoute::RepoObject {
                 name: "alice".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn routes_repo_status_to_repo_object_by_did() {
+        assert_eq!(
+            route_xrpc_method(
+                SYNC_GET_REPO_STATUS,
+                &query(&[("did", "did:web:pds.example.com")])
+            )
+            .unwrap(),
+            XrpcRoute::RepoObject {
+                name: "pds.example.com".to_string()
             }
         );
     }

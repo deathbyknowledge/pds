@@ -7,6 +7,7 @@ use crate::cid::{parse_cid, verify_repo_block_cid, Cid};
 use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RepoPath};
 use crate::do_schema::ALL_SCHEMA_STATEMENTS;
+use crate::identity::{IdentityError, RepoSigningKey};
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 
 #[derive(Clone, Debug)]
@@ -19,6 +20,19 @@ pub struct RepoStateRow {
     pub did: Did,
     pub latest_commit: Cid,
     pub latest_rev: RepoRev,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoIdentityRow {
+    pub handle: String,
+    pub signing_key_p256_hex: String,
+    pub public_key_multibase: String,
+}
+
+impl RepoIdentityRow {
+    pub fn signing_key(&self) -> Result<RepoSigningKey, IdentityError> {
+        RepoSigningKey::from_p256_hex(&self.signing_key_p256_hex)
+    }
 }
 
 impl SqlRepoStore {
@@ -77,6 +91,48 @@ impl SqlRepoStore {
         Ok(())
     }
 
+    pub fn get_repo_identity(&self) -> worker::Result<Option<RepoIdentityRow>> {
+        #[derive(Deserialize)]
+        struct Row {
+            handle: String,
+            signing_key_p256_hex: String,
+            public_key_multibase: String,
+        }
+
+        let rows: Vec<Row> = self
+            .sql
+            .exec(
+                "SELECT handle, signing_key_p256_hex, public_key_multibase
+                 FROM repo_identity
+                 WHERE id = 1",
+                None,
+            )?
+            .to_array()?;
+
+        Ok(rows.into_iter().next().map(|row| RepoIdentityRow {
+            handle: row.handle,
+            signing_key_p256_hex: row.signing_key_p256_hex,
+            public_key_multibase: row.public_key_multibase,
+        }))
+    }
+
+    pub fn put_repo_identity(&self, row: &RepoIdentityRow) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO repo_identity (id, handle, signing_key_p256_hex, public_key_multibase)
+             VALUES (1, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                handle = excluded.handle,
+                signing_key_p256_hex = excluded.signing_key_p256_hex,
+                public_key_multibase = excluded.public_key_multibase",
+            vec![
+                SqlStorageValue::from(row.handle.clone()),
+                SqlStorageValue::from(row.signing_key_p256_hex.clone()),
+                SqlStorageValue::from(row.public_key_multibase.clone()),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn block_count(&self) -> worker::Result<i64> {
         count(&self.sql, "SELECT COUNT(*) AS n FROM repo_blocks")
     }
@@ -88,6 +144,7 @@ impl SqlRepoStore {
     pub fn clear_all(&self) -> worker::Result<()> {
         self.sql.exec("DELETE FROM record_index", None)?;
         self.sql.exec("DELETE FROM repo_blocks", None)?;
+        self.sql.exec("DELETE FROM repo_identity", None)?;
         self.sql.exec("DELETE FROM repo_state", None)?;
         Ok(())
     }

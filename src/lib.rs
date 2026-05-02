@@ -5,6 +5,7 @@ pub mod commit;
 pub mod data_model;
 pub mod diagnostics;
 pub mod do_schema;
+pub mod identity;
 pub mod model;
 pub mod mst;
 pub mod repo;

@@ -7,6 +7,13 @@ pub const CREATE_REPO_STATE: &str = "CREATE TABLE IF NOT EXISTS repo_state (
     latest_rev    TEXT NOT NULL
 )";
 
+pub const CREATE_REPO_IDENTITY: &str = "CREATE TABLE IF NOT EXISTS repo_identity (
+    id                    INTEGER PRIMARY KEY CHECK (id = 1),
+    handle                TEXT NOT NULL,
+    signing_key_p256_hex  TEXT NOT NULL,
+    public_key_multibase  TEXT NOT NULL
+)";
+
 pub const CREATE_REPO_BLOCKS: &str = "CREATE TABLE IF NOT EXISTS repo_blocks (
     cid        TEXT PRIMARY KEY,
     bytes      BLOB NOT NULL,
@@ -28,6 +35,7 @@ pub const CREATE_RECORD_COLLECTION_INDEX: &str =
 
 pub const ALL_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_REPO_STATE,
+    CREATE_REPO_IDENTITY,
     CREATE_REPO_BLOCKS,
     CREATE_RECORD_INDEX,
     CREATE_RECORD_COLLECTION_INDEX,
@@ -42,6 +50,7 @@ mod tests {
         let joined = ALL_SCHEMA_STATEMENTS.join("\n");
 
         assert!(joined.contains("repo_state"));
+        assert!(joined.contains("repo_identity"));
         assert!(joined.contains("repo_blocks"));
         assert!(joined.contains("record_index"));
         assert!(joined.contains("idx_record_index_collection_path"));
@@ -51,6 +60,14 @@ mod tests {
     fn repo_state_is_singleton_table() {
         assert!(CREATE_REPO_STATE.contains("CHECK (id = 1)"));
         assert!(CREATE_REPO_STATE.contains("latest_commit TEXT NOT NULL"));
+    }
+
+    #[test]
+    fn repo_identity_stores_signing_metadata() {
+        assert!(CREATE_REPO_IDENTITY.contains("CHECK (id = 1)"));
+        assert!(CREATE_REPO_IDENTITY.contains("handle                TEXT NOT NULL"));
+        assert!(CREATE_REPO_IDENTITY.contains("signing_key_p256_hex  TEXT NOT NULL"));
+        assert!(CREATE_REPO_IDENTITY.contains("public_key_multibase  TEXT NOT NULL"));
     }
 
     #[test]
