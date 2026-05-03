@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const DAG_CBOR_CODEC: u64 = DAG_CBOR;
+pub const RAW_CODEC: u64 = 0x55;
 pub const SHA2_256_CODE: u64 = SHA2_256;
 
 #[derive(Debug, Error)]
@@ -30,6 +31,10 @@ pub fn parse_cid(value: &str) -> Result<Cid, CidError> {
 
 pub fn dag_cbor_cid(bytes: &[u8]) -> Cid {
     cid_for_bytes(DAG_CBOR_CODEC, bytes)
+}
+
+pub fn raw_cid(bytes: &[u8]) -> Cid {
+    cid_for_bytes(RAW_CODEC, bytes)
 }
 
 pub fn cid_for_bytes(codec: u64, bytes: &[u8]) -> Cid {
@@ -109,8 +114,19 @@ mod tests {
 
     #[test]
     fn rejects_non_repo_block_codec() {
-        let cid = cid_for_bytes(0x55, b"raw bytes");
+        let cid = raw_cid(b"raw bytes");
 
         assert!(validate_repo_block_cid(&cid).is_err());
+    }
+
+    #[test]
+    fn computes_raw_cid_from_bytes() {
+        let cid = raw_cid(b"raw bytes");
+
+        assert!(cid.to_string().starts_with("baf"));
+        assert_eq!(cid.version(), Version::V1);
+        assert_eq!(cid.codec(), RAW_CODEC);
+        assert_eq!(cid.hash().code(), SHA2_256_CODE);
+        assert_eq!(cid.hash().digest().len(), 32);
     }
 }

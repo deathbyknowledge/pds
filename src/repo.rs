@@ -59,6 +59,32 @@ pub struct RepoMutation {
     pub commit: SignedCommit,
     pub mst_root: Cid,
     pub record_cid: Option<Cid>,
+    pub ops: Vec<RepoOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoOperation {
+    pub action: RepoOperationAction,
+    pub path: RepoPath,
+    pub cid: Option<Cid>,
+    pub prev: Option<Cid>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RepoOperationAction {
+    Create,
+    Update,
+    Delete,
+}
+
+impl RepoOperationAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Create => "create",
+            Self::Update => "update",
+            Self::Delete => "delete",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -167,7 +193,13 @@ where
         self.storage_mut()
             .put_block_with_cid(block.cid, block.bytes.clone())?;
         let mst_root = self.mst_add(path.clone(), block.cid).await?;
-        let mutation = self.commit_root(mst_root, Some(block.cid), rev, signer)?;
+        let op = RepoOperation {
+            action: RepoOperationAction::Create,
+            path: path.clone(),
+            cid: Some(block.cid),
+            prev: None,
+        };
+        let mutation = self.commit_root(mst_root, Some(block.cid), vec![op], rev, signer)?;
         self.storage_mut().put_record_pointer(path, block.cid)?;
 
         Ok(mutation)
@@ -180,15 +212,21 @@ where
         rev: RepoRev,
         signer: &impl CommitSigner,
     ) -> Result<RepoMutation, RepoError> {
-        if self.mst_get(&path).await?.is_none() {
+        let Some(previous) = self.mst_get(&path).await? else {
             return Err(RepoError::RecordNotFound { path });
-        }
+        };
 
         let block = encode_block(record)?;
         self.storage_mut()
             .put_block_with_cid(block.cid, block.bytes.clone())?;
         let mst_root = self.mst_update(path.clone(), block.cid).await?;
-        let mutation = self.commit_root(mst_root, Some(block.cid), rev, signer)?;
+        let op = RepoOperation {
+            action: RepoOperationAction::Update,
+            path: path.clone(),
+            cid: Some(block.cid),
+            prev: Some(previous),
+        };
+        let mutation = self.commit_root(mst_root, Some(block.cid), vec![op], rev, signer)?;
         self.storage_mut().put_record_pointer(path, block.cid)?;
 
         Ok(mutation)
@@ -200,12 +238,18 @@ where
         rev: RepoRev,
         signer: &impl CommitSigner,
     ) -> Result<RepoMutation, RepoError> {
-        if self.mst_get(path).await?.is_none() {
+        let Some(previous) = self.mst_get(path).await? else {
             return Err(RepoError::RecordNotFound { path: path.clone() });
-        }
+        };
 
         let mst_root = self.mst_delete(path).await?;
-        let mutation = self.commit_root(mst_root, None, rev, signer)?;
+        let op = RepoOperation {
+            action: RepoOperationAction::Delete,
+            path: path.clone(),
+            cid: None,
+            prev: Some(previous),
+        };
+        let mutation = self.commit_root(mst_root, None, vec![op], rev, signer)?;
         self.storage_mut().delete_record_pointer(path)?;
 
         Ok(mutation)
@@ -268,6 +312,7 @@ where
         &mut self,
         mst_root: Cid,
         record_cid: Option<Cid>,
+        ops: Vec<RepoOperation>,
         rev: RepoRev,
         signer: &impl CommitSigner,
     ) -> Result<RepoMutation, RepoError> {
@@ -284,6 +329,7 @@ where
             commit: latest.commit,
             mst_root,
             record_cid,
+            ops,
         })
     }
 
@@ -602,6 +648,15 @@ mod tests {
             assert_eq!(mutation.mst_root, repo.mst_root());
             assert_ne!(mutation.mst_root, initial_root);
             assert_eq!(
+                mutation.ops,
+                vec![RepoOperation {
+                    action: RepoOperationAction::Create,
+                    path: path.clone(),
+                    cid: mutation.record_cid,
+                    prev: None,
+                }]
+            );
+            assert_eq!(
                 repo.storage().get_record_pointer(&path).unwrap(),
                 mutation.record_cid
             );
@@ -633,6 +688,15 @@ mod tests {
 
             assert_eq!(second.commit.prev, Some(first.commit_cid));
             assert_ne!(second.record_cid, Some(old_record_cid));
+            assert_eq!(
+                second.ops,
+                vec![RepoOperation {
+                    action: RepoOperationAction::Update,
+                    path: path.clone(),
+                    cid: second.record_cid,
+                    prev: Some(old_record_cid),
+                }]
+            );
             assert!(repo.storage().has_block(&old_record_cid).unwrap());
             assert!(repo.storage().block_count() > block_count_after_create);
 
@@ -666,6 +730,15 @@ mod tests {
 
             assert_eq!(delete.commit.prev, Some(first.commit_cid));
             assert_eq!(delete.record_cid, None);
+            assert_eq!(
+                delete.ops,
+                vec![RepoOperation {
+                    action: RepoOperationAction::Delete,
+                    path: path.clone(),
+                    cid: None,
+                    prev: Some(old_record_cid),
+                }]
+            );
             assert_eq!(repo.storage().get_record_pointer(&path).unwrap(), None);
             assert!(repo.storage().has_block(&old_record_cid).unwrap());
             assert!(repo

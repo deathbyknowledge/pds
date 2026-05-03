@@ -78,6 +78,92 @@ const mutation = await expectJson("seed record", "POST", `/repos/${encodePath(re
   record,
 });
 
+const xrpcRkey = "xrpc-seed";
+const xrpcCreate = await expectJson(
+  "XRPC createRecord",
+  "POST",
+  "/xrpc/com.atproto.repo.createRecord",
+  {
+    repo: did,
+    collection,
+    rkey: xrpcRkey,
+    record: {
+      $type: collection,
+      text: "created through XRPC",
+      createdAt: new Date().toISOString(),
+    },
+  },
+  (body) => {
+    if (body.uri !== `at://${did}/${collection}/${xrpcRkey}` || !body.cid || !body.commit?.cid) {
+      throw new Error(`unexpected createRecord response ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+const xrpcPut = await expectJson(
+  "XRPC putRecord",
+  "POST",
+  "/xrpc/com.atproto.repo.putRecord",
+  {
+    repo: host,
+    collection,
+    rkey: xrpcRkey,
+    record: {
+      $type: collection,
+      text: "updated through XRPC",
+      updatedAt: new Date().toISOString(),
+    },
+  },
+  (body) => {
+    if (body.uri !== `at://${did}/${collection}/${xrpcRkey}` || !body.cid || !body.commit?.cid) {
+      throw new Error(`unexpected putRecord response ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+const xrpcDelete = await expectJson(
+  "XRPC deleteRecord",
+  "POST",
+  "/xrpc/com.atproto.repo.deleteRecord",
+  {
+    repo: did,
+    collection,
+    rkey: xrpcRkey,
+  },
+  (body) => {
+    if (!body.commit?.cid || !body.commit?.rev) {
+      throw new Error(`unexpected deleteRecord response ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+const latestCommit = xrpcDelete.commit.cid;
+const latestRev = xrpcDelete.commit.rev;
+
+const blobBytes = new TextEncoder().encode("hello from a GSV blob");
+const uploadBlob = await expectJson(
+  "upload blob",
+  "POST",
+  "/xrpc/com.atproto.repo.uploadBlob",
+  blobBytes,
+  (body) => {
+    if (body.blob?.mimeType !== "text/plain" || body.blob?.size !== blobBytes.byteLength) {
+      throw new Error(`unexpected uploadBlob response ${JSON.stringify(body)}`);
+    }
+  },
+  { "content-type": "text/plain" },
+);
+const blobCid = uploadBlob.blob.ref?.$link;
+if (!blobCid) {
+  throw new Error(`uploadBlob response did not include blob ref: ${JSON.stringify(uploadBlob)}`);
+}
+
+await expectJson("directory sync", "POST", `/repos/${encodePath(repo)}/directory-sync`, null, (body) => {
+  if (body.ok !== true || body.latestCommit !== latestCommit || body.latestRev !== latestRev) {
+    throw new Error(`unexpected directory-sync response ${JSON.stringify(body)}`);
+  }
+});
+
 const listRepos = await expectJson(
   "list repos",
   "GET",
@@ -88,7 +174,7 @@ const listRepos = await expectJson(
     if (!hostedRepo) {
       throw new Error(`listRepos did not include ${did}: ${JSON.stringify(body)}`);
     }
-    if (hostedRepo.head !== mutation.latestCommit || hostedRepo.rev !== mutation.latestRev) {
+    if (hostedRepo.head !== latestCommit || hostedRepo.rev !== latestRev) {
       throw new Error(`listRepos returned stale repo state: ${JSON.stringify(hostedRepo)}`);
     }
   },
@@ -127,8 +213,23 @@ const listBlobs = await expectJson(
   `/xrpc/com.atproto.sync.listBlobs?did=${encodeQuery(did)}`,
   null,
   (body) => {
-    if (!Array.isArray(body.cids) || body.cids.length !== 0) {
-      throw new Error(`expected no blobs, got ${JSON.stringify(body)}`);
+    if (!Array.isArray(body.cids) || !body.cids.includes(blobCid)) {
+      throw new Error(`expected blob ${blobCid}, got ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+await expectBytes(
+  "get blob",
+  "GET",
+  `/xrpc/com.atproto.sync.getBlob?did=${encodeQuery(did)}&cid=${encodeQuery(blobCid)}`,
+  null,
+  async (response, bytes) => {
+    const contentType = response.headers.get("content-type") ?? "";
+    if (!contentType.includes("text/plain") || new TextDecoder().decode(bytes) !== "hello from a GSV blob") {
+      throw new Error(
+        `unexpected blob response content-type=${contentType} bytes=${new TextDecoder().decode(bytes)}`,
+      );
     }
   },
 );
@@ -151,6 +252,17 @@ const missingBlob = await expectJsonStatus(
   `/xrpc/com.atproto.sync.getBlob?did=${encodeQuery(did)}&cid=${encodeQuery(mutation.latestCommit)}`,
   null,
   404,
+);
+
+await expectJsonStatus(
+  "subscribeRepos requires websocket",
+  "GET",
+  "/xrpc/com.atproto.sync.subscribeRepos",
+  null,
+  426,
+);
+const subscribeRepos = await expectSubscribeReposEvent(
+  `/xrpc/com.atproto.sync.subscribeRepos?cursor=0`,
 );
 
 const repoCar = await request("GET", `/xrpc/com.atproto.sync.getRepo?did=${encodeQuery(did)}`);
@@ -178,10 +290,16 @@ console.log(
       handleDid: handleDid.trim(),
       didDocumentServiceEndpoint: atprotoServiceEndpoint(didDocument),
       publicKeyMultibase: init.publicKeyMultibase,
-      latestCommit: mutation.latestCommit,
-      latestRev: mutation.latestRev,
+      seedRecordCommit: mutation.latestCommit,
+      latestCommit,
+      latestRev,
+      xrpcCreateCommit: xrpcCreate.commit.cid,
+      xrpcPutCommit: xrpcPut.commit.cid,
+      xrpcDeleteCommit: xrpcDelete.commit.cid,
       listedRepos: listRepos.repos.length,
       listedBlobs: listBlobs.cids.length,
+      subscribeRepos,
+      blobCid,
       missingBlobStatus: missingBlob.status,
       collection,
       rkey,
@@ -199,8 +317,8 @@ console.log(
   ),
 );
 
-async function expectJson(label, method, path, body, validate = undefined) {
-  const response = await request(method, path, body);
+async function expectJson(label, method, path, body, validate = undefined, extraHeaders = {}) {
+  const response = await request(method, path, body, extraHeaders);
   const text = await response.text();
   let parsed;
   try {
@@ -227,6 +345,16 @@ async function expectText(label, method, path, body, validate = undefined) {
   return text;
 }
 
+async function expectBytes(label, method, path, body, validate = undefined, extraHeaders = {}) {
+  const response = await request(method, path, body, extraHeaders);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (!response.ok) {
+    throw new Error(`${label} failed status=${response.status}: ${new TextDecoder().decode(bytes)}`);
+  }
+  await validate?.(response, bytes);
+  return bytes;
+}
+
 async function expectJsonStatus(label, method, path, body, expectedStatus) {
   const response = await request(method, path, body);
   const text = await response.text();
@@ -249,14 +377,66 @@ async function expectJsonStatus(label, method, path, body, expectedStatus) {
   return { status: response.status, body: parsed };
 }
 
-async function request(method, path, body = null) {
+async function expectSubscribeReposEvent(path) {
+  if (typeof WebSocket === "undefined") {
+    return { skipped: "global WebSocket is unavailable in this Node runtime" };
+  }
+
+  const url = new URL(path, `${config.baseUrl}/`);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url);
+    const timeout = setTimeout(() => {
+      socket.close();
+      reject(new Error(`subscribeRepos did not deliver a binary frame before timeout`));
+    }, 3000);
+
+    socket.addEventListener("message", (event) => {
+      const byteLength = binaryMessageLength(event.data);
+      if (byteLength <= 0) {
+        clearTimeout(timeout);
+        socket.close();
+        reject(new Error(`subscribeRepos returned an empty or non-binary frame`));
+        return;
+      }
+      clearTimeout(timeout);
+      socket.close();
+      resolve({ binaryFrames: 1, firstFrameBytes: byteLength });
+    });
+    socket.addEventListener("error", () => {
+      clearTimeout(timeout);
+      reject(new Error(`subscribeRepos WebSocket failed`));
+    });
+  });
+}
+
+function binaryMessageLength(data) {
+  if (data instanceof ArrayBuffer) {
+    return data.byteLength;
+  }
+  if (ArrayBuffer.isView(data)) {
+    return data.byteLength;
+  }
+  if (typeof Blob !== "undefined" && data instanceof Blob) {
+    return data.size;
+  }
+  return 0;
+}
+
+async function request(method, path, body = null, extraHeaders = {}) {
   const headers = {
     authorization: `Bearer ${config.adminToken}`,
+    ...extraHeaders,
   };
   let payload;
   if (body !== null) {
-    headers["content-type"] = "application/json";
-    payload = JSON.stringify(body);
+    if (body instanceof Uint8Array) {
+      payload = body;
+    } else {
+      headers["content-type"] = headers["content-type"] ?? "application/json";
+      payload = JSON.stringify(body);
+    }
   }
   return fetch(new URL(path, `${config.baseUrl}/`), {
     method,

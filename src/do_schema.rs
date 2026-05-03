@@ -21,6 +21,18 @@ pub const CREATE_REPO_BLOCKS: &str = "CREATE TABLE IF NOT EXISTS repo_blocks (
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 )";
 
+pub const CREATE_REPO_BLOBS: &str = "CREATE TABLE IF NOT EXISTS repo_blobs (
+    cid        TEXT PRIMARY KEY,
+    mime_type  TEXT NOT NULL,
+    bytes      BLOB NOT NULL,
+    byte_len   INTEGER NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_REPO_BLOBS_CREATED_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_repo_blobs_created_at
+     ON repo_blobs(created_at, cid)";
+
 pub const CREATE_RECORD_INDEX: &str = "CREATE TABLE IF NOT EXISTS record_index (
     path       TEXT PRIMARY KEY,
     collection TEXT NOT NULL,
@@ -37,6 +49,8 @@ pub const ALL_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_REPO_STATE,
     CREATE_REPO_IDENTITY,
     CREATE_REPO_BLOCKS,
+    CREATE_REPO_BLOBS,
+    CREATE_REPO_BLOBS_CREATED_INDEX,
     CREATE_RECORD_INDEX,
     CREATE_RECORD_COLLECTION_INDEX,
 ];
@@ -61,6 +75,10 @@ pub const CREATE_DIRECTORY_EVENTS: &str = "CREATE TABLE IF NOT EXISTS directory_
     event_type TEXT NOT NULL,
     commit_cid TEXT,
     rev        TEXT,
+    since      TEXT,
+    blocks     BLOB,
+    ops_json   TEXT NOT NULL DEFAULT '[]',
+    blobs_json TEXT NOT NULL DEFAULT '[]',
     created_at INTEGER NOT NULL DEFAULT (unixepoch())
 )";
 
@@ -86,6 +104,7 @@ mod tests {
         assert!(joined.contains("repo_state"));
         assert!(joined.contains("repo_identity"));
         assert!(joined.contains("repo_blocks"));
+        assert!(joined.contains("repo_blobs"));
         assert!(joined.contains("record_index"));
         assert!(joined.contains("idx_record_index_collection_path"));
     }
@@ -111,6 +130,13 @@ mod tests {
     }
 
     #[test]
+    fn repo_blobs_store_raw_bytes_by_cid() {
+        assert!(CREATE_REPO_BLOBS.contains("cid        TEXT PRIMARY KEY"));
+        assert!(CREATE_REPO_BLOBS.contains("mime_type  TEXT NOT NULL"));
+        assert!(CREATE_REPO_BLOBS.contains("bytes      BLOB NOT NULL"));
+    }
+
+    #[test]
     fn directory_schema_indexes_repos_and_events() {
         let joined = DIRECTORY_SCHEMA_STATEMENTS.join("\n");
 
@@ -119,6 +145,8 @@ mod tests {
         assert!(joined.contains("idx_directory_repos_updated_at"));
         assert!(joined.contains("directory_events"));
         assert!(joined.contains("seq        INTEGER PRIMARY KEY AUTOINCREMENT"));
+        assert!(joined.contains("blocks     BLOB"));
+        assert!(joined.contains("ops_json   TEXT NOT NULL DEFAULT '[]'"));
         assert!(joined.contains("idx_directory_events_did_seq"));
     }
 }

@@ -3,7 +3,7 @@
 use serde::Deserialize;
 use worker::{Error as WorkerError, SqlStorage, SqlStorageValue};
 
-use crate::cid::{parse_cid, verify_repo_block_cid, Cid};
+use crate::cid::{parse_cid, raw_cid, verify_repo_block_cid, Cid};
 use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RepoPath};
 use crate::do_schema::{ALL_SCHEMA_STATEMENTS, DIRECTORY_SCHEMA_STATEMENTS};
@@ -42,6 +42,38 @@ pub struct DirectoryRepoRow {
     pub head: Cid,
     pub rev: RepoRev,
     pub active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryCommitEventInput {
+    pub did: Did,
+    pub commit_cid: Cid,
+    pub rev: RepoRev,
+    pub since: Option<RepoRev>,
+    pub blocks: Vec<u8>,
+    pub ops_json: String,
+    pub blobs_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryEventRow {
+    pub seq: i64,
+    pub did: Did,
+    pub event_type: String,
+    pub commit_cid: Option<Cid>,
+    pub rev: Option<RepoRev>,
+    pub since: Option<RepoRev>,
+    pub blocks: Option<Vec<u8>>,
+    pub ops_json: String,
+    pub blobs_json: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoBlobRow {
+    pub cid: Cid,
+    pub mime_type: String,
+    pub bytes: Vec<u8>,
 }
 
 impl RepoIdentityRow {
@@ -158,10 +190,119 @@ impl SqlRepoStore {
 
     pub fn clear_all(&self) -> worker::Result<()> {
         self.sql.exec("DELETE FROM record_index", None)?;
+        self.sql.exec("DELETE FROM repo_blobs", None)?;
         self.sql.exec("DELETE FROM repo_blocks", None)?;
         self.sql.exec("DELETE FROM repo_identity", None)?;
         self.sql.exec("DELETE FROM repo_state", None)?;
         Ok(())
+    }
+
+    pub fn put_blob(&self, mime_type: &str, bytes: Vec<u8>) -> worker::Result<RepoBlobRow> {
+        let cid = raw_cid(&bytes);
+        self.sql.exec(
+            "INSERT OR IGNORE INTO repo_blobs (cid, mime_type, bytes, byte_len)
+             VALUES (?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(cid.to_string()),
+                SqlStorageValue::from(mime_type.to_string()),
+                SqlStorageValue::Blob(bytes.clone()),
+                SqlStorageValue::from(bytes.len() as i64),
+            ],
+        )?;
+
+        Ok(RepoBlobRow {
+            cid,
+            mime_type: mime_type.to_string(),
+            bytes,
+        })
+    }
+
+    pub fn get_blob(&self, cid: &Cid) -> worker::Result<Option<RepoBlobRow>> {
+        #[derive(Deserialize)]
+        struct Row {
+            mime_type: String,
+        }
+
+        let rows: Vec<Row> = self
+            .sql
+            .exec(
+                "SELECT mime_type FROM repo_blobs WHERE cid = ?",
+                vec![SqlStorageValue::from(cid.to_string())],
+            )?
+            .to_array()?;
+        let Some(row) = rows.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let cursor = self.sql.exec(
+            "SELECT bytes FROM repo_blobs WHERE cid = ?",
+            vec![SqlStorageValue::from(cid.to_string())],
+        )?;
+        let Some(raw_row) = cursor.raw().next() else {
+            return Ok(None);
+        };
+        let values = raw_row?;
+        let Some(SqlStorageValue::Blob(bytes)) = values.into_iter().next() else {
+            return Err(worker_error(std::io::Error::other(
+                "blob query returned non-blob bytes",
+            )));
+        };
+
+        Ok(Some(RepoBlobRow {
+            cid: *cid,
+            mime_type: row.mime_type,
+            bytes,
+        }))
+    }
+
+    pub fn list_blob_cids(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> worker::Result<(Vec<Cid>, Option<String>)> {
+        #[derive(Deserialize)]
+        struct Row {
+            cid: String,
+        }
+
+        let query_limit = limit.saturating_add(1);
+        let rows: Vec<Row> = if let Some(cursor) = cursor {
+            self.sql
+                .exec(
+                    "SELECT cid FROM repo_blobs
+                     WHERE cid > ?
+                     ORDER BY cid ASC
+                     LIMIT ?",
+                    vec![
+                        SqlStorageValue::from(cursor.to_string()),
+                        SqlStorageValue::from(query_limit as i64),
+                    ],
+                )?
+                .to_array()?
+        } else {
+            self.sql
+                .exec(
+                    "SELECT cid FROM repo_blobs
+                     ORDER BY cid ASC
+                     LIMIT ?",
+                    vec![SqlStorageValue::from(query_limit as i64)],
+                )?
+                .to_array()?
+        };
+
+        let has_more = rows.len() > limit;
+        let cids = rows
+            .into_iter()
+            .take(limit)
+            .map(|row| parse_cid(&row.cid).map_err(worker_error))
+            .collect::<worker::Result<Vec<_>>>()?;
+        let next_cursor = if has_more {
+            cids.last().map(|cid| cid.to_string())
+        } else {
+            None
+        };
+
+        Ok((cids, next_cursor))
     }
 }
 
@@ -174,11 +315,18 @@ impl SqlDirectoryStore {
         for statement in DIRECTORY_SCHEMA_STATEMENTS {
             self.sql.exec(statement, None)?;
         }
+        for statement in [
+            "ALTER TABLE directory_events ADD COLUMN since TEXT",
+            "ALTER TABLE directory_events ADD COLUMN blocks BLOB",
+            "ALTER TABLE directory_events ADD COLUMN ops_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE directory_events ADD COLUMN blobs_json TEXT NOT NULL DEFAULT '[]'",
+        ] {
+            exec_ignore_duplicate_column(&self.sql, statement)?;
+        }
         Ok(())
     }
 
     pub fn upsert_repo(&self, row: &DirectoryRepoRow) -> worker::Result<()> {
-        let previous_head = self.get_repo(&row.did)?.map(|repo| repo.head);
         self.sql.exec(
             "INSERT INTO directory_repos (did, handle, repo_name, head, rev, active, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, unixepoch())
@@ -199,28 +347,78 @@ impl SqlDirectoryStore {
             ],
         )?;
 
-        if previous_head != Some(row.head) {
-            self.append_event("repo_update", row)?;
-        }
-
         Ok(())
     }
 
-    pub fn get_repo(&self, did: &Did) -> worker::Result<Option<DirectoryRepoRow>> {
-        let rows: Vec<DirectoryRepoStorageRow> = self
-            .sql
-            .exec(
-                "SELECT did, handle, repo_name, head, rev, active
-                 FROM directory_repos
-                 WHERE did = ?",
-                vec![SqlStorageValue::from(did.to_string())],
-            )?
-            .to_array()?;
+    pub fn append_commit_event(
+        &self,
+        event: &DirectoryCommitEventInput,
+    ) -> worker::Result<DirectoryEventRow> {
+        self.sql.exec(
+            "INSERT INTO directory_events (
+                did, event_type, commit_cid, rev, since, blocks, ops_json, blobs_json
+             )
+             VALUES (?, 'commit', ?, ?, ?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(event.did.to_string()),
+                SqlStorageValue::from(event.commit_cid.to_string()),
+                SqlStorageValue::from(event.rev.to_string()),
+                optional_text(event.since.as_ref().map(|rev| rev.to_string())),
+                SqlStorageValue::Blob(event.blocks.clone()),
+                SqlStorageValue::from(event.ops_json.clone()),
+                SqlStorageValue::from(event.blobs_json.clone()),
+            ],
+        )?;
 
-        rows.into_iter()
-            .next()
-            .map(directory_repo_from_row)
-            .transpose()
+        let seq = last_insert_rowid(&self.sql)?;
+        self.get_event(seq)?.ok_or_else(|| {
+            worker_error(std::io::Error::other("inserted directory event not found"))
+        })
+    }
+
+    pub fn max_event_seq(&self) -> worker::Result<i64> {
+        count(
+            &self.sql,
+            "SELECT COALESCE(MAX(seq), 0) AS n FROM directory_events",
+        )
+    }
+
+    pub fn list_events_after(
+        &self,
+        cursor: i64,
+        limit: usize,
+    ) -> worker::Result<Vec<DirectoryEventRow>> {
+        let rows = self.sql.exec(
+            "SELECT seq, did, event_type, commit_cid, rev, since, blocks, ops_json, blobs_json,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_events
+                 WHERE seq > ? AND event_type = 'commit'
+                 ORDER BY seq ASC
+                 LIMIT ?",
+            vec![
+                SqlStorageValue::from(cursor),
+                SqlStorageValue::from(limit as i64),
+            ],
+        )?;
+
+        rows.raw()
+            .map(|row| directory_event_from_values(row?))
+            .collect()
+    }
+
+    fn get_event(&self, seq: i64) -> worker::Result<Option<DirectoryEventRow>> {
+        let rows = self.sql.exec(
+            "SELECT seq, did, event_type, commit_cid, rev, since, blocks, ops_json, blobs_json,
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+             FROM directory_events
+             WHERE seq = ?",
+            vec![SqlStorageValue::from(seq)],
+        )?;
+
+        let Some(row) = rows.raw().next() else {
+            return Ok(None);
+        };
+        Ok(Some(directory_event_from_values(row?)?))
     }
 
     pub fn list_repos(
@@ -276,20 +474,6 @@ impl SqlDirectoryStore {
 
     pub fn event_count(&self) -> worker::Result<i64> {
         count(&self.sql, "SELECT COUNT(*) AS n FROM directory_events")
-    }
-
-    fn append_event(&self, event_type: &str, row: &DirectoryRepoRow) -> worker::Result<()> {
-        self.sql.exec(
-            "INSERT INTO directory_events (did, event_type, commit_cid, rev)
-             VALUES (?, ?, ?, ?)",
-            vec![
-                SqlStorageValue::from(row.did.to_string()),
-                SqlStorageValue::from(event_type.to_string()),
-                SqlStorageValue::from(row.head.to_string()),
-                SqlStorageValue::from(row.rev.to_string()),
-            ],
-        )?;
-        Ok(())
     }
 }
 
@@ -459,6 +643,122 @@ struct DirectoryRepoStorageRow {
 
 fn worker_error(error: impl std::error::Error) -> WorkerError {
     WorkerError::RustError(error.to_string())
+}
+
+fn exec_ignore_duplicate_column(sql: &SqlStorage, statement: &str) -> worker::Result<()> {
+    match sql.exec(statement, None) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn optional_text(value: Option<String>) -> SqlStorageValue {
+    value
+        .map(SqlStorageValue::from)
+        .unwrap_or(SqlStorageValue::Null)
+}
+
+fn last_insert_rowid(sql: &SqlStorage) -> worker::Result<i64> {
+    #[derive(Deserialize)]
+    struct Row {
+        n: i64,
+    }
+
+    let row: Row = sql.exec("SELECT last_insert_rowid() AS n", None)?.one()?;
+    Ok(row.n)
+}
+
+fn directory_event_from_values(values: Vec<SqlStorageValue>) -> worker::Result<DirectoryEventRow> {
+    let mut values = values.into_iter();
+    let seq = next_i64(&mut values, "seq")?;
+    let did = Did::new(next_string(&mut values, "did")?).map_err(worker_error)?;
+    let event_type = next_string(&mut values, "event_type")?;
+    let commit_cid = next_optional_string(&mut values, "commit_cid")?
+        .map(|value| parse_cid(&value).map_err(worker_error))
+        .transpose()?;
+    let rev = next_optional_string(&mut values, "rev")?
+        .map(|value| RepoRev::new(value).map_err(worker_error))
+        .transpose()?;
+    let since = next_optional_string(&mut values, "since")?
+        .map(|value| RepoRev::new(value).map_err(worker_error))
+        .transpose()?;
+    let blocks = next_optional_blob(&mut values, "blocks")?;
+    let ops_json = next_string(&mut values, "ops_json")?;
+    let blobs_json = next_string(&mut values, "blobs_json")?;
+    let created_at = next_string(&mut values, "created_at")?;
+
+    Ok(DirectoryEventRow {
+        seq,
+        did,
+        event_type,
+        commit_cid,
+        rev,
+        since,
+        blocks,
+        ops_json,
+        blobs_json,
+        created_at,
+    })
+}
+
+fn next_i64(values: &mut impl Iterator<Item = SqlStorageValue>, name: &str) -> worker::Result<i64> {
+    match values.next() {
+        Some(SqlStorageValue::Integer(value)) => Ok(value),
+        Some(other) => Err(worker_error(std::io::Error::other(format!(
+            "expected integer column `{name}`, got {other:?}"
+        )))),
+        None => Err(worker_error(std::io::Error::other(format!(
+            "missing column `{name}`"
+        )))),
+    }
+}
+
+fn next_string(
+    values: &mut impl Iterator<Item = SqlStorageValue>,
+    name: &str,
+) -> worker::Result<String> {
+    match values.next() {
+        Some(SqlStorageValue::String(value)) => Ok(value),
+        Some(other) => Err(worker_error(std::io::Error::other(format!(
+            "expected string column `{name}`, got {other:?}"
+        )))),
+        None => Err(worker_error(std::io::Error::other(format!(
+            "missing column `{name}`"
+        )))),
+    }
+}
+
+fn next_optional_string(
+    values: &mut impl Iterator<Item = SqlStorageValue>,
+    name: &str,
+) -> worker::Result<Option<String>> {
+    match values.next() {
+        Some(SqlStorageValue::String(value)) => Ok(Some(value)),
+        Some(SqlStorageValue::Null) => Ok(None),
+        Some(other) => Err(worker_error(std::io::Error::other(format!(
+            "expected optional string column `{name}`, got {other:?}"
+        )))),
+        None => Err(worker_error(std::io::Error::other(format!(
+            "missing column `{name}`"
+        )))),
+    }
+}
+
+fn next_optional_blob(
+    values: &mut impl Iterator<Item = SqlStorageValue>,
+    name: &str,
+) -> worker::Result<Option<Vec<u8>>> {
+    match values.next() {
+        Some(SqlStorageValue::Blob(value)) => Ok(Some(value)),
+        Some(SqlStorageValue::Null) => Ok(None),
+        Some(other) => Err(worker_error(std::io::Error::other(format!(
+            "expected optional blob column `{name}`, got {other:?}"
+        )))),
+        None => Err(worker_error(std::io::Error::other(format!(
+            "missing column `{name}`"
+        )))),
+    }
 }
 
 fn storage_error(error: WorkerError) -> StorageError {
