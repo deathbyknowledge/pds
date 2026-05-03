@@ -19,8 +19,8 @@ use worker::{
 };
 
 use crate::auth::{
-    hash_password, session_claims, sign_token, verify_password, verify_token, ACCESS_SCOPE,
-    REFRESH_SCOPE,
+    hash_password, oauth_session_claims, session_claims, sign_token, verify_password, verify_token,
+    ACCESS_SCOPE, REFRESH_SCOPE,
 };
 use crate::car::{decode_car, encode_car, encode_car_from_store, CarBlock, CarError};
 use crate::cbor::encode_dag_cbor;
@@ -36,9 +36,10 @@ use crate::do_store::{
 use crate::identity::{IdentityError, RepoSigningKey};
 use crate::oauth::{
     authorization_server_metadata, is_oauth_well_known_path, parse_authorization_request,
-    parse_pushed_authorization_request, protected_resource_metadata, OAuthRequestError,
-    OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_PAR_EXPIRES_IN_SECONDS,
-    OAUTH_PAR_PATH, OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
+    parse_pushed_authorization_request, parse_token_request, protected_resource_metadata,
+    OAuthRequestError, TokenRequest, OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH,
+    OAUTH_PAR_EXPIRES_IN_SECONDS, OAUTH_PAR_PATH, OAUTH_PROTECTED_RESOURCE_PATH,
+    OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
 };
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
@@ -773,12 +774,180 @@ impl PdsDirectoryObject {
     }
 
     async fn oauth_token(&self, req: &mut Request) -> Result<Response, HttpError> {
-        ensure_form_urlencoded(req)?;
-        let _ = req.text().await.map_err(HttpError::worker)?;
-        oauth_error_response(
-            501,
-            "temporarily_unavailable",
-            "OAuth token exchange is not implemented yet",
+        if let Err(error) = ensure_form_urlencoded(req) {
+            return oauth_error_response(415, "invalid_request", &error.message)
+                .map_err(HttpError::worker);
+        }
+        let body = req.text().await.map_err(HttpError::worker)?;
+        let request = match parse_token_request(&body) {
+            Ok(request) => request,
+            Err(error) => return oauth_request_error_response(error).map_err(HttpError::worker),
+        };
+        match request {
+            TokenRequest::AuthorizationCode {
+                client_id,
+                code,
+                redirect_uri,
+                code_verifier,
+            } => self.oauth_authorization_code_token(
+                &client_id,
+                &code,
+                &redirect_uri,
+                &code_verifier,
+            ),
+            TokenRequest::RefreshToken {
+                client_id,
+                refresh_token,
+            } => self.oauth_refresh_token(&client_id, &refresh_token),
+        }
+    }
+
+    fn oauth_authorization_code_token(
+        &self,
+        client_id: &str,
+        code: &str,
+        redirect_uri: &str,
+        code_verifier: &str,
+    ) -> Result<Response, HttpError> {
+        let now = current_unix_time();
+        let store = self.store();
+        store
+            .purge_expired_oauth_authorization_codes(now)
+            .map_err(HttpError::worker)?;
+        let Some(authorization_code) = store
+            .get_oauth_authorization_code(code, now)
+            .map_err(HttpError::worker)?
+        else {
+            return oauth_error_response(
+                400,
+                "invalid_grant",
+                "unknown or expired authorization code",
+            )
+            .map_err(HttpError::worker);
+        };
+        if authorization_code.client_id != client_id {
+            return oauth_error_response(400, "invalid_grant", "client_id did not match code")
+                .map_err(HttpError::worker);
+        }
+        if authorization_code.redirect_uri != redirect_uri {
+            return oauth_error_response(400, "invalid_grant", "redirect_uri did not match code")
+                .map_err(HttpError::worker);
+        }
+        if authorization_code.code_challenge_method != "S256"
+            || pkce_s256_challenge(code_verifier) != authorization_code.code_challenge
+        {
+            return oauth_error_response(400, "invalid_grant", "PKCE verification failed")
+                .map_err(HttpError::worker);
+        }
+
+        let Some(account) = store
+            .get_account_by_did(&authorization_code.did)
+            .map_err(HttpError::worker)?
+            .filter(|account| account.active)
+        else {
+            return oauth_error_response(
+                400,
+                "invalid_grant",
+                "authorization account is unavailable",
+            )
+            .map_err(HttpError::worker);
+        };
+        store
+            .consume_oauth_authorization_code(code, now)
+            .map_err(HttpError::worker)?;
+        let oauth_session = self.create_oauth_session_for_account(
+            &account,
+            client_id,
+            &authorization_code.scope,
+            None,
+        )?;
+        store
+            .insert_session(&oauth_session.row)
+            .map_err(HttpError::worker)?;
+        oauth_token_response(
+            &oauth_session.tokens,
+            &authorization_code.scope,
+            account.did.as_str(),
+            &oauth_session.dpop_nonce,
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn oauth_refresh_token(
+        &self,
+        client_id: &str,
+        refresh_token: &str,
+    ) -> Result<Response, HttpError> {
+        let now = current_unix_time();
+        let claims = match verify_token(
+            &token_secret_from_env(&self.env)?,
+            refresh_token,
+            REFRESH_SCOPE,
+            now,
+        ) {
+            Ok(claims) => claims,
+            Err(_) => {
+                return oauth_error_response(400, "invalid_grant", "invalid refresh token")
+                    .map_err(HttpError::worker);
+            }
+        };
+        if claims.client_id.as_deref() != Some(client_id) {
+            return oauth_error_response(
+                400,
+                "invalid_grant",
+                "client_id did not match refresh token",
+            )
+            .map_err(HttpError::worker);
+        }
+        let Some(scope) = claims.oauth_scope.as_deref() else {
+            return oauth_error_response(
+                400,
+                "invalid_grant",
+                "refresh token is not an OAuth token",
+            )
+            .map_err(HttpError::worker);
+        };
+        let store = self.store();
+        let Some(session) = store
+            .get_session_by_refresh_jti(&claims.jti)
+            .map_err(HttpError::worker)?
+        else {
+            return oauth_error_response(400, "invalid_grant", "refresh token is no longer active")
+                .map_err(HttpError::worker);
+        };
+        if !session.active {
+            return oauth_error_response(400, "invalid_grant", "refresh token is no longer active")
+                .map_err(HttpError::worker);
+        }
+        let Some(account) = store
+            .get_account_by_did(&session.did)
+            .map_err(HttpError::worker)?
+            .filter(|account| account.active)
+        else {
+            return oauth_error_response(
+                400,
+                "invalid_grant",
+                "authorization account is unavailable",
+            )
+            .map_err(HttpError::worker);
+        };
+        let oauth_session = self.create_oauth_session_for_account(
+            &account,
+            client_id,
+            scope,
+            Some(session.session_id),
+        )?;
+        store
+            .rotate_session_refresh(
+                &oauth_session.row.session_id,
+                &oauth_session.row.refresh_jti,
+            )
+            .map_err(HttpError::worker)?;
+        oauth_token_response(
+            &oauth_session.tokens,
+            scope,
+            account.did.as_str(),
+            &oauth_session.dpop_nonce,
         )
         .map_err(HttpError::worker)
     }
@@ -1007,6 +1176,64 @@ impl PdsDirectoryObject {
                 access_jwt,
                 refresh_jwt,
             },
+        })
+    }
+
+    fn create_oauth_session_for_account(
+        &self,
+        account: &DirectoryAccountRow,
+        client_id: &str,
+        oauth_scope: &str,
+        session_id: Option<String>,
+    ) -> Result<CreatedOAuthSession, HttpError> {
+        let now = current_unix_time();
+        let session_id = match session_id {
+            Some(session_id) => session_id,
+            None => random_token_id()?,
+        };
+        let access_jti = random_token_id()?;
+        let refresh_jti = random_token_id()?;
+        let secret = token_secret_from_env(&self.env)?;
+        let access_jwt = sign_token(
+            &secret,
+            &oauth_session_claims(
+                account.did.as_str(),
+                &account.handle,
+                &access_jti,
+                ACCESS_SCOPE,
+                now,
+                ACCESS_TOKEN_TTL_SECONDS,
+                client_id,
+                oauth_scope,
+            ),
+        )
+        .map_err(HttpError::auth)?;
+        let refresh_jwt = sign_token(
+            &secret,
+            &oauth_session_claims(
+                account.did.as_str(),
+                &account.handle,
+                &refresh_jti,
+                REFRESH_SCOPE,
+                now,
+                REFRESH_TOKEN_TTL_SECONDS,
+                client_id,
+                oauth_scope,
+            ),
+        )
+        .map_err(HttpError::auth)?;
+        Ok(CreatedOAuthSession {
+            row: DirectorySessionRow {
+                session_id,
+                did: account.did.clone(),
+                refresh_jti,
+                active: true,
+            },
+            tokens: SessionTokens {
+                access_jwt,
+                refresh_jwt,
+            },
+            dpop_nonce: random_urlsafe_token::<OAUTH_DPOP_NONCE_BYTES>()?,
         })
     }
 
@@ -2651,6 +2878,12 @@ struct CreatedSession {
     tokens: SessionTokens,
 }
 
+struct CreatedOAuthSession {
+    row: DirectorySessionRow,
+    tokens: SessionTokens,
+    dpop_nonce: String,
+}
+
 struct SessionTokens {
     access_jwt: String,
     refresh_jwt: String,
@@ -3240,6 +3473,7 @@ fn bearer_token(req: &Request) -> Result<String, HttpError> {
         .ok_or_else(|| HttpError::new(401, "authorization bearer token required"))?;
     authorization
         .strip_prefix("Bearer ")
+        .or_else(|| authorization.strip_prefix("DPoP "))
         .filter(|token| !token.is_empty())
         .map(|token| token.to_string())
         .ok_or_else(|| HttpError::new(401, "authorization bearer token required"))
@@ -3315,6 +3549,10 @@ fn random_token_id() -> Result<String, HttpError> {
 
 fn random_urlsafe_token<const N: usize>() -> Result<String, HttpError> {
     Ok(BASE64_URL_SAFE_NO_PAD.encode(random_bytes::<N>()?))
+}
+
+fn pkce_s256_challenge(verifier: &str) -> String {
+    BASE64_URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
 fn random_bytes<const N: usize>() -> Result<[u8; N], HttpError> {
@@ -3831,6 +4069,27 @@ fn oauth_par_response(
     }))?
     .with_status(201);
     response.headers_mut().set("cache-control", "no-store")?;
+    response.headers_mut().set("dpop-nonce", dpop_nonce)?;
+    set_cors(&mut response)?;
+    Ok(response)
+}
+
+fn oauth_token_response(
+    tokens: &SessionTokens,
+    scope: &str,
+    sub: &str,
+    dpop_nonce: &str,
+) -> worker::Result<Response> {
+    let mut response = Response::from_json(&json!({
+        "access_token": &tokens.access_jwt,
+        "token_type": "DPoP",
+        "expires_in": ACCESS_TOKEN_TTL_SECONDS,
+        "refresh_token": &tokens.refresh_jwt,
+        "scope": scope,
+        "sub": sub,
+    }))?;
+    response.headers_mut().set("cache-control", "no-store")?;
+    response.headers_mut().set("pragma", "no-cache")?;
     response.headers_mut().set("dpop-nonce", dpop_nonce)?;
     set_cors(&mut response)?;
     Ok(response)

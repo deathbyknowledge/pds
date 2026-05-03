@@ -136,6 +136,22 @@ pub struct DirectoryOauthAuthorizationCodeInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryOauthAuthorizationCodeRow {
+    pub code: String,
+    pub request_uri: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scope: String,
+    pub state: String,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    pub did: Did,
+    pub handle: String,
+    pub dpop_nonce: String,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoBlobRow {
     pub cid: Cid,
     pub mime_type: String,
@@ -847,6 +863,46 @@ impl SqlDirectoryStore {
         Ok(())
     }
 
+    pub fn get_oauth_authorization_code(
+        &self,
+        code: &str,
+        now: i64,
+    ) -> worker::Result<Option<DirectoryOauthAuthorizationCodeRow>> {
+        let rows: Vec<DirectoryOauthAuthorizationCodeStorageRow> = self
+            .sql
+            .exec(
+                "SELECT
+                    code, request_uri, client_id, redirect_uri, scope, state, code_challenge,
+                    code_challenge_method, did, handle, dpop_nonce, expires_at
+                 FROM directory_oauth_authorization_codes
+                 WHERE code = ? AND expires_at > ? AND consumed_at IS NULL
+                 LIMIT 1",
+                vec![
+                    SqlStorageValue::from(code.to_string()),
+                    SqlStorageValue::from(now),
+                ],
+            )?
+            .to_array()?;
+        rows.into_iter()
+            .next()
+            .map(directory_oauth_authorization_code_from_row)
+            .transpose()
+    }
+
+    pub fn consume_oauth_authorization_code(&self, code: &str, now: i64) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_oauth_authorization_codes
+             SET consumed_at = ?
+             WHERE code = ? AND expires_at > ? AND consumed_at IS NULL",
+            vec![
+                SqlStorageValue::from(now),
+                SqlStorageValue::from(code.to_string()),
+                SqlStorageValue::from(now),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn purge_expired_oauth_authorization_codes(&self, now: i64) -> worker::Result<()> {
         self.sql.exec(
             "DELETE FROM directory_oauth_authorization_codes WHERE expires_at <= ?",
@@ -1292,6 +1348,25 @@ fn directory_oauth_par_request_from_row(
     }
 }
 
+fn directory_oauth_authorization_code_from_row(
+    row: DirectoryOauthAuthorizationCodeStorageRow,
+) -> worker::Result<DirectoryOauthAuthorizationCodeRow> {
+    Ok(DirectoryOauthAuthorizationCodeRow {
+        code: row.code,
+        request_uri: row.request_uri,
+        client_id: row.client_id,
+        redirect_uri: row.redirect_uri,
+        scope: row.scope,
+        state: row.state,
+        code_challenge: row.code_challenge,
+        code_challenge_method: row.code_challenge_method,
+        did: Did::new(row.did).map_err(worker_error)?,
+        handle: row.handle,
+        dpop_nonce: row.dpop_nonce,
+        expires_at: row.expires_at,
+    })
+}
+
 trait IntoDirectoryRepoRow {
     fn into_directory_repo_row(self) -> worker::Result<DirectoryRepoRow>;
 }
@@ -1351,6 +1426,22 @@ struct DirectoryOauthParRequestStorageRow {
     login_hint: Option<String>,
     dpop_nonce: String,
     params_json: String,
+    expires_at: i64,
+}
+
+#[derive(Deserialize)]
+struct DirectoryOauthAuthorizationCodeStorageRow {
+    code: String,
+    request_uri: String,
+    client_id: String,
+    redirect_uri: String,
+    scope: String,
+    state: String,
+    code_challenge: String,
+    code_challenge_method: String,
+    did: String,
+    handle: String,
+    dpop_nonce: String,
     expires_at: i64,
 }
 

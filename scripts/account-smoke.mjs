@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { createHash } from "node:crypto";
 
 const config = {
   baseUrl: requiredEnv("PDS_BASE_URL").replace(/\/+$/, ""),
@@ -40,7 +41,20 @@ await expectJson(
 );
 
 await expectOAuthAuthorize(oauthPar, session.accessJwt);
-await expectOAuthTokenStub();
+const oauthToken = await expectOAuthTokenExchange(oauthPar);
+await expectJson(
+  "OAuth access token getSession",
+  "GET",
+  "/xrpc/com.atproto.server.getSession",
+  null,
+  (body) => {
+    if (body.did !== session.did || body.handle !== handle) {
+      throw new Error(`unexpected OAuth getSession response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `DPoP ${oauthToken.access_token}` },
+);
+await expectOAuthRefresh(oauthPar.clientId, oauthToken.refresh_token);
 
 const createRecord = await expectJson(
   "account createRecord",
@@ -188,10 +202,11 @@ async function expectOAuthParEndpoint() {
   const state = `state-${Date.now().toString(36)}`;
   const clientId = "http://localhost";
   const redirectUri = "http://127.0.0.1/callback";
+  const codeVerifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
   const parBody = new URLSearchParams({
     client_id: clientId,
     response_type: "code",
-    code_challenge: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+    code_challenge: pkceS256Challenge(codeVerifier),
     code_challenge_method: "S256",
     state,
     redirect_uri: redirectUri,
@@ -240,6 +255,7 @@ async function expectOAuthParEndpoint() {
     redirectUri,
     requestUri: par.request_uri,
     state,
+    codeVerifier,
   };
 }
 
@@ -272,35 +288,83 @@ async function expectOAuthAuthorize(par, accessJwt) {
   ) {
     throw new Error(`OAuth authorize redirect had unexpected query ${location}`);
   }
+  par.code = actualRedirect.searchParams.get("code");
 }
 
-async function expectOAuthTokenStub() {
-  await expectOAuthStub(
-    "OAuth token scaffold",
+async function expectOAuthTokenExchange(par) {
+  const body = new URLSearchParams({
+    grant_type: "authorization_code",
+    client_id: par.clientId,
+    code: par.code,
+    redirect_uri: par.redirectUri,
+    code_verifier: par.codeVerifier,
+  }).toString();
+  const token = await expectJson(
+    "OAuth token exchange",
     "POST",
     "/oauth/token",
-    "grant_type=authorization_code&code=stub",
+    body,
+    (body, response) => {
+      if (
+        !body.access_token ||
+        !body.refresh_token ||
+        body.token_type !== "DPoP" ||
+        body.expires_in !== 900 ||
+        body.sub !== `did:web:${handle}` ||
+        !String(body.scope ?? "").split(/\s+/).includes("atproto")
+      ) {
+        throw new Error(`unexpected OAuth token response ${JSON.stringify(body)}`);
+      }
+      if (!response.headers.get("dpop-nonce")) {
+        throw new Error(`OAuth token response did not include DPoP-Nonce header`);
+      }
+    },
     { "content-type": "application/x-www-form-urlencoded" },
   );
+  await expectStatus(
+    "OAuth authorization code replay",
+    "POST",
+    "/oauth/token",
+    body,
+    400,
+    { "content-type": "application/x-www-form-urlencoded" },
+  );
+  return token;
 }
 
-async function expectOAuthStub(label, method, path, body = null, extraHeaders = {}) {
-  const response = await request(method, path, body, extraHeaders);
-  const text = await response.text();
-  let parsed;
-  try {
-    parsed = JSON.parse(text);
-  } catch (error) {
-    throw new Error(`${label} returned non-JSON status=${response.status}: ${text}`, {
-      cause: error,
-    });
-  }
-  if (response.status !== 501 || parsed.error !== "temporarily_unavailable") {
-    throw new Error(`${label} returned unexpected response status=${response.status}: ${JSON.stringify(parsed)}`);
-  }
-  if (parsed.error === "MethodNotFound") {
-    throw new Error(`${label} still returned MethodNotFound`);
-  }
+async function expectOAuthRefresh(clientId, refreshToken) {
+  const refreshed = await expectJson(
+    "OAuth refresh token",
+    "POST",
+    "/oauth/token",
+    new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: clientId,
+      refresh_token: refreshToken,
+    }).toString(),
+    (body, response) => {
+      if (!body.access_token || !body.refresh_token || body.token_type !== "DPoP" || body.sub !== `did:web:${handle}`) {
+        throw new Error(`unexpected OAuth refresh response ${JSON.stringify(body)}`);
+      }
+      if (!response.headers.get("dpop-nonce")) {
+        throw new Error(`OAuth refresh response did not include DPoP-Nonce header`);
+      }
+    },
+    { "content-type": "application/x-www-form-urlencoded" },
+  );
+  await expectStatus(
+    "OAuth refresh token replay",
+    "POST",
+    "/oauth/token",
+    new URLSearchParams({
+      grant_type: "refresh_token",
+      client_id: clientId,
+      refresh_token: refreshToken,
+    }).toString(),
+    400,
+    { "content-type": "application/x-www-form-urlencoded" },
+  );
+  return refreshed;
 }
 
 async function expectJson(label, method, path, body, validate = undefined, extraHeaders = {}) {
@@ -362,4 +426,12 @@ function optionalEnv(name, fallback = undefined) {
 
 function encodeQuery(value) {
   return encodeURIComponent(value);
+}
+
+function pkceS256Challenge(verifier) {
+  return base64Url(createHash("sha256").update(verifier).digest());
+}
+
+function base64Url(bytes) {
+  return Buffer.from(bytes).toString("base64").replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
 }

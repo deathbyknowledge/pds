@@ -36,6 +36,20 @@ pub struct AuthorizationRequest {
     pub request_uri: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenRequest {
+    AuthorizationCode {
+        client_id: String,
+        code: String,
+        redirect_uri: String,
+        code_verifier: String,
+    },
+    RefreshToken {
+        client_id: String,
+        refresh_token: String,
+    },
+}
+
 impl PushedAuthorizationRequest {
     pub fn requested_scopes(&self) -> BTreeSet<&str> {
         self.scope.split_whitespace().collect()
@@ -77,6 +91,9 @@ pub enum OAuthRequestError {
     #[error("confidential OAuth client authentication is not implemented yet")]
     UnsupportedClientAuthentication,
 
+    #[error("unsupported OAuth grant type `{grant_type}`")]
+    UnsupportedGrantType { grant_type: String },
+
     #[error("malformed form body: {0}")]
     MalformedForm(String),
 }
@@ -89,6 +106,7 @@ impl OAuthRequestError {
                 ..
             } => "invalid_client",
             Self::UnsupportedClientAuthentication => "invalid_client",
+            Self::UnsupportedGrantType { .. } => "unsupported_grant_type",
             _ => "invalid_request",
         }
     }
@@ -240,6 +258,43 @@ pub fn parse_pushed_authorization_request(
     })
 }
 
+pub fn parse_token_request(body: &str) -> Result<TokenRequest, OAuthRequestError> {
+    let fields = parse_form_urlencoded(body)?;
+    reject_unsupported_client_secret(&fields)?;
+    reject_unsupported_client_assertion(&fields)?;
+
+    let grant_type = required_single(&fields, "grant_type")?;
+    match grant_type.as_str() {
+        "authorization_code" => {
+            let client_id = required_single(&fields, "client_id")?;
+            validate_client_id(&client_id)?;
+            let code = required_single(&fields, "code")?;
+            validate_nonempty_length("code", &code, 2048)?;
+            let redirect_uri = required_single(&fields, "redirect_uri")?;
+            validate_redirect_uri(&redirect_uri)?;
+            let code_verifier = required_single(&fields, "code_verifier")?;
+            validate_code_verifier(&code_verifier)?;
+            Ok(TokenRequest::AuthorizationCode {
+                client_id,
+                code,
+                redirect_uri,
+                code_verifier,
+            })
+        }
+        "refresh_token" => {
+            let client_id = required_single(&fields, "client_id")?;
+            validate_client_id(&client_id)?;
+            let refresh_token = required_single(&fields, "refresh_token")?;
+            validate_nonempty_length("refresh_token", &refresh_token, 100_000)?;
+            Ok(TokenRequest::RefreshToken {
+                client_id,
+                refresh_token,
+            })
+        }
+        _ => Err(OAuthRequestError::UnsupportedGrantType { grant_type }),
+    }
+}
+
 fn parse_form_urlencoded(body: &str) -> Result<BTreeMap<String, Vec<String>>, OAuthRequestError> {
     let mut fields = BTreeMap::<String, Vec<String>>::new();
     if body.is_empty() {
@@ -256,6 +311,42 @@ fn parse_form_urlencoded(body: &str) -> Result<BTreeMap<String, Vec<String>>, OA
         fields.entry(key).or_default().push(value);
     }
     Ok(fields)
+}
+
+fn reject_unsupported_client_secret(
+    fields: &BTreeMap<String, Vec<String>>,
+) -> Result<(), OAuthRequestError> {
+    if fields.contains_key("client_secret") {
+        Err(OAuthRequestError::UnsupportedParameter {
+            parameter: "client_secret",
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_unsupported_client_assertion(
+    fields: &BTreeMap<String, Vec<String>>,
+) -> Result<(), OAuthRequestError> {
+    let client_assertion_type = optional_single(fields, "client_assertion_type")?;
+    let client_assertion = optional_single(fields, "client_assertion")?;
+    match (&client_assertion_type, &client_assertion) {
+        (None, None) => Ok(()),
+        (Some(kind), Some(assertion)) if kind == OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER => {
+            validate_nonempty_length("client_assertion", assertion, 100_000)?;
+            Err(OAuthRequestError::UnsupportedClientAuthentication)
+        }
+        (Some(_), Some(_)) => Err(invalid_param(
+            "client_assertion_type",
+            "expected JWT bearer client assertion type".to_string(),
+        )),
+        (Some(_), None) => Err(OAuthRequestError::MissingParameter {
+            parameter: "client_assertion",
+        }),
+        (None, Some(_)) => Err(OAuthRequestError::MissingParameter {
+            parameter: "client_assertion_type",
+        }),
+    }
 }
 
 fn params_to_fields(params: &[(String, String)]) -> BTreeMap<String, Vec<String>> {
@@ -437,6 +528,25 @@ fn validate_code_challenge(value: &str) -> Result<(), OAuthRequestError> {
     {
         return Err(invalid_param(
             "code_challenge",
+            "contains characters outside the PKCE unreserved set".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_code_verifier(value: &str) -> Result<(), OAuthRequestError> {
+    if !(43..=128).contains(&value.len()) {
+        return Err(invalid_param(
+            "code_verifier",
+            "must be 43 to 128 characters".to_string(),
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        return Err(invalid_param(
+            "code_verifier",
             "contains characters outside the PKCE unreserved set".to_string(),
         ));
     }
@@ -640,6 +750,56 @@ mod tests {
         assert!(matches!(
             parse_pushed_authorization_request("client_id=%zz"),
             Err(OAuthRequestError::MalformedForm(_))
+        ));
+    }
+
+    #[test]
+    fn parses_authorization_code_token_request() {
+        let request = parse_token_request(
+            "grant_type=authorization_code&client_id=http%3A%2F%2Flocalhost&code=abc&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback&code_verifier=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            TokenRequest::AuthorizationCode {
+                client_id: "http://localhost".to_string(),
+                code: "abc".to_string(),
+                redirect_uri: "http://127.0.0.1/callback".to_string(),
+                code_verifier: CODE_CHALLENGE.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_refresh_token_request() {
+        let request = parse_token_request(
+            "grant_type=refresh_token&client_id=http%3A%2F%2Flocalhost&refresh_token=token",
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            TokenRequest::RefreshToken {
+                client_id: "http://localhost".to_string(),
+                refresh_token: "token".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_short_pkce_verifier() {
+        let error = parse_token_request(
+            "grant_type=authorization_code&client_id=http%3A%2F%2Flocalhost&code=abc&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback&code_verifier=short",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OAuthRequestError::InvalidParameter {
+                parameter: "code_verifier",
+                ..
+            }
         ));
     }
 }

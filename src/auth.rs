@@ -26,6 +26,10 @@ pub struct TokenClaims {
     pub jti: String,
     pub scope: String,
     pub handle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_scope: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -160,7 +164,25 @@ pub fn session_claims(
         jti: jti.to_string(),
         scope: scope.to_string(),
         handle: handle.to_string(),
+        client_id: None,
+        oauth_scope: None,
     }
+}
+
+pub fn oauth_session_claims(
+    did: &str,
+    handle: &str,
+    jti: &str,
+    scope: &str,
+    now: i64,
+    ttl_seconds: i64,
+    client_id: &str,
+    oauth_scope: &str,
+) -> TokenClaims {
+    let mut claims = session_claims(did, handle, jti, scope, now, ttl_seconds);
+    claims.client_id = Some(client_id.to_string());
+    claims.oauth_scope = Some(oauth_scope.to_string());
+    claims
 }
 
 fn hmac_sha256(secret: &[u8], bytes: &[u8]) -> Result<Vec<u8>, AuthError> {
