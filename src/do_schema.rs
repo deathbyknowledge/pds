@@ -41,6 +41,40 @@ pub const ALL_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_RECORD_COLLECTION_INDEX,
 ];
 
+pub const CREATE_DIRECTORY_REPOS: &str = "CREATE TABLE IF NOT EXISTS directory_repos (
+    did        TEXT PRIMARY KEY,
+    handle     TEXT NOT NULL,
+    repo_name  TEXT NOT NULL,
+    head       TEXT NOT NULL,
+    rev        TEXT NOT NULL,
+    active     INTEGER NOT NULL DEFAULT 1,
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_DIRECTORY_REPOS_UPDATED_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_repos_updated_at
+     ON directory_repos(updated_at, did)";
+
+pub const CREATE_DIRECTORY_EVENTS: &str = "CREATE TABLE IF NOT EXISTS directory_events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    did        TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    commit_cid TEXT,
+    rev        TEXT,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_DIRECTORY_EVENTS_DID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_events_did_seq
+     ON directory_events(did, seq)";
+
+pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
+    CREATE_DIRECTORY_REPOS,
+    CREATE_DIRECTORY_REPOS_UPDATED_INDEX,
+    CREATE_DIRECTORY_EVENTS,
+    CREATE_DIRECTORY_EVENTS_DID_INDEX,
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -74,5 +108,17 @@ mod tests {
     fn repo_blocks_store_bytes_by_cid() {
         assert!(CREATE_REPO_BLOCKS.contains("cid        TEXT PRIMARY KEY"));
         assert!(CREATE_REPO_BLOCKS.contains("bytes      BLOB NOT NULL"));
+    }
+
+    #[test]
+    fn directory_schema_indexes_repos_and_events() {
+        let joined = DIRECTORY_SCHEMA_STATEMENTS.join("\n");
+
+        assert!(joined.contains("directory_repos"));
+        assert!(joined.contains("did        TEXT PRIMARY KEY"));
+        assert!(joined.contains("idx_directory_repos_updated_at"));
+        assert!(joined.contains("directory_events"));
+        assert!(joined.contains("seq        INTEGER PRIMARY KEY AUTOINCREMENT"));
+        assert!(joined.contains("idx_directory_events_did_seq"));
     }
 }

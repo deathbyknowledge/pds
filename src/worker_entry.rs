@@ -1,17 +1,20 @@
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, to_string, Value};
+use wasm_bindgen::JsValue;
 use worker::{
-    durable_object, event, Context, DurableObject, Env, Method, Request, Response, SqlStorage,
-    State,
+    durable_object, event, Context, DurableObject, Env, Headers, Method, Request, RequestInit,
+    Response, SqlStorage, State,
 };
 
 use crate::car::{encode_car_from_store, CarError};
 use crate::cid::parse_cid;
 use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
-use crate::do_store::{RepoIdentityRow, RepoStateRow, SqlRepoStore};
+use crate::do_store::{
+    DirectoryRepoRow, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
+};
 use crate::identity::{IdentityError, RepoSigningKey};
 use crate::repo::{RepoError, RepoMutation, SignedRepository};
 use crate::xrpc::{
@@ -58,7 +61,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
         let query = query_pairs(&url);
         return match route_xrpc_method(parts[1], &query) {
             Ok(XrpcRoute::Worker) => describe_server(&url),
-            Ok(XrpcRoute::HostRepoObject) => {
+            Ok(XrpcRoute::DirectoryObject) => {
                 let Some(host) = url.host_str() else {
                     return json_response(
                         400,
@@ -68,7 +71,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                         }),
                     );
                 };
-                let namespace = env.durable_object("REPO_OBJECTS")?;
+                let namespace = env.durable_object("DIRECTORY_OBJECTS")?;
                 let id = namespace.id_from_name(host)?;
                 let stub = id.get_stub()?;
                 stub.fetch_with_request(req).await
@@ -166,6 +169,126 @@ impl DurableObject for RepoObject {
     }
 }
 
+#[durable_object]
+pub struct PdsDirectoryObject {
+    sql: SqlStorage,
+    #[allow(dead_code)]
+    state: State,
+    #[allow(dead_code)]
+    env: Env,
+}
+
+impl DurableObject for PdsDirectoryObject {
+    fn new(state: State, env: Env) -> Self {
+        let sql = state.storage().sql();
+        SqlDirectoryStore::new(sql.clone())
+            .init_schema()
+            .expect("initialize PDS directory durable object schema");
+        Self { sql, state, env }
+    }
+
+    async fn fetch(&self, mut req: Request) -> worker::Result<Response> {
+        match self.handle(&mut req).await {
+            Ok(response) => Ok(response),
+            Err(error) => json_response(
+                error.status,
+                &json!({
+                    "error": error.message,
+                }),
+            ),
+        }
+    }
+}
+
+impl PdsDirectoryObject {
+    async fn handle(&self, req: &mut Request) -> Result<Response, HttpError> {
+        if req.method() == Method::Options {
+            return empty_response(204).map_err(HttpError::worker);
+        }
+
+        let url = req.url().map_err(HttpError::worker)?;
+        let parts = url
+            .path()
+            .trim_start_matches('/')
+            .split('/')
+            .collect::<Vec<_>>();
+
+        if req.method() == Method::Get
+            && parts.len() >= 2
+            && parts[0] == "xrpc"
+            && parts[1] == SYNC_LIST_REPOS
+        {
+            return self.xrpc_list_repos(&url);
+        }
+
+        match (req.method(), url.path()) {
+            (Method::Get, "/directory/status") => self.status(),
+            (Method::Post, "/directory/repos/upsert") => self.upsert_repo(req).await,
+            _ => Err(HttpError::new(404, "not found")),
+        }
+    }
+
+    fn store(&self) -> SqlDirectoryStore {
+        SqlDirectoryStore::new(self.sql.clone())
+    }
+
+    fn status(&self) -> Result<Response, HttpError> {
+        let store = self.store();
+        json_response(
+            200,
+            &json!({
+                "repos": store.repo_count().map_err(HttpError::worker)?,
+                "events": store.event_count().map_err(HttpError::worker)?,
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn xrpc_list_repos(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 500, 1000)?;
+        let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
+        let (repos, next_cursor) = self
+            .store()
+            .list_repos(limit, cursor.as_deref())
+            .map_err(HttpError::worker)?;
+
+        let mut body = json!({
+            "repos": repos
+                .into_iter()
+                .map(directory_repo_json)
+                .collect::<Vec<_>>()
+        });
+        if let Some(cursor) = next_cursor {
+            body["cursor"] = json!(cursor);
+        }
+
+        json_response(200, &body).map_err(HttpError::worker)
+    }
+
+    async fn upsert_repo(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let body: DirectoryUpsertRepoRequest = req.json().await.map_err(HttpError::worker)?;
+        let row = DirectoryRepoRow {
+            did: Did::new(body.did).map_err(HttpError::bad_request)?,
+            handle: body.handle,
+            repo_name: body.repo_name,
+            head: parse_cid(&body.head).map_err(HttpError::bad_request)?,
+            rev: RepoRev::new(body.rev).map_err(HttpError::bad_request)?,
+            active: body.active.unwrap_or(true),
+        };
+        self.store().upsert_repo(&row).map_err(HttpError::worker)?;
+
+        json_response(
+            200,
+            &json!({
+                "ok": true,
+                "repo": directory_repo_json(row),
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+}
+
 impl RepoObject {
     async fn handle(&self, req: &mut Request) -> Result<Response, HttpError> {
         if req.method() == Method::Options {
@@ -190,14 +313,15 @@ impl RepoObject {
             return self.handle_xrpc(req.method(), parts[1], &url).await;
         }
 
+        let repo_name = parts.get(1).copied().unwrap_or("").to_string();
         let action = parts.get(2).copied().unwrap_or("");
 
         match (req.method(), action) {
             (Method::Get, "status") => self.status(),
-            (Method::Post, "init") => self.init(req).await,
-            (Method::Post, "records") => self.create_record(req).await,
-            (Method::Put, "records") => self.update_record(req).await,
-            (Method::Delete, "records") => self.delete_record(req).await,
+            (Method::Post, "init") => self.init(req, &repo_name).await,
+            (Method::Post, "records") => self.create_record(req, &repo_name).await,
+            (Method::Put, "records") => self.update_record(req, &repo_name).await,
+            (Method::Delete, "records") => self.delete_record(req, &repo_name).await,
             (Method::Get, "records") => self.read_records(&url).await,
             _ => Err(HttpError::new(404, "not found")),
         }
@@ -223,7 +347,6 @@ impl RepoObject {
             REPO_LIST_RECORDS => self.xrpc_list_records(url).await,
             SYNC_GET_LATEST_COMMIT => self.xrpc_get_latest_commit(url),
             SYNC_GET_REPO_STATUS => self.xrpc_get_repo_status(url),
-            SYNC_LIST_REPOS => self.xrpc_list_repos(),
             SYNC_LIST_BLOBS => self.xrpc_list_blobs(url),
             SYNC_GET_BLOB => self.xrpc_get_blob(url),
             SYNC_GET_RECORD => self.xrpc_get_sync_record(url).await,
@@ -428,29 +551,6 @@ impl RepoObject {
         .map_err(HttpError::worker)
     }
 
-    fn xrpc_list_repos(&self) -> Result<Response, HttpError> {
-        let state = self.store().get_repo_state().map_err(HttpError::worker)?;
-        let repos = state
-            .into_iter()
-            .map(|state| {
-                json!({
-                    "did": state.did.to_string(),
-                    "head": state.latest_commit.to_string(),
-                    "rev": state.latest_rev.to_string(),
-                    "active": true,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        json_response(
-            200,
-            &json!({
-                "repos": repos,
-            }),
-        )
-        .map_err(HttpError::worker)
-    }
-
     fn xrpc_list_blobs(&self, url: &worker::Url) -> Result<Response, HttpError> {
         let params = query_pairs(url);
         let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
@@ -515,9 +615,10 @@ impl RepoObject {
         car_response(car).map_err(HttpError::worker)
     }
 
-    async fn init(&self, req: &mut Request) -> Result<Response, HttpError> {
+    async fn init(&self, req: &mut Request, repo_name: &str) -> Result<Response, HttpError> {
         let body: InitRepoRequest = req.json().await.map_err(HttpError::worker)?;
         self.require_admin(req)?;
+        let request_host = request_host(req)?;
         let store = self.store();
         let existing = store.get_repo_state().map_err(HttpError::worker)?;
         if existing.is_some() && !body.reset.unwrap_or(false) {
@@ -552,6 +653,8 @@ impl RepoObject {
         repo.storage()
             .put_repo_identity(&identity)
             .map_err(HttpError::worker)?;
+        self.notify_directory(&request_host, repo_name, &identity, &state)
+            .await?;
 
         json_response(
             201,
@@ -567,48 +670,72 @@ impl RepoObject {
         .map_err(HttpError::worker)
     }
 
-    async fn create_record(&self, req: &mut Request) -> Result<Response, HttpError> {
+    async fn create_record(
+        &self,
+        req: &mut Request,
+        repo_name: &str,
+    ) -> Result<Response, HttpError> {
         let body: WriteRecordRequest = req.json().await.map_err(HttpError::worker)?;
         self.require_admin(req)?;
-        let (signing_key, mut repo) = self.open_repo_for_write()?;
+        let request_host = request_host(req)?;
+        let (identity, signing_key, mut repo) = self.open_repo_for_write()?;
         let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
         let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
         let mutation = repo
             .create_record(path.clone(), &body.record, rev, &signing_key)
             .await
             .map_err(HttpError::repo)?;
-        self.persist_mutation(repo.storage(), &mutation)
+        let state = self
+            .persist_mutation(repo.storage(), &mutation)
             .map_err(HttpError::worker)?;
+        self.notify_directory(&request_host, repo_name, &identity, &state)
+            .await?;
         json_response(201, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
     }
 
-    async fn update_record(&self, req: &mut Request) -> Result<Response, HttpError> {
+    async fn update_record(
+        &self,
+        req: &mut Request,
+        repo_name: &str,
+    ) -> Result<Response, HttpError> {
         let body: WriteRecordRequest = req.json().await.map_err(HttpError::worker)?;
         self.require_admin(req)?;
-        let (signing_key, mut repo) = self.open_repo_for_write()?;
+        let request_host = request_host(req)?;
+        let (identity, signing_key, mut repo) = self.open_repo_for_write()?;
         let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
         let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
         let mutation = repo
             .update_record(path.clone(), &body.record, rev, &signing_key)
             .await
             .map_err(HttpError::repo)?;
-        self.persist_mutation(repo.storage(), &mutation)
+        let state = self
+            .persist_mutation(repo.storage(), &mutation)
             .map_err(HttpError::worker)?;
+        self.notify_directory(&request_host, repo_name, &identity, &state)
+            .await?;
         json_response(200, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
     }
 
-    async fn delete_record(&self, req: &mut Request) -> Result<Response, HttpError> {
+    async fn delete_record(
+        &self,
+        req: &mut Request,
+        repo_name: &str,
+    ) -> Result<Response, HttpError> {
         let body: DeleteRecordRequest = req.json().await.map_err(HttpError::worker)?;
         self.require_admin(req)?;
-        let (signing_key, mut repo) = self.open_repo_for_write()?;
+        let request_host = request_host(req)?;
+        let (identity, signing_key, mut repo) = self.open_repo_for_write()?;
         let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
         let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
         let mutation = repo
             .delete_record(&path, rev, &signing_key)
             .await
             .map_err(HttpError::repo)?;
-        self.persist_mutation(repo.storage(), &mutation)
+        let state = self
+            .persist_mutation(repo.storage(), &mutation)
             .map_err(HttpError::worker)?;
+        self.notify_directory(&request_host, repo_name, &identity, &state)
+            .await?;
         json_response(200, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
     }
 
@@ -674,10 +801,17 @@ impl RepoObject {
 
     fn open_repo_for_write(
         &self,
-    ) -> Result<(RepoSigningKey, SignedRepository<SqlRepoStore>), HttpError> {
+    ) -> Result<
+        (
+            RepoIdentityRow,
+            RepoSigningKey,
+            SignedRepository<SqlRepoStore>,
+        ),
+        HttpError,
+    > {
         let (_, identity, repo) = self.open_repo_with_identity()?;
         let signing_key = identity.signing_key().map_err(HttpError::identity)?;
-        Ok((signing_key, repo))
+        Ok((identity, signing_key, repo))
     }
 
     fn open_repo_with_state(
@@ -785,16 +919,55 @@ impl RepoObject {
         }
     }
 
+    async fn notify_directory(
+        &self,
+        request_host: &str,
+        repo_name: &str,
+        identity: &RepoIdentityRow,
+        state: &RepoStateRow,
+    ) -> Result<(), HttpError> {
+        let body = json!({
+            "did": state.did.to_string(),
+            "handle": identity.handle.clone(),
+            "repoName": repo_name,
+            "head": state.latest_commit.to_string(),
+            "rev": state.latest_rev.to_string(),
+            "active": true,
+        });
+        let mut response = fetch_directory_json(
+            &self.env,
+            request_host,
+            Method::Post,
+            "/directory/repos/upsert",
+            &body,
+        )
+        .await?;
+        let status = response.status_code();
+        if !(200..300).contains(&status) {
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "failed to read directory response".to_string());
+            return Err(HttpError::new(
+                500,
+                format!("directory update failed with status {status}: {message}"),
+            ));
+        }
+        Ok(())
+    }
+
     fn persist_mutation(
         &self,
         store: &SqlRepoStore,
         mutation: &RepoMutation,
-    ) -> worker::Result<()> {
-        store.put_repo_state(&RepoStateRow {
+    ) -> worker::Result<RepoStateRow> {
+        let state = RepoStateRow {
             did: mutation.commit.did.clone(),
             latest_commit: mutation.commit_cid,
             latest_rev: mutation.commit.rev.clone(),
-        })
+        };
+        store.put_repo_state(&state)?;
+        Ok(state)
     }
 }
 
@@ -820,6 +993,18 @@ struct WriteRecordRequest {
 struct DeleteRecordRequest {
     path: String,
     rev: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectoryUpsertRepoRequest {
+    did: String,
+    handle: String,
+    #[serde(rename = "repoName", alias = "repo_name")]
+    repo_name: String,
+    head: String,
+    rev: String,
+    #[serde(default)]
+    active: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -936,14 +1121,85 @@ fn did_document(
     })
 }
 
+async fn fetch_directory_json(
+    env: &Env,
+    directory_name: &str,
+    method: Method,
+    path: &str,
+    body: &Value,
+) -> Result<Response, HttpError> {
+    let namespace = env
+        .durable_object("DIRECTORY_OBJECTS")
+        .map_err(HttpError::worker)?;
+    let id = namespace
+        .id_from_name(directory_name)
+        .map_err(HttpError::worker)?;
+    let stub = id.get_stub().map_err(HttpError::worker)?;
+
+    let headers = Headers::new();
+    headers
+        .set("content-type", "application/json")
+        .map_err(HttpError::worker)?;
+    let mut init = RequestInit::new();
+    init.with_method(method)
+        .with_headers(headers)
+        .with_body(Some(JsValue::from_str(
+            &to_string(body).map_err(HttpError::worker)?,
+        )));
+    let request = Request::new_with_init(&format!("https://pds.internal{path}"), &init)
+        .map_err(HttpError::worker)?;
+
+    stub.fetch_with_request(request)
+        .await
+        .map_err(HttpError::worker)
+}
+
+fn directory_repo_json(row: DirectoryRepoRow) -> Value {
+    json!({
+        "did": row.did.to_string(),
+        "head": row.head.to_string(),
+        "rev": row.rev.to_string(),
+        "active": row.active,
+        "handle": row.handle,
+        "repoName": row.repo_name,
+    })
+}
+
 fn query_pairs(url: &worker::Url) -> Vec<(String, String)> {
     url.query_pairs()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
 }
 
+fn request_host(req: &Request) -> Result<String, HttpError> {
+    req.url()
+        .map_err(HttpError::worker)?
+        .host_str()
+        .map(|host| host.to_string())
+        .ok_or_else(|| HttpError::new(400, "request host is required"))
+}
+
 fn is_host_identity_path(path: &str) -> bool {
     matches!(path, DID_DOCUMENT_PATH | ATPROTO_DID_PATH)
+}
+
+fn parse_xrpc_limit(value: Option<&str>, default: usize, max: usize) -> Result<usize, HttpError> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    if value.is_empty() {
+        return Ok(default);
+    }
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| HttpError::new(400, format!("invalid limit `{value}`")))?;
+    if !(1..=max).contains(&limit) {
+        return Err(HttpError::new(
+            400,
+            format!("invalid limit `{value}`: expected an integer from 1 to {max}"),
+        ));
+    }
+    Ok(limit)
 }
 
 fn request_origin(url: &worker::Url) -> String {

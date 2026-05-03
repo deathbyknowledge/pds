@@ -20,7 +20,7 @@ const MAX_LIST_LIMIT: usize = 100;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum XrpcRoute {
     Worker,
-    HostRepoObject,
+    DirectoryObject,
     RepoObject { name: String },
     Unsupported,
 }
@@ -51,7 +51,7 @@ pub enum XrpcError {
 pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<XrpcRoute, XrpcError> {
     match method {
         SERVER_DESCRIBE_SERVER => Ok(XrpcRoute::Worker),
-        SYNC_LIST_REPOS => Ok(XrpcRoute::HostRepoObject),
+        SYNC_LIST_REPOS => Ok(XrpcRoute::DirectoryObject),
         REPO_DESCRIBE_REPO | REPO_GET_RECORD | REPO_LIST_RECORDS => {
             let repo = required_param(query, "repo")?;
             Ok(XrpcRoute::RepoObject {
@@ -169,10 +169,10 @@ mod tests {
     }
 
     #[test]
-    fn routes_list_repos_to_host_repo_object() {
+    fn routes_list_repos_to_directory_object() {
         assert_eq!(
             route_xrpc_method(SYNC_LIST_REPOS, &[]).unwrap(),
-            XrpcRoute::HostRepoObject
+            XrpcRoute::DirectoryObject
         );
     }
 

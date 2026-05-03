@@ -8,12 +8,17 @@ command = "worker-build --release ."
 
 [durable_objects]
 bindings = [
-  { name = "REPO_OBJECTS", class_name = "RepoObject" }
+  { name = "REPO_OBJECTS", class_name = "RepoObject" },
+  { name = "DIRECTORY_OBJECTS", class_name = "PdsDirectoryObject" }
 ]
 
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["RepoObject"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PdsDirectoryObject"]
 
 [observability]
 [observability.logs]

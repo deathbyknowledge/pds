@@ -6,12 +6,17 @@ use worker::{Error as WorkerError, SqlStorage, SqlStorageValue};
 use crate::cid::{parse_cid, verify_repo_block_cid, Cid};
 use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RepoPath};
-use crate::do_schema::ALL_SCHEMA_STATEMENTS;
+use crate::do_schema::{ALL_SCHEMA_STATEMENTS, DIRECTORY_SCHEMA_STATEMENTS};
 use crate::identity::{IdentityError, RepoSigningKey};
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 
 #[derive(Clone, Debug)]
 pub struct SqlRepoStore {
+    sql: SqlStorage,
+}
+
+#[derive(Clone, Debug)]
+pub struct SqlDirectoryStore {
     sql: SqlStorage,
 }
 
@@ -27,6 +32,16 @@ pub struct RepoIdentityRow {
     pub handle: String,
     pub signing_key_p256_hex: String,
     pub public_key_multibase: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryRepoRow {
+    pub did: Did,
+    pub handle: String,
+    pub repo_name: String,
+    pub head: Cid,
+    pub rev: RepoRev,
+    pub active: bool,
 }
 
 impl RepoIdentityRow {
@@ -146,6 +161,134 @@ impl SqlRepoStore {
         self.sql.exec("DELETE FROM repo_blocks", None)?;
         self.sql.exec("DELETE FROM repo_identity", None)?;
         self.sql.exec("DELETE FROM repo_state", None)?;
+        Ok(())
+    }
+}
+
+impl SqlDirectoryStore {
+    pub fn new(sql: SqlStorage) -> Self {
+        Self { sql }
+    }
+
+    pub fn init_schema(&self) -> worker::Result<()> {
+        for statement in DIRECTORY_SCHEMA_STATEMENTS {
+            self.sql.exec(statement, None)?;
+        }
+        Ok(())
+    }
+
+    pub fn upsert_repo(&self, row: &DirectoryRepoRow) -> worker::Result<()> {
+        let previous_head = self.get_repo(&row.did)?.map(|repo| repo.head);
+        self.sql.exec(
+            "INSERT INTO directory_repos (did, handle, repo_name, head, rev, active, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, unixepoch())
+             ON CONFLICT(did) DO UPDATE SET
+                handle = excluded.handle,
+                repo_name = excluded.repo_name,
+                head = excluded.head,
+                rev = excluded.rev,
+                active = excluded.active,
+                updated_at = excluded.updated_at",
+            vec![
+                SqlStorageValue::from(row.did.to_string()),
+                SqlStorageValue::from(row.handle.clone()),
+                SqlStorageValue::from(row.repo_name.clone()),
+                SqlStorageValue::from(row.head.to_string()),
+                SqlStorageValue::from(row.rev.to_string()),
+                SqlStorageValue::from(if row.active { 1_i64 } else { 0_i64 }),
+            ],
+        )?;
+
+        if previous_head != Some(row.head) {
+            self.append_event("repo_update", row)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn get_repo(&self, did: &Did) -> worker::Result<Option<DirectoryRepoRow>> {
+        let rows: Vec<DirectoryRepoStorageRow> = self
+            .sql
+            .exec(
+                "SELECT did, handle, repo_name, head, rev, active
+                 FROM directory_repos
+                 WHERE did = ?",
+                vec![SqlStorageValue::from(did.to_string())],
+            )?
+            .to_array()?;
+
+        rows.into_iter()
+            .next()
+            .map(directory_repo_from_row)
+            .transpose()
+    }
+
+    pub fn list_repos(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> worker::Result<(Vec<DirectoryRepoRow>, Option<String>)> {
+        let query_limit = limit.saturating_add(1);
+        let rows: Vec<DirectoryRepoStorageRow> = if let Some(cursor) = cursor {
+            self.sql
+                .exec(
+                    "SELECT did, handle, repo_name, head, rev, active
+                     FROM directory_repos
+                     WHERE did > ?
+                     ORDER BY did ASC
+                     LIMIT ?",
+                    vec![
+                        SqlStorageValue::from(cursor.to_string()),
+                        SqlStorageValue::from(query_limit as i64),
+                    ],
+                )?
+                .to_array()?
+        } else {
+            self.sql
+                .exec(
+                    "SELECT did, handle, repo_name, head, rev, active
+                     FROM directory_repos
+                     ORDER BY did ASC
+                     LIMIT ?",
+                    vec![SqlStorageValue::from(query_limit as i64)],
+                )?
+                .to_array()?
+        };
+
+        let has_more = rows.len() > limit;
+        let repos = rows
+            .into_iter()
+            .take(limit)
+            .map(directory_repo_from_row)
+            .collect::<worker::Result<Vec<_>>>()?;
+        let next_cursor = if has_more {
+            repos.last().map(|repo| repo.did.to_string())
+        } else {
+            None
+        };
+
+        Ok((repos, next_cursor))
+    }
+
+    pub fn repo_count(&self) -> worker::Result<i64> {
+        count(&self.sql, "SELECT COUNT(*) AS n FROM directory_repos")
+    }
+
+    pub fn event_count(&self) -> worker::Result<i64> {
+        count(&self.sql, "SELECT COUNT(*) AS n FROM directory_events")
+    }
+
+    fn append_event(&self, event_type: &str, row: &DirectoryRepoRow) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO directory_events (did, event_type, commit_cid, rev)
+             VALUES (?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(row.did.to_string()),
+                SqlStorageValue::from(event_type.to_string()),
+                SqlStorageValue::from(row.head.to_string()),
+                SqlStorageValue::from(row.rev.to_string()),
+            ],
+        )?;
         Ok(())
     }
 }
@@ -278,6 +421,40 @@ impl RepoRecordIndex for SqlRepoStore {
             .map(|row| Ok((RepoPath::parse(&row.path)?, parse_cid(&row.cid)?)))
             .collect()
     }
+}
+
+fn directory_repo_from_row<Row>(row: Row) -> worker::Result<DirectoryRepoRow>
+where
+    Row: IntoDirectoryRepoRow,
+{
+    row.into_directory_repo_row()
+}
+
+trait IntoDirectoryRepoRow {
+    fn into_directory_repo_row(self) -> worker::Result<DirectoryRepoRow>;
+}
+
+impl IntoDirectoryRepoRow for DirectoryRepoStorageRow {
+    fn into_directory_repo_row(self) -> worker::Result<DirectoryRepoRow> {
+        Ok(DirectoryRepoRow {
+            did: Did::new(self.did).map_err(worker_error)?,
+            handle: self.handle,
+            repo_name: self.repo_name,
+            head: parse_cid(&self.head).map_err(worker_error)?,
+            rev: RepoRev::new(self.rev).map_err(worker_error)?,
+            active: self.active != 0,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct DirectoryRepoStorageRow {
+    did: String,
+    handle: String,
+    repo_name: String,
+    head: String,
+    rev: String,
+    active: i64,
 }
 
 fn worker_error(error: impl std::error::Error) -> WorkerError {
