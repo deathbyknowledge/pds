@@ -21,6 +21,9 @@ use crate::xrpc::{
 };
 use crate::xrpc::{XrpcError, XrpcRoute};
 
+const DID_DOCUMENT_PATH: &str = "/.well-known/did.json";
+const ATPROTO_DID_PATH: &str = "/.well-known/atproto-did";
+
 #[event(fetch)]
 async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<Response> {
     let url = req.url()?;
@@ -34,7 +37,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
         return health_response();
     }
 
-    if req.method() == Method::Get && url.path() == "/.well-known/did.json" {
+    if req.method() == Method::Get && is_host_identity_path(url.path()) {
         let Some(host) = url.host_str() else {
             return json_response(
                 400,
@@ -106,7 +109,8 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcGetRepoStatus": "GET /xrpc/com.atproto.sync.getRepoStatus?did=:did",
                 "xrpcSyncGetRecord": "GET /xrpc/com.atproto.sync.getRecord?did=:did&collection=:nsid&rkey=:rkey",
                 "xrpcSyncGetRepo": "GET /xrpc/com.atproto.sync.getRepo?did=:did",
-                "didWeb": "GET /.well-known/did.json"
+                "didWeb": "GET /.well-known/did.json",
+                "handleDid": "GET /.well-known/atproto-did"
             }
         }),
     )
@@ -155,8 +159,12 @@ impl RepoObject {
             .trim_start_matches('/')
             .split('/')
             .collect::<Vec<_>>();
-        if req.method() == Method::Get && url.path() == "/.well-known/did.json" {
-            return self.did_document_response(&url);
+        if req.method() == Method::Get {
+            match url.path() {
+                DID_DOCUMENT_PATH => return self.did_document_response(&url),
+                ATPROTO_DID_PATH => return self.handle_did_response(),
+                _ => {}
+            }
         }
 
         if parts.len() >= 2 && parts[0] == "xrpc" && !parts[1].is_empty() {
@@ -666,6 +674,11 @@ impl RepoObject {
         .map_err(HttpError::worker)
     }
 
+    fn handle_did_response(&self) -> Result<Response, HttpError> {
+        let state = self.repo_state()?;
+        text_response(200, state.did.as_str()).map_err(HttpError::worker)
+    }
+
     fn require_admin(&self, req: &Request) -> Result<(), HttpError> {
         let token = self.admin_token()?;
         let authorization = req
@@ -858,6 +871,10 @@ fn query_pairs(url: &worker::Url) -> Vec<(String, String)> {
         .collect()
 }
 
+fn is_host_identity_path(path: &str) -> bool {
+    matches!(path, DID_DOCUMENT_PATH | ATPROTO_DID_PATH)
+}
+
 fn request_origin(url: &worker::Url) -> String {
     let mut origin = format!(
         "{}://{}",
@@ -901,6 +918,13 @@ fn json_response(status: u16, value: &impl Serialize) -> worker::Result<Response
     Ok(response)
 }
 
+fn text_response(status: u16, value: &str) -> worker::Result<Response> {
+    let mut response = Response::from_bytes(value.as_bytes().to_vec())?.with_status(status);
+    response.headers_mut().set("content-type", "text/plain")?;
+    set_cors(&mut response)?;
+    Ok(response)
+}
+
 fn empty_response(status: u16) -> worker::Result<Response> {
     let mut response = Response::empty()?.with_status(status);
     set_cors(&mut response)?;
@@ -919,4 +943,17 @@ fn set_cors(response: &mut Response) -> worker::Result<()> {
         "authorization, content-type, x-pds-admin-token",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_host_identity_well_known_paths() {
+        assert!(is_host_identity_path("/.well-known/did.json"));
+        assert!(is_host_identity_path("/.well-known/atproto-did"));
+        assert!(!is_host_identity_path("/.well-known"));
+        assert!(!is_host_identity_path("/.well-known/other"));
+    }
 }

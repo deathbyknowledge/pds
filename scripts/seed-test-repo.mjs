@@ -66,6 +66,12 @@ const didDocument = await expectJson(
   },
 );
 
+const handleDid = await expectText("handle DID", "GET", "/.well-known/atproto-did", null, (body) => {
+  if (body.trim() !== did) {
+    throw new Error(`handle DID returned ${body}, expected ${did}`);
+  }
+});
+
 const mutation = await expectJson("seed record", "POST", `/repos/${encodePath(repo)}/records`, {
   path: config.recordPath,
   rev: config.recordRev,
@@ -133,6 +139,7 @@ console.log(
       repo,
       did,
       handle: host,
+      handleDid: handleDid.trim(),
       didDocumentServiceEndpoint: atprotoServiceEndpoint(didDocument),
       publicKeyMultibase: init.publicKeyMultibase,
       latestCommit: mutation.latestCommit,
@@ -169,6 +176,16 @@ async function expectJson(label, method, path, body, validate = undefined) {
   }
   validate?.(parsed);
   return parsed;
+}
+
+async function expectText(label, method, path, body, validate = undefined) {
+  const response = await request(method, path, body);
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`${label} failed status=${response.status}: ${text}`);
+  }
+  validate?.(text);
+  return text;
 }
 
 async function request(method, path, body = null) {
