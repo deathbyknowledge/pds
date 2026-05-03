@@ -697,6 +697,45 @@ impl SqlDirectoryStore {
         Ok(())
     }
 
+    pub fn replace_repo_record_paths(&self, did: &Did, paths: &[RepoPath]) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM directory_repo_records WHERE did = ?",
+            vec![SqlStorageValue::from(did.to_string())],
+        )?;
+        self.upsert_repo_record_paths(did, paths)
+    }
+
+    pub fn upsert_repo_record_paths(&self, did: &Did, paths: &[RepoPath]) -> worker::Result<()> {
+        for path in paths {
+            self.sql.exec(
+                "INSERT INTO directory_repo_records (did, path, collection, updated_at)
+                 VALUES (?, ?, ?, unixepoch())
+                 ON CONFLICT(did, path) DO UPDATE SET
+                    collection = excluded.collection,
+                    updated_at = excluded.updated_at",
+                vec![
+                    SqlStorageValue::from(did.to_string()),
+                    SqlStorageValue::from(path.to_string()),
+                    SqlStorageValue::from(path.collection.to_string()),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_repo_record_paths(&self, did: &Did, paths: &[RepoPath]) -> worker::Result<()> {
+        for path in paths {
+            self.sql.exec(
+                "DELETE FROM directory_repo_records WHERE did = ? AND path = ?",
+                vec![
+                    SqlStorageValue::from(did.to_string()),
+                    SqlStorageValue::from(path.to_string()),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn append_commit_event(
         &self,
         event: &DirectoryCommitEventInput,
@@ -808,6 +847,68 @@ impl SqlDirectoryStore {
             .collect::<worker::Result<Vec<_>>>()?;
         let next_cursor = if has_more {
             repos.last().map(|repo| repo.did.to_string())
+        } else {
+            None
+        };
+
+        Ok((repos, next_cursor))
+    }
+
+    pub fn list_repos_by_collection(
+        &self,
+        collection: &Nsid,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> worker::Result<(Vec<Did>, Option<String>)> {
+        #[derive(Deserialize)]
+        struct Row {
+            did: String,
+        }
+
+        let query_limit = limit.saturating_add(1);
+        let rows: Vec<Row> = if let Some(cursor) = cursor {
+            self.sql
+                .exec(
+                    "SELECT records.did
+                     FROM directory_repo_records AS records
+                     JOIN directory_repos AS repos ON repos.did = records.did
+                     WHERE records.collection = ? AND records.did > ? AND repos.active = 1
+                     GROUP BY records.did
+                     ORDER BY records.did ASC
+                     LIMIT ?",
+                    vec![
+                        SqlStorageValue::from(collection.to_string()),
+                        SqlStorageValue::from(cursor.to_string()),
+                        SqlStorageValue::from(query_limit as i64),
+                    ],
+                )?
+                .to_array()?
+        } else {
+            self.sql
+                .exec(
+                    "SELECT records.did
+                     FROM directory_repo_records AS records
+                     JOIN directory_repos AS repos ON repos.did = records.did
+                     WHERE records.collection = ? AND repos.active = 1
+                     GROUP BY records.did
+                     ORDER BY records.did ASC
+                     LIMIT ?",
+                    vec![
+                        SqlStorageValue::from(collection.to_string()),
+                        SqlStorageValue::from(query_limit as i64),
+                    ],
+                )?
+                .to_array()?
+        };
+
+        let has_more = rows.len() > limit;
+        let repos = rows
+            .into_iter()
+            .take(limit)
+            .map(|row| Did::new(row.did).map_err(worker_error))
+            .collect::<worker::Result<Vec<_>>>()?;
+        let next_cursor = if has_more {
+            repos.last().map(|did| did.to_string())
         } else {
             None
         };

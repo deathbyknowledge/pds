@@ -304,6 +304,43 @@ await expectJson(
   },
 );
 
+const head = await expectJson(
+  "repo head",
+  "GET",
+  `/xrpc/com.atproto.sync.getHead?did=${encodeQuery(did)}`,
+  null,
+  (body) => {
+    if (body.root !== latestCommit) {
+      throw new Error(`unexpected repo head ${JSON.stringify(body)}, expected ${latestCommit}`);
+    }
+  },
+);
+
+const hostStatus = await expectJson(
+  "host status",
+  "GET",
+  `/xrpc/com.atproto.sync.getHostStatus?hostname=${encodeQuery(base.hostname)}`,
+  null,
+  (body) => {
+    if (body.hostname !== base.hostname || body.status !== "active" || typeof body.seq !== "number") {
+      throw new Error(`unexpected host status ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+const reposByCollection = await expectJson(
+  "list repos by collection",
+  "GET",
+  `/xrpc/com.atproto.sync.listReposByCollection?collection=${encodeQuery(collection)}&limit=500`,
+  null,
+  (body) => {
+    const hostedRepo = body.repos?.find((repo) => repo.did === did);
+    if (!hostedRepo) {
+      throw new Error(`listReposByCollection did not include ${did}: ${JSON.stringify(body)}`);
+    }
+  },
+);
+
 const listBlobs = await expectJson(
   "list blobs",
   "GET",
@@ -387,6 +424,22 @@ if (!repoCar.ok || !contentType.includes("application/vnd.ipld.car") || carBytes
   );
 }
 
+const checkoutCar = await request(
+  "GET",
+  `/xrpc/com.atproto.sync.getCheckout?did=${encodeQuery(did)}`,
+);
+const checkoutContentType = checkoutCar.headers.get("content-type") ?? "";
+const checkoutCarBytes = await checkoutCar.arrayBuffer();
+if (
+  !checkoutCar.ok ||
+  !checkoutContentType.includes("application/vnd.ipld.car") ||
+  checkoutCarBytes.byteLength === 0
+) {
+  throw new Error(
+    `getCheckout CAR check failed: status=${checkoutCar.status} content-type=${checkoutContentType} bytes=${checkoutCarBytes.byteLength}`,
+  );
+}
+
 const blocksCar = await request(
   "GET",
   `/xrpc/com.atproto.sync.getBlocks?did=${encodeQuery(did)}&cids=${encodeQuery(latestCommit)}&cids=${encodeQuery(mutation.latestCommit)}`,
@@ -447,16 +500,20 @@ console.log(
       xrpcDeleteCommit: xrpcDelete.commit.cid,
       applyWritesCommit: applyWrites.commit.cid,
       listedRepos: listRepos.repos.length,
+      listedReposByCollection: reposByCollection.repos.length,
       listedBlobs: listBlobs.cids.length,
       missingBlobRefs: missingBlobRefs.blobs.length,
       subscribeRepos,
       blobCid,
       missingBlobStatus: missingBlob.status,
+      head: head.root,
+      hostStatus,
       collection,
       rkey,
       atRepoUri,
       atRecordUri,
       carBytes: carBytes.byteLength,
+      checkoutCarBytes: checkoutCarBytes.byteLength,
       blocksCarBytes: blocksCarBytes.byteLength,
       diffCarBytes: diffCarBytes.byteLength,
       missingBlockStatus: missingBlock.status,

@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -40,8 +40,9 @@ use crate::xrpc::{
     REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS,
     REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION,
     SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION, SERVER_REFRESH_SESSION,
-    SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
-    SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS, SYNC_SUBSCRIBE_REPOS,
+    SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT, SYNC_GET_HEAD, SYNC_GET_HOST_STATUS,
+    SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO, SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS,
+    SYNC_LIST_REPOS, SYNC_LIST_REPOS_BY_COLLECTION, SYNC_SUBSCRIBE_REPOS,
 };
 use crate::xrpc::{XrpcError, XrpcRoute};
 
@@ -180,13 +181,17 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcUploadBlob": "POST /xrpc/com.atproto.repo.uploadBlob",
                 "xrpcListMissingBlobs": "GET /xrpc/com.atproto.repo.listMissingBlobs",
                 "xrpcGetLatestCommit": "GET /xrpc/com.atproto.sync.getLatestCommit?did=:did",
+                "xrpcGetHead": "GET /xrpc/com.atproto.sync.getHead?did=:did",
                 "xrpcGetRepoStatus": "GET /xrpc/com.atproto.sync.getRepoStatus?did=:did",
                 "xrpcListRepos": "GET /xrpc/com.atproto.sync.listRepos",
+                "xrpcListReposByCollection": "GET /xrpc/com.atproto.sync.listReposByCollection?collection=:nsid",
                 "xrpcSubscribeRepos": "GET /xrpc/com.atproto.sync.subscribeRepos",
+                "xrpcGetHostStatus": "GET /xrpc/com.atproto.sync.getHostStatus?hostname=:hostname",
                 "xrpcListBlobs": "GET /xrpc/com.atproto.sync.listBlobs?did=:did",
                 "xrpcGetBlob": "GET /xrpc/com.atproto.sync.getBlob?did=:did&cid=:cid",
                 "xrpcGetBlocks": "GET /xrpc/com.atproto.sync.getBlocks?did=:did&cids=:cid",
                 "xrpcSyncGetRecord": "GET /xrpc/com.atproto.sync.getRecord?did=:did&collection=:nsid&rkey=:rkey",
+                "xrpcGetCheckout": "GET /xrpc/com.atproto.sync.getCheckout?did=:did",
                 "xrpcSyncGetRepo": "GET /xrpc/com.atproto.sync.getRepo?did=:did",
                 "didWeb": "GET /.well-known/did.json",
                 "handleDid": "GET /.well-known/atproto-did"
@@ -302,6 +307,20 @@ impl PdsDirectoryObject {
         if req.method() == Method::Get
             && parts.len() >= 2
             && parts[0] == "xrpc"
+            && parts[1] == SYNC_LIST_REPOS_BY_COLLECTION
+        {
+            return self.xrpc_list_repos_by_collection(&url);
+        }
+        if req.method() == Method::Get
+            && parts.len() >= 2
+            && parts[0] == "xrpc"
+            && parts[1] == SYNC_GET_HOST_STATUS
+        {
+            return self.xrpc_get_host_status(req, &url);
+        }
+        if req.method() == Method::Get
+            && parts.len() >= 2
+            && parts[0] == "xrpc"
             && parts[1] == SYNC_SUBSCRIBE_REPOS
         {
             return self.xrpc_subscribe_repos(req, &url);
@@ -321,7 +340,11 @@ impl PdsDirectoryObject {
                     | SERVER_CREATE_SESSION
                     | SERVER_GET_SESSION
                     | SERVER_REFRESH_SESSION
-                    | SERVER_DELETE_SESSION,
+                    | SERVER_DELETE_SESSION
+                    | SYNC_LIST_REPOS
+                    | SYNC_LIST_REPOS_BY_COLLECTION
+                    | SYNC_GET_HOST_STATUS
+                    | SYNC_SUBSCRIBE_REPOS,
                 ) => Err(HttpError::new(405, "method not allowed")),
                 _ => Err(HttpError::new(404, "unsupported XRPC method")),
             };
@@ -519,6 +542,54 @@ impl PdsDirectoryObject {
         json_response(200, &body).map_err(HttpError::worker)
     }
 
+    fn xrpc_list_repos_by_collection(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let collection = Nsid::new(required_param(&params, "collection").map_err(HttpError::xrpc)?)
+            .map_err(HttpError::bad_request)?;
+        let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 500, 2000)?;
+        let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
+        let (repos, next_cursor) = self
+            .store()
+            .list_repos_by_collection(&collection, limit, cursor.as_deref())
+            .map_err(HttpError::worker)?;
+
+        let mut body = json!({
+            "repos": repos
+                .into_iter()
+                .map(|did| json!({ "did": did.to_string() }))
+                .collect::<Vec<_>>(),
+        });
+        if let Some(cursor) = next_cursor {
+            body["cursor"] = json!(cursor);
+        }
+
+        json_response(200, &body).map_err(HttpError::worker)
+    }
+
+    fn xrpc_get_host_status(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let hostname = required_param(&params, "hostname").map_err(HttpError::xrpc)?;
+        let request_host = request_host(req)?;
+        if hostname != request_host {
+            return Err(HttpError::new(404, "HostNotFound"));
+        }
+        let store = self.store();
+        json_response(
+            200,
+            &json!({
+                "hostname": hostname,
+                "seq": store.max_event_seq().map_err(HttpError::worker)?,
+                "accountCount": store.account_count().map_err(HttpError::worker)?,
+                "status": "active",
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
     fn xrpc_subscribe_repos(
         &self,
         req: &Request,
@@ -573,6 +644,7 @@ impl PdsDirectoryObject {
 
     async fn upsert_repo(&self, req: &mut Request) -> Result<Response, HttpError> {
         let body: DirectoryUpsertRepoRequest = req.json().await.map_err(HttpError::worker)?;
+        let records = body.records.map(validate_repo_paths).transpose()?;
         let row = DirectoryRepoRow {
             did: Did::new(body.did).map_err(HttpError::bad_request)?,
             handle: body.handle,
@@ -581,11 +653,18 @@ impl PdsDirectoryObject {
             rev: RepoRev::new(body.rev).map_err(HttpError::bad_request)?,
             active: body.active.unwrap_or(true),
         };
-        self.store().upsert_repo(&row).map_err(HttpError::worker)?;
+        let store = self.store();
+        store.upsert_repo(&row).map_err(HttpError::worker)?;
+        if let Some(records) = &records {
+            store
+                .replace_repo_record_paths(&row.did, records)
+                .map_err(HttpError::worker)?;
+        }
         let stored_event = if let Some(event) = body.event {
             let blocks = BASE64_STANDARD
                 .decode(event.blocks_base64)
                 .map_err(HttpError::bad_request)?;
+            let event_record_paths = repo_record_path_ops_from_commit_ops(&event.ops)?;
             let event = DirectoryCommitEventInput {
                 did: row.did.clone(),
                 commit_cid: row.head,
@@ -600,11 +679,18 @@ impl PdsDirectoryObject {
                 blobs_json: to_string(&event.blobs.unwrap_or_default())
                     .map_err(HttpError::worker)?,
             };
-            Some(
-                self.store()
-                    .append_commit_event(&event)
-                    .map_err(HttpError::worker)?,
-            )
+            let stored = store
+                .append_commit_event(&event)
+                .map_err(HttpError::worker)?;
+            if records.is_none() {
+                store
+                    .upsert_repo_record_paths(&row.did, &event_record_paths.upserts)
+                    .map_err(HttpError::worker)?;
+                store
+                    .delete_repo_record_paths(&row.did, &event_record_paths.deletes)
+                    .map_err(HttpError::worker)?;
+            }
+            Some(stored)
         } else {
             None
         };
@@ -819,11 +905,13 @@ impl RepoObject {
             (Method::Get, REPO_GET_RECORD) => self.xrpc_get_record(url).await,
             (Method::Get, REPO_LIST_RECORDS) => self.xrpc_list_records(url).await,
             (Method::Get, SYNC_GET_LATEST_COMMIT) => self.xrpc_get_latest_commit(url),
+            (Method::Get, SYNC_GET_HEAD) => self.xrpc_get_head(url),
             (Method::Get, SYNC_GET_REPO_STATUS) => self.xrpc_get_repo_status(url),
             (Method::Get, SYNC_LIST_BLOBS) => self.xrpc_list_blobs(url),
             (Method::Get, SYNC_GET_BLOB) => self.xrpc_get_blob(url).await,
             (Method::Get, SYNC_GET_BLOCKS) => self.xrpc_get_blocks(url),
             (Method::Get, SYNC_GET_RECORD) => self.xrpc_get_sync_record(url).await,
+            (Method::Get, SYNC_GET_CHECKOUT) => self.xrpc_get_checkout(url).await,
             (Method::Get, SYNC_GET_REPO) => self.xrpc_get_repo(url).await,
             (Method::Get, REPO_LIST_MISSING_BLOBS) => self.xrpc_list_missing_blobs(req, url),
             (Method::Get, SERVER_DESCRIBE_SERVER) => {
@@ -840,11 +928,13 @@ impl RepoObject {
                 | REPO_GET_RECORD
                 | REPO_LIST_RECORDS
                 | SYNC_GET_LATEST_COMMIT
+                | SYNC_GET_HEAD
                 | SYNC_GET_REPO_STATUS
                 | SYNC_LIST_BLOBS
                 | SYNC_GET_BLOB
                 | SYNC_GET_BLOCKS
                 | SYNC_GET_RECORD
+                | SYNC_GET_CHECKOUT
                 | SYNC_GET_REPO
                 | SERVER_DESCRIBE_SERVER
                 | REPO_CREATE_RECORD
@@ -1036,6 +1126,21 @@ impl RepoObject {
         .map_err(HttpError::worker)
     }
 
+    fn xrpc_get_head(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
+        let state = self.repo_state()?;
+        ensure_repo_did(&state, &did)?;
+
+        json_response(
+            200,
+            &json!({
+                "root": state.latest_commit.to_string(),
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
     fn xrpc_get_repo_status(&self, url: &worker::Url) -> Result<Response, HttpError> {
         let params = query_pairs(url);
         let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
@@ -1166,6 +1271,17 @@ impl RepoObject {
         car_response(car).map_err(HttpError::worker)
     }
 
+    async fn xrpc_get_checkout(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
+        let (state, mut repo) = self.open_repo_with_state()?;
+        ensure_repo_did(&state, &did)?;
+        let cids = repo.export_cids().await.map_err(HttpError::repo)?;
+        let car = encode_car_from_store(&[state.latest_commit], cids, repo.storage())
+            .map_err(HttpError::car)?;
+        car_response(car).map_err(HttpError::worker)
+    }
+
     async fn xrpc_get_repo(&self, url: &worker::Url) -> Result<Response, HttpError> {
         let params = query_pairs(url);
         let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
@@ -1227,8 +1343,15 @@ impl RepoObject {
         self.persist_commit_event(repo.storage(), &state, &event)
             .map_err(HttpError::worker)?;
         if body.notify_directory.unwrap_or(true) {
-            self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
-                .await?;
+            self.notify_directory(
+                &request_host,
+                repo_name,
+                &identity,
+                &state,
+                None,
+                Some(&event),
+            )
+            .await?;
         }
 
         json_response(
@@ -1280,8 +1403,15 @@ impl RepoObject {
                 .replace_blob_refs(&path, record_cid, &blob_cids)
                 .map_err(HttpError::worker)?;
         }
-        self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
-            .await?;
+        self.notify_directory(
+            &request_host,
+            repo_name,
+            &identity,
+            &state,
+            None,
+            Some(&event),
+        )
+        .await?;
         json_response(201, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
     }
 
@@ -1320,8 +1450,15 @@ impl RepoObject {
                 .replace_blob_refs(&path, record_cid, &blob_cids)
                 .map_err(HttpError::worker)?;
         }
-        self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
-            .await?;
+        self.notify_directory(
+            &request_host,
+            repo_name,
+            &identity,
+            &state,
+            None,
+            Some(&event),
+        )
+        .await?;
         json_response(200, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
     }
 
@@ -1357,8 +1494,15 @@ impl RepoObject {
         repo.storage()
             .delete_blob_refs(&path)
             .map_err(HttpError::worker)?;
-        self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
-            .await?;
+        self.notify_directory(
+            &request_host,
+            repo_name,
+            &identity,
+            &state,
+            None,
+            Some(&event),
+        )
+        .await?;
         json_response(200, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
     }
 
@@ -1369,10 +1513,17 @@ impl RepoObject {
     ) -> Result<Response, HttpError> {
         self.require_admin(req)?;
         let request_host = request_host(req)?;
-        let state = self.repo_state()?;
-        let identity = self.repo_identity()?;
-        self.notify_directory(&request_host, repo_name, &identity, &state, None)
-            .await?;
+        let (state, identity, mut repo) = self.open_repo_with_identity()?;
+        let records = repo_record_paths(&mut repo).await?;
+        self.notify_directory(
+            &request_host,
+            repo_name,
+            &identity,
+            &state,
+            Some(&records),
+            None,
+        )
+        .await?;
 
         json_response(
             200,
@@ -1431,6 +1582,7 @@ impl RepoObject {
             &identity.handle,
             &identity,
             &state,
+            None,
             Some(&event),
         )
         .await?;
@@ -1496,6 +1648,7 @@ impl RepoObject {
             &identity.handle,
             &identity,
             &state,
+            None,
             Some(&event),
         )
         .await?;
@@ -1558,6 +1711,7 @@ impl RepoObject {
             &identity.handle,
             &identity,
             &state,
+            None,
             Some(&event),
         )
         .await?;
@@ -1686,6 +1840,7 @@ impl RepoObject {
             &identity.handle,
             &identity,
             &state,
+            None,
             Some(&event),
         )
         .await?;
@@ -1895,6 +2050,7 @@ impl RepoObject {
         repo_name: &str,
         identity: &RepoIdentityRow,
         state: &RepoStateRow,
+        records: Option<&[RepoPath]>,
         event: Option<&DirectoryCommitEventPayload>,
     ) -> Result<(), HttpError> {
         let mut body = json!({
@@ -1905,6 +2061,12 @@ impl RepoObject {
             "rev": state.latest_rev.to_string(),
             "active": true,
         });
+        if let Some(records) = records {
+            body["records"] = json!(records
+                .iter()
+                .map(|path| path.to_string())
+                .collect::<Vec<_>>());
+        }
         if let Some(event) = event {
             body["event"] = json!({
                 "since": event.since.as_ref().map(|rev| rev.to_string()),
@@ -2328,6 +2490,8 @@ struct DirectoryUpsertRepoRequest {
     #[serde(default)]
     active: Option<bool>,
     #[serde(default)]
+    records: Option<Vec<String>>,
+    #[serde(default)]
     event: Option<DirectoryCommitEventRequest>,
 }
 
@@ -2496,6 +2660,47 @@ fn directory_commit_ops(ops: &[RepoOperation]) -> Vec<DirectoryCommitOp> {
             prev: op.prev.map(|cid| cid.to_string()),
         })
         .collect()
+}
+
+async fn repo_record_paths(
+    repo: &mut SignedRepository<SqlRepoStore>,
+) -> Result<Vec<RepoPath>, HttpError> {
+    Ok(repo
+        .entries()
+        .await
+        .map_err(HttpError::repo)?
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect())
+}
+
+fn validate_repo_paths(paths: Vec<String>) -> Result<Vec<RepoPath>, HttpError> {
+    paths
+        .into_iter()
+        .map(|path| RepoPath::parse(&path).map_err(HttpError::bad_request))
+        .collect::<Result<BTreeSet<_>, _>>()
+        .map(|paths| paths.into_iter().collect())
+}
+
+#[derive(Debug, Default)]
+struct RepoRecordPathOps {
+    upserts: Vec<RepoPath>,
+    deletes: Vec<RepoPath>,
+}
+
+fn repo_record_path_ops_from_commit_ops(
+    ops: &[DirectoryCommitOp],
+) -> Result<RepoRecordPathOps, HttpError> {
+    let mut paths = BTreeMap::new();
+    for op in ops {
+        let path = RepoPath::parse(&op.path).map_err(HttpError::bad_request)?;
+        paths.insert(path, op.action != "delete");
+    }
+    let (upserts, deletes): (Vec<_>, Vec<_>) = paths.into_iter().partition(|(_, active)| *active);
+    Ok(RepoRecordPathOps {
+        upserts: upserts.into_iter().map(|(path, _)| path).collect(),
+        deletes: deletes.into_iter().map(|(path, _)| path).collect(),
+    })
 }
 
 async fn mutation_diff_cids(

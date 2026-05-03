@@ -102,6 +102,19 @@ pub const CREATE_DIRECTORY_REPOS_UPDATED_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_directory_repos_updated_at
      ON directory_repos(updated_at, did)";
 
+pub const CREATE_DIRECTORY_REPO_RECORDS: &str =
+    "CREATE TABLE IF NOT EXISTS directory_repo_records (
+    did        TEXT NOT NULL,
+    path       TEXT NOT NULL,
+    collection TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (did, path)
+)";
+
+pub const CREATE_DIRECTORY_REPO_RECORDS_COLLECTION_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_repo_records_collection_did
+     ON directory_repo_records(collection, did)";
+
 pub const CREATE_DIRECTORY_EVENTS: &str = "CREATE TABLE IF NOT EXISTS directory_events (
     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
     did        TEXT NOT NULL,
@@ -152,6 +165,8 @@ pub const CREATE_DIRECTORY_SESSIONS_DID_INDEX: &str =
 pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_REPOS,
     CREATE_DIRECTORY_REPOS_UPDATED_INDEX,
+    CREATE_DIRECTORY_REPO_RECORDS,
+    CREATE_DIRECTORY_REPO_RECORDS_COLLECTION_INDEX,
     CREATE_DIRECTORY_EVENTS,
     CREATE_DIRECTORY_EVENTS_DID_INDEX,
     CREATE_DIRECTORY_ACCOUNTS,
@@ -226,6 +241,8 @@ mod tests {
         assert!(joined.contains("directory_repos"));
         assert!(joined.contains("did        TEXT PRIMARY KEY"));
         assert!(joined.contains("idx_directory_repos_updated_at"));
+        assert!(joined.contains("directory_repo_records"));
+        assert!(joined.contains("PRIMARY KEY (did, path)"));
         assert!(joined.contains("directory_events"));
         assert!(joined.contains("seq        INTEGER PRIMARY KEY AUTOINCREMENT"));
         assert!(joined.contains("blocks     BLOB"));

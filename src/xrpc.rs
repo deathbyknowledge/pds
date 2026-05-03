@@ -18,13 +18,17 @@ pub const REPO_APPLY_WRITES: &str = "com.atproto.repo.applyWrites";
 pub const REPO_UPLOAD_BLOB: &str = "com.atproto.repo.uploadBlob";
 pub const REPO_LIST_MISSING_BLOBS: &str = "com.atproto.repo.listMissingBlobs";
 pub const SYNC_GET_LATEST_COMMIT: &str = "com.atproto.sync.getLatestCommit";
+pub const SYNC_GET_HEAD: &str = "com.atproto.sync.getHead";
 pub const SYNC_GET_REPO_STATUS: &str = "com.atproto.sync.getRepoStatus";
 pub const SYNC_LIST_REPOS: &str = "com.atproto.sync.listRepos";
+pub const SYNC_LIST_REPOS_BY_COLLECTION: &str = "com.atproto.sync.listReposByCollection";
 pub const SYNC_SUBSCRIBE_REPOS: &str = "com.atproto.sync.subscribeRepos";
+pub const SYNC_GET_HOST_STATUS: &str = "com.atproto.sync.getHostStatus";
 pub const SYNC_LIST_BLOBS: &str = "com.atproto.sync.listBlobs";
 pub const SYNC_GET_BLOB: &str = "com.atproto.sync.getBlob";
 pub const SYNC_GET_BLOCKS: &str = "com.atproto.sync.getBlocks";
 pub const SYNC_GET_RECORD: &str = "com.atproto.sync.getRecord";
+pub const SYNC_GET_CHECKOUT: &str = "com.atproto.sync.getCheckout";
 pub const SYNC_GET_REPO: &str = "com.atproto.sync.getRepo";
 
 const DEFAULT_LIST_LIMIT: usize = 50;
@@ -81,6 +85,8 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | SERVER_REFRESH_SESSION
         | SERVER_DELETE_SESSION
         | SYNC_LIST_REPOS
+        | SYNC_LIST_REPOS_BY_COLLECTION
+        | SYNC_GET_HOST_STATUS
         | SYNC_SUBSCRIBE_REPOS => Ok(XrpcRoute::DirectoryObject),
         REPO_CREATE_RECORD
         | REPO_PUT_RECORD
@@ -96,10 +102,12 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         }
         SYNC_GET_LATEST_COMMIT
         | SYNC_GET_REPO_STATUS
+        | SYNC_GET_HEAD
         | SYNC_LIST_BLOBS
         | SYNC_GET_BLOB
         | SYNC_GET_BLOCKS
         | SYNC_GET_RECORD
+        | SYNC_GET_CHECKOUT
         | SYNC_GET_REPO => {
             let did = required_param(query, "did")?;
             Ok(XrpcRoute::RepoObject {
@@ -242,6 +250,8 @@ mod tests {
             SERVER_REFRESH_SESSION,
             SERVER_DELETE_SESSION,
             SYNC_LIST_REPOS,
+            SYNC_LIST_REPOS_BY_COLLECTION,
+            SYNC_GET_HOST_STATUS,
             SYNC_SUBSCRIBE_REPOS,
         ] {
             assert_eq!(
@@ -286,6 +296,12 @@ mod tests {
                 name: "alice".to_string()
             }
         );
+        assert_eq!(
+            route_xrpc_method(SYNC_GET_HEAD, &query(&[("did", "did:gsv:alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
     }
 
     #[test]
@@ -306,6 +322,12 @@ mod tests {
     fn routes_sync_car_methods_to_repo_object_by_did() {
         assert_eq!(
             route_xrpc_method(SYNC_GET_REPO, &query(&[("did", "did:gsv:alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            route_xrpc_method(SYNC_GET_CHECKOUT, &query(&[("did", "did:gsv:alice")])).unwrap(),
             XrpcRoute::RepoObject {
                 name: "alice".to_string()
             }
