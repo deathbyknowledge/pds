@@ -23,11 +23,13 @@ pub const SYNC_LIST_REPOS: &str = "com.atproto.sync.listRepos";
 pub const SYNC_SUBSCRIBE_REPOS: &str = "com.atproto.sync.subscribeRepos";
 pub const SYNC_LIST_BLOBS: &str = "com.atproto.sync.listBlobs";
 pub const SYNC_GET_BLOB: &str = "com.atproto.sync.getBlob";
+pub const SYNC_GET_BLOCKS: &str = "com.atproto.sync.getBlocks";
 pub const SYNC_GET_RECORD: &str = "com.atproto.sync.getRecord";
 pub const SYNC_GET_REPO: &str = "com.atproto.sync.getRepo";
 
 const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 100;
+const MAX_GET_BLOCKS_CIDS: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum XrpcRoute {
@@ -46,6 +48,12 @@ pub struct ListRecordsParams {
     pub reverse: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GetBlocksParams {
+    pub did: String,
+    pub cids: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum XrpcError {
     #[error("missing required query parameter `{param}`")]
@@ -59,6 +67,9 @@ pub enum XrpcError {
 
     #[error("invalid boolean `{param}` value `{value}`: expected `true` or `false`")]
     InvalidBoolean { param: &'static str, value: String },
+
+    #[error("too many `{param}` values: expected at most {max}")]
+    TooManyValues { param: &'static str, max: usize },
 }
 
 pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<XrpcRoute, XrpcError> {
@@ -87,6 +98,7 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | SYNC_GET_REPO_STATUS
         | SYNC_LIST_BLOBS
         | SYNC_GET_BLOB
+        | SYNC_GET_BLOCKS
         | SYNC_GET_RECORD
         | SYNC_GET_REPO => {
             let did = required_param(query, "did")?;
@@ -109,6 +121,12 @@ pub fn parse_list_records_params(
     })
 }
 
+pub fn parse_get_blocks_params(query: &[(String, String)]) -> Result<GetBlocksParams, XrpcError> {
+    let did = required_param(query, "did")?;
+    let cids = array_param(query, "cids", MAX_GET_BLOCKS_CIDS)?;
+    Ok(GetBlocksParams { did, cids })
+}
+
 pub fn required_param(
     query: &[(String, String)],
     param: &'static str,
@@ -129,6 +147,28 @@ pub fn optional_param(query: &[(String, String)], param: &str) -> Option<String>
         .iter()
         .find(|(key, _)| key == param)
         .map(|(_, value)| value.to_string())
+}
+
+fn array_param(
+    query: &[(String, String)],
+    param: &'static str,
+    max: usize,
+) -> Result<Vec<String>, XrpcError> {
+    let values = query
+        .iter()
+        .filter(|(key, _)| key == param)
+        .map(|(_, value)| value.trim().to_string())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        return Err(XrpcError::MissingParam { param });
+    }
+    if values.iter().any(|value| value.is_empty()) {
+        return Err(XrpcError::EmptyParam { param });
+    }
+    if values.len() > max {
+        return Err(XrpcError::TooManyValues { param, max });
+    }
+    Ok(values)
 }
 
 pub fn repo_object_name_from_identifier(identifier: &str) -> String {
@@ -292,6 +332,12 @@ mod tests {
                 name: "alice".to_string()
             }
         );
+        assert_eq!(
+            route_xrpc_method(SYNC_GET_BLOCKS, &query(&[("did", "did:gsv:alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
     }
 
     #[test]
@@ -359,6 +405,51 @@ mod tests {
             XrpcError::InvalidLimit {
                 value: "101".to_string(),
                 max: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_get_blocks_repeated_cids() {
+        assert_eq!(
+            parse_get_blocks_params(&query(&[
+                ("did", "did:gsv:alice"),
+                ("cids", "bafyfirst"),
+                ("cids", "bafysecond"),
+            ]))
+            .unwrap(),
+            GetBlocksParams {
+                did: "did:gsv:alice".to_string(),
+                cids: vec!["bafyfirst".to_string(), "bafysecond".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn get_blocks_requires_at_least_one_cid() {
+        assert_eq!(
+            parse_get_blocks_params(&query(&[("did", "did:gsv:alice")])).unwrap_err(),
+            XrpcError::MissingParam { param: "cids" }
+        );
+        assert_eq!(
+            parse_get_blocks_params(&query(&[("did", "did:gsv:alice"), ("cids", "")])).unwrap_err(),
+            XrpcError::EmptyParam { param: "cids" }
+        );
+    }
+
+    #[test]
+    fn get_blocks_rejects_too_many_cids() {
+        let mut params = vec![("did".to_string(), "did:gsv:alice".to_string())];
+        params.extend(
+            (0..=MAX_GET_BLOCKS_CIDS)
+                .map(|index| ("cids".to_string(), format!("bafy{index:0>12}"))),
+        );
+
+        assert_eq!(
+            parse_get_blocks_params(&params).unwrap_err(),
+            XrpcError::TooManyValues {
+                param: "cids",
+                max: MAX_GET_BLOCKS_CIDS,
             }
         );
     }

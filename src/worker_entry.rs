@@ -35,13 +35,13 @@ use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
 };
 use crate::xrpc::{
-    at_uri, optional_param, parse_list_records_params, required_param, route_xrpc_method,
-    REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD,
-    REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
-    SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER,
-    SERVER_GET_SESSION, SERVER_REFRESH_SESSION, SYNC_GET_BLOB, SYNC_GET_LATEST_COMMIT,
-    SYNC_GET_RECORD, SYNC_GET_REPO, SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS,
-    SYNC_SUBSCRIBE_REPOS,
+    at_uri, optional_param, parse_get_blocks_params, parse_list_records_params, required_param,
+    route_xrpc_method, REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD,
+    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS,
+    REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION,
+    SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION, SERVER_REFRESH_SESSION,
+    SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
+    SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS, SYNC_SUBSCRIBE_REPOS,
 };
 use crate::xrpc::{XrpcError, XrpcRoute};
 
@@ -185,6 +185,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcSubscribeRepos": "GET /xrpc/com.atproto.sync.subscribeRepos",
                 "xrpcListBlobs": "GET /xrpc/com.atproto.sync.listBlobs?did=:did",
                 "xrpcGetBlob": "GET /xrpc/com.atproto.sync.getBlob?did=:did&cid=:cid",
+                "xrpcGetBlocks": "GET /xrpc/com.atproto.sync.getBlocks?did=:did&cids=:cid",
                 "xrpcSyncGetRecord": "GET /xrpc/com.atproto.sync.getRecord?did=:did&collection=:nsid&rkey=:rkey",
                 "xrpcSyncGetRepo": "GET /xrpc/com.atproto.sync.getRepo?did=:did",
                 "didWeb": "GET /.well-known/did.json",
@@ -821,6 +822,7 @@ impl RepoObject {
             (Method::Get, SYNC_GET_REPO_STATUS) => self.xrpc_get_repo_status(url),
             (Method::Get, SYNC_LIST_BLOBS) => self.xrpc_list_blobs(url),
             (Method::Get, SYNC_GET_BLOB) => self.xrpc_get_blob(url).await,
+            (Method::Get, SYNC_GET_BLOCKS) => self.xrpc_get_blocks(url),
             (Method::Get, SYNC_GET_RECORD) => self.xrpc_get_sync_record(url).await,
             (Method::Get, SYNC_GET_REPO) => self.xrpc_get_repo(url).await,
             (Method::Get, REPO_LIST_MISSING_BLOBS) => self.xrpc_list_missing_blobs(req, url),
@@ -841,6 +843,7 @@ impl RepoObject {
                 | SYNC_GET_REPO_STATUS
                 | SYNC_LIST_BLOBS
                 | SYNC_GET_BLOB
+                | SYNC_GET_BLOCKS
                 | SYNC_GET_RECORD
                 | SYNC_GET_REPO
                 | SERVER_DESCRIBE_SERVER
@@ -1122,6 +1125,25 @@ impl RepoObject {
         };
 
         self.blob_response_for_row(blob).await
+    }
+
+    fn xrpc_get_blocks(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = parse_get_blocks_params(&query_pairs(url)).map_err(HttpError::xrpc)?;
+        let state = self.repo_state()?;
+        ensure_repo_did(&state, &params.did)?;
+        let cids = params
+            .cids
+            .iter()
+            .map(|cid| parse_cid(cid).map_err(HttpError::bad_request))
+            .collect::<Result<Vec<_>, _>>()?;
+        let store = self.store();
+        let car = encode_car_from_store(&[], cids, &store).map_err(|error| match error {
+            CarError::MissingBlock { cid } => {
+                HttpError::new(404, format!("BlockNotFound: block `{cid}` not found"))
+            }
+            other => HttpError::car(other),
+        })?;
+        car_response(car).map_err(HttpError::worker)
     }
 
     async fn xrpc_get_sync_record(&self, url: &worker::Url) -> Result<Response, HttpError> {
@@ -2907,6 +2929,10 @@ fn subscribe_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError
                     .cid
                     .map(|cid| parse_cid(&cid).map_err(HttpError::bad_request))
                     .transpose()?,
+                prev: op
+                    .prev
+                    .map(|cid| parse_cid(&cid).map_err(HttpError::bad_request))
+                    .transpose()?,
             })
         })
         .collect::<Result<Vec<_>, HttpError>>()?;
@@ -3005,6 +3031,8 @@ struct SubscribeReposOp {
     path: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     cid: Option<crate::cid::Cid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prev: Option<crate::cid::Cid>,
 }
 
 fn health_response() -> worker::Result<Response> {

@@ -387,6 +387,30 @@ if (!repoCar.ok || !contentType.includes("application/vnd.ipld.car") || carBytes
   );
 }
 
+const blocksCar = await request(
+  "GET",
+  `/xrpc/com.atproto.sync.getBlocks?did=${encodeQuery(did)}&cids=${encodeQuery(latestCommit)}&cids=${encodeQuery(mutation.latestCommit)}`,
+);
+const blocksContentType = blocksCar.headers.get("content-type") ?? "";
+const blocksCarBytes = await blocksCar.arrayBuffer();
+if (
+  !blocksCar.ok ||
+  !blocksContentType.includes("application/vnd.ipld.car") ||
+  blocksCarBytes.byteLength === 0
+) {
+  throw new Error(
+    `getBlocks CAR check failed: status=${blocksCar.status} content-type=${blocksContentType} bytes=${blocksCarBytes.byteLength}`,
+  );
+}
+
+const missingBlock = await expectJsonStatus(
+  "missing repo block",
+  "GET",
+  `/xrpc/com.atproto.sync.getBlocks?did=${encodeQuery(did)}&cids=${encodeQuery(blobCid)}`,
+  null,
+  404,
+);
+
 const repoDiffCar = await request(
   "GET",
   `/xrpc/com.atproto.sync.getRepo?did=${encodeQuery(did)}&since=${encodeQuery(applySinceRev)}`,
@@ -433,7 +457,9 @@ console.log(
       atRepoUri,
       atRecordUri,
       carBytes: carBytes.byteLength,
+      blocksCarBytes: blocksCarBytes.byteLength,
       diffCarBytes: diffCarBytes.byteLength,
+      missingBlockStatus: missingBlock.status,
       pdslsRepoUrl,
       pdslsRecordUrl,
       generatedSigningKey: config.signingKeyHex ? false : true,
