@@ -1,19 +1,24 @@
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use futures_util::StreamExt;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, json, to_string, Value};
+use sha2::{Digest, Sha256};
 use wasm_bindgen::JsValue;
 use worker::{
-    durable_object, event, Context, DurableObject, Env, Headers, HttpMetadata, Method, Request,
-    RequestInit, Response, SqlStorage, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
+    durable_object, event, Context, DurableObject, Env, FixedLengthStream, Headers, HttpMetadata,
+    Method, Request, RequestInit, Response, ResponseBody, SqlStorage, State, WebSocket,
+    WebSocketIncomingMessage, WebSocketPair,
 };
 
 use crate::car::{decode_car, encode_car, encode_car_from_store, CarBlock, CarError};
 use crate::cbor::encode_dag_cbor;
-use crate::cid::{parse_cid, raw_cid};
+use crate::cid::{parse_cid, raw_cid, raw_cid_from_sha256_digest};
 use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
@@ -798,10 +803,8 @@ impl RepoObject {
         let Some(blob) = self.store().get_blob(&cid).map_err(HttpError::worker)? else {
             return Err(HttpError::new(404, "blob not found"));
         };
-        let mime_type = blob.mime_type.clone();
-        let bytes = self.load_blob_bytes(blob).await?;
 
-        blob_response(bytes, &mime_type).map_err(HttpError::worker)
+        self.blob_response_for_row(blob).await
     }
 
     async fn xrpc_get_sync_record(&self, url: &worker::Url) -> Result<Response, HttpError> {
@@ -1360,14 +1363,7 @@ impl RepoObject {
             .and_then(|value| value.split(';').next().map(|part| part.trim().to_string()))
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "application/octet-stream".to_string());
-        let bytes = req.bytes().await.map_err(HttpError::worker)?;
-        if bytes.len() > MAX_BLOB_BYTES {
-            return Err(HttpError::new(
-                413,
-                format!("blob too large: max {MAX_BLOB_BYTES} bytes"),
-            ));
-        }
-        let blob = self.put_blob(&mime_type, bytes).await?;
+        let blob = self.put_blob_request_body(&mime_type, req).await?;
 
         json_response(
             200,
@@ -1676,34 +1672,7 @@ impl RepoObject {
         })
     }
 
-    async fn put_blob(&self, mime_type: &str, bytes: Vec<u8>) -> Result<RepoBlobRow, HttpError> {
-        let cid = raw_cid(&bytes);
-        if let Ok(bucket) = self.env.bucket(BLOB_BUCKET_BINDING) {
-            let key = blob_storage_key(&cid);
-            bucket
-                .put(key.clone(), bytes.clone())
-                .http_metadata(HttpMetadata {
-                    content_type: Some(mime_type.to_string()),
-                    content_language: None,
-                    content_disposition: None,
-                    content_encoding: None,
-                    cache_control: None,
-                    cache_expiry: None,
-                })
-                .execute()
-                .await
-                .map_err(HttpError::worker)?;
-            self.store()
-                .put_blob_metadata(cid, mime_type, bytes.len(), "r2", Some(&key))
-                .map_err(HttpError::worker)
-        } else {
-            self.store()
-                .put_blob_bytes(mime_type, bytes)
-                .map_err(HttpError::worker)
-        }
-    }
-
-    async fn load_blob_bytes(&self, blob: RepoBlobRow) -> Result<Vec<u8>, HttpError> {
+    async fn blob_response_for_row(&self, blob: RepoBlobRow) -> Result<Response, HttpError> {
         if blob.storage_kind == "r2" {
             let key = blob
                 .storage_key
@@ -1721,9 +1690,105 @@ impl RepoObject {
                     "R2 blob object returned without a body",
                 ));
             };
-            body.bytes().await.map_err(HttpError::worker)
+            let response_body = body.response_body().map_err(HttpError::worker)?;
+            blob_stream_response(response_body, &blob.mime_type, blob.byte_len)
+                .map_err(HttpError::worker)
         } else {
-            Ok(blob.bytes)
+            blob_response(blob.bytes, &blob.mime_type).map_err(HttpError::worker)
+        }
+    }
+
+    async fn put_blob_request_body(
+        &self,
+        mime_type: &str,
+        req: &mut Request,
+    ) -> Result<RepoBlobRow, HttpError> {
+        let content_length = request_content_length(req)?;
+        if let Some(content_length) = content_length {
+            ensure_blob_size_limit(content_length)?;
+        }
+
+        if let (Ok(bucket), Some(content_length)) =
+            (self.env.bucket(BLOB_BUCKET_BINDING), content_length)
+        {
+            let key = temporary_blob_storage_key();
+            let hasher = Rc::new(RefCell::new(Sha256::new()));
+            let byte_len = Rc::new(Cell::new(0_u64));
+            let stream_hasher = Rc::clone(&hasher);
+            let stream_byte_len = Rc::clone(&byte_len);
+            let metered_stream = req.stream().map_err(HttpError::worker)?.map(
+                move |chunk| -> worker::Result<Vec<u8>> {
+                    let chunk = chunk?;
+                    let next_len = stream_byte_len
+                        .get()
+                        .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+                    if next_len > MAX_BLOB_BYTES as u64 {
+                        return Err(worker::Error::RustError(format!(
+                            "blob too large: max {MAX_BLOB_BYTES} bytes"
+                        )));
+                    }
+                    stream_byte_len.set(next_len);
+                    stream_hasher.borrow_mut().update(&chunk);
+                    Ok(chunk)
+                },
+            );
+
+            bucket
+                .put(
+                    key.clone(),
+                    FixedLengthStream::wrap(metered_stream, content_length),
+                )
+                .http_metadata(blob_http_metadata(mime_type))
+                .execute()
+                .await
+                .map_err(HttpError::worker)?;
+
+            let digest = hasher.borrow().clone().finalize();
+            let cid = raw_cid_from_sha256_digest(&digest);
+            let byte_len = byte_len.get();
+            if let Some(existing) = self.store().get_blob(&cid).map_err(HttpError::worker)? {
+                let _ = bucket.delete(key).await;
+                return Ok(existing);
+            }
+            return self
+                .store()
+                .put_blob_metadata(
+                    cid,
+                    mime_type,
+                    usize::try_from(byte_len).unwrap_or(MAX_BLOB_BYTES),
+                    "r2",
+                    Some(&key),
+                )
+                .map_err(HttpError::worker);
+        }
+
+        let bytes = req.bytes().await.map_err(HttpError::worker)?;
+        ensure_blob_size_limit(bytes.len() as u64)?;
+        self.put_blob_bytes(mime_type, bytes).await
+    }
+
+    async fn put_blob_bytes(
+        &self,
+        mime_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<RepoBlobRow, HttpError> {
+        let cid = raw_cid(&bytes);
+        let byte_len = bytes.len();
+        if let Ok(bucket) = self.env.bucket(BLOB_BUCKET_BINDING) {
+            let key = blob_storage_key(&cid);
+            bucket
+                .put(key.clone(), bytes)
+                .http_metadata(blob_http_metadata(mime_type))
+                .execute()
+                .await
+                .map_err(HttpError::worker)?;
+            self.store()
+                .put_blob_metadata(cid, mime_type, byte_len, "r2", Some(&key))
+                .map_err(HttpError::worker)
+        } else {
+            self.store()
+                .put_blob_bytes(mime_type, bytes)
+                .map_err(HttpError::worker)
         }
     }
 
@@ -2180,6 +2245,51 @@ fn blob_storage_key(cid: &crate::cid::Cid) -> String {
     format!("blobs/{cid}")
 }
 
+fn temporary_blob_storage_key() -> String {
+    let random = (js_sys::Math::random() * u64::MAX as f64) as u64;
+    format!(
+        "blob-uploads/{}-{random:016x}",
+        worker::Date::now().as_millis()
+    )
+}
+
+fn blob_http_metadata(mime_type: &str) -> HttpMetadata {
+    HttpMetadata {
+        content_type: Some(mime_type.to_string()),
+        content_language: None,
+        content_disposition: None,
+        content_encoding: None,
+        cache_control: None,
+        cache_expiry: None,
+    }
+}
+
+fn request_content_length(req: &Request) -> Result<Option<u64>, HttpError> {
+    let Some(value) = req
+        .headers()
+        .get("content-length")
+        .map_err(HttpError::worker)?
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|error| HttpError::new(400, format!("invalid content-length header: {error}")))
+}
+
+fn ensure_blob_size_limit(byte_len: u64) -> Result<(), HttpError> {
+    if byte_len > MAX_BLOB_BYTES as u64 {
+        Err(HttpError::new(
+            413,
+            format!("blob too large: max {MAX_BLOB_BYTES} bytes"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn generated_record_key(seed: &crate::cid::Cid) -> Result<RecordKey, HttpError> {
     RecordKey::new(generated_tid(seed)).map_err(HttpError::bad_request)
 }
@@ -2483,6 +2593,22 @@ fn car_response(bytes: Vec<u8>) -> worker::Result<Response> {
 fn blob_response(bytes: Vec<u8>, mime_type: &str) -> worker::Result<Response> {
     let mut response = Response::from_bytes(bytes)?;
     response.headers_mut().set("content-type", mime_type)?;
+    set_cors(&mut response)?;
+    Ok(response)
+}
+
+fn blob_stream_response(
+    body: ResponseBody,
+    mime_type: &str,
+    byte_len: i64,
+) -> worker::Result<Response> {
+    let mut response = Response::from_body(body)?;
+    response.headers_mut().set("content-type", mime_type)?;
+    if byte_len >= 0 {
+        response
+            .headers_mut()
+            .set("content-length", &byte_len.to_string())?;
+    }
     set_cors(&mut response)?;
     Ok(response)
 }

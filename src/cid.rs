@@ -37,9 +37,17 @@ pub fn raw_cid(bytes: &[u8]) -> Cid {
     cid_for_bytes(RAW_CODEC, bytes)
 }
 
+pub fn raw_cid_from_sha256_digest(digest: &[u8]) -> Cid {
+    cid_from_sha256_digest(RAW_CODEC, digest)
+}
+
 pub fn cid_for_bytes(codec: u64, bytes: &[u8]) -> Cid {
     let digest = Sha256::digest(bytes);
-    let hash = Multihash::wrap(SHA2_256_CODE, digest.as_slice())
+    cid_from_sha256_digest(codec, digest.as_slice())
+}
+
+fn cid_from_sha256_digest(codec: u64, digest: &[u8]) -> Cid {
+    let hash = Multihash::wrap(SHA2_256_CODE, digest)
         .expect("SHA-256 digest always fits in default multihash size");
     Cid::new_v1(codec, hash)
 }
@@ -128,5 +136,12 @@ mod tests {
         assert_eq!(cid.codec(), RAW_CODEC);
         assert_eq!(cid.hash().code(), SHA2_256_CODE);
         assert_eq!(cid.hash().digest().len(), 32);
+    }
+
+    #[test]
+    fn computes_raw_cid_from_streamed_sha256_digest() {
+        let digest = Sha256::digest(b"raw bytes");
+
+        assert_eq!(raw_cid_from_sha256_digest(&digest), raw_cid(b"raw bytes"));
     }
 }

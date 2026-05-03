@@ -1071,6 +1071,7 @@ dependencies = [
  "futures-core",
  "futures-executor",
  "futures-util",
+ "js-sys",
  "p256",
  "serde",
  "serde-wasm-bindgen",
