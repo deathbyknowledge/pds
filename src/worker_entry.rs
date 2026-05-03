@@ -9,21 +9,26 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, json, to_string, Value};
 use sha2::{Digest, Sha256};
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{JsCast, JsValue};
 use worker::{
     durable_object, event, Context, DurableObject, Env, FixedLengthStream, Headers, HttpMetadata,
     Method, Request, RequestInit, Response, ResponseBody, SqlStorage, State, WebSocket,
     WebSocketIncomingMessage, WebSocketPair,
 };
 
+use crate::auth::{
+    hash_password, session_claims, sign_token, verify_password, verify_token, ACCESS_SCOPE,
+    REFRESH_SCOPE,
+};
 use crate::car::{decode_car, encode_car, encode_car_from_store, CarBlock, CarError};
 use crate::cbor::encode_dag_cbor;
 use crate::cid::{parse_cid, raw_cid, raw_cid_from_sha256_digest};
 use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
-    DirectoryCommitEventInput, DirectoryEventRow, DirectoryRepoRow, RepoBlobRow,
-    RepoCommitEventInput, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
+    DirectoryAccountRow, DirectoryCommitEventInput, DirectoryEventRow, DirectoryRepoRow,
+    DirectorySessionRow, RepoBlobRow, RepoCommitEventInput, RepoIdentityRow, RepoStateRow,
+    SqlDirectoryStore, SqlRepoStore,
 };
 use crate::identity::{IdentityError, RepoSigningKey};
 use crate::repo::{
@@ -33,8 +38,10 @@ use crate::xrpc::{
     at_uri, optional_param, parse_list_records_params, required_param, route_xrpc_method,
     REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD,
     REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
-    SERVER_DESCRIBE_SERVER, SYNC_GET_BLOB, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
-    SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS, SYNC_SUBSCRIBE_REPOS,
+    SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER,
+    SERVER_GET_SESSION, SERVER_REFRESH_SESSION, SYNC_GET_BLOB, SYNC_GET_LATEST_COMMIT,
+    SYNC_GET_RECORD, SYNC_GET_REPO, SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS,
+    SYNC_SUBSCRIBE_REPOS,
 };
 use crate::xrpc::{XrpcError, XrpcRoute};
 
@@ -43,6 +50,11 @@ const ATPROTO_DID_PATH: &str = "/.well-known/atproto-did";
 const BLOB_BUCKET_BINDING: &str = "BLOB_BUCKET";
 const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
 const MAX_APPLY_WRITES: usize = 200;
+const PASSWORD_SALT_BYTES: usize = 16;
+const SESSION_ID_BYTES: usize = 24;
+const REPO_SIGNING_KEY_BYTES: usize = 32;
+const ACCESS_TOKEN_TTL_SECONDS: i64 = 15 * 60;
+const REFRESH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
 
 #[event(fetch)]
 async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<Response> {
@@ -153,6 +165,11 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "recordRead": "GET /repos/:name/records?path=collection/rkey",
                 "recordList": "GET /repos/:name/records?collection=nsid",
                 "xrpcDescribeServer": "GET /xrpc/com.atproto.server.describeServer",
+                "xrpcCreateAccount": "POST /xrpc/com.atproto.server.createAccount",
+                "xrpcCreateSession": "POST /xrpc/com.atproto.server.createSession",
+                "xrpcGetSession": "GET /xrpc/com.atproto.server.getSession",
+                "xrpcRefreshSession": "POST /xrpc/com.atproto.server.refreshSession",
+                "xrpcDeleteSession": "POST /xrpc/com.atproto.server.deleteSession",
                 "xrpcDescribeRepo": "GET /xrpc/com.atproto.repo.describeRepo?repo=:repo",
                 "xrpcGetRecord": "GET /xrpc/com.atproto.repo.getRecord?repo=:repo&collection=:nsid&rkey=:rkey",
                 "xrpcListRecords": "GET /xrpc/com.atproto.repo.listRecords?repo=:repo&collection=:nsid",
@@ -288,6 +305,26 @@ impl PdsDirectoryObject {
         {
             return self.xrpc_subscribe_repos(req, &url);
         }
+        if parts.len() >= 2 && parts[0] == "xrpc" {
+            return match (req.method(), parts[1]) {
+                (Method::Post, SERVER_CREATE_ACCOUNT) => self.xrpc_create_account(req, &url).await,
+                (Method::Post, SERVER_CREATE_SESSION) => self.xrpc_create_session(req, &url).await,
+                (Method::Get, SERVER_GET_SESSION) => self.xrpc_get_session(req, &url),
+                (Method::Post, SERVER_REFRESH_SESSION) => {
+                    self.xrpc_refresh_session(req, &url).await
+                }
+                (Method::Post, SERVER_DELETE_SESSION) => self.xrpc_delete_session(req),
+                (
+                    _,
+                    SERVER_CREATE_ACCOUNT
+                    | SERVER_CREATE_SESSION
+                    | SERVER_GET_SESSION
+                    | SERVER_REFRESH_SESSION
+                    | SERVER_DELETE_SESSION,
+                ) => Err(HttpError::new(405, "method not allowed")),
+                _ => Err(HttpError::new(404, "unsupported XRPC method")),
+            };
+        }
 
         match (req.method(), url.path()) {
             (Method::Get, "/directory/status") => self.status(),
@@ -306,10 +343,157 @@ impl PdsDirectoryObject {
             200,
             &json!({
                 "repos": store.repo_count().map_err(HttpError::worker)?,
+                "accounts": store.account_count().map_err(HttpError::worker)?,
                 "events": store.event_count().map_err(HttpError::worker)?,
             }),
         )
         .map_err(HttpError::worker)
+    }
+
+    async fn xrpc_create_account(
+        &self,
+        req: &mut Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcCreateAccountRequest = req.json().await.map_err(HttpError::worker)?;
+        let request_host = request_host(req)?;
+        ensure_supported_account_handle(&body.handle, &request_host)?;
+        if body.did.is_some() || body.plc_op.is_some() {
+            return Err(HttpError::new(
+                400,
+                "importing existing DIDs is not implemented",
+            ));
+        }
+        let password = body
+            .password
+            .as_deref()
+            .ok_or_else(|| HttpError::new(400, "InvalidPassword: password is required"))?;
+        ensure_password_strength(password)?;
+        let store = self.store();
+        if store
+            .get_account_by_identifier(&body.handle)
+            .map_err(HttpError::worker)?
+            .is_some()
+        {
+            return Err(HttpError::new(400, "HandleNotAvailable"));
+        }
+
+        let did = Did::new(format!("did:web:{}", body.handle)).map_err(HttpError::bad_request)?;
+        let repo_name = body.handle.clone();
+        let signing_key_hex = generate_repo_signing_key_hex()?;
+        let init = self
+            .initialize_account_repo(
+                url,
+                &repo_name,
+                did.as_str(),
+                &body.handle,
+                &signing_key_hex,
+            )
+            .await?;
+
+        let salt = random_bytes::<PASSWORD_SALT_BYTES>()?;
+        let account = DirectoryAccountRow {
+            did: did.clone(),
+            handle: body.handle.clone(),
+            email: body.email.clone(),
+            password_hash: hash_password(password, &salt),
+            repo_name: repo_name.clone(),
+            public_key_multibase: init.public_key_multibase.clone(),
+            active: true,
+            status: None,
+        };
+        store.insert_account(&account).map_err(HttpError::worker)?;
+        let repo = DirectoryRepoRow {
+            did: did.clone(),
+            handle: body.handle.clone(),
+            repo_name,
+            head: parse_cid(&init.latest_commit).map_err(HttpError::bad_request)?,
+            rev: RepoRev::new(init.latest_rev).map_err(HttpError::bad_request)?,
+            active: true,
+        };
+        store.upsert_repo(&repo).map_err(HttpError::worker)?;
+        let event = store
+            .append_account_event(&did, true, None)
+            .map_err(HttpError::worker)?;
+        self.broadcast_repo_event(&event)?;
+
+        let session = self.create_session_for_account(&account)?;
+        store
+            .insert_session(&session.row)
+            .map_err(HttpError::worker)?;
+        json_response(200, &session_response(url, &account, Some(session.tokens)))
+            .map_err(HttpError::worker)
+    }
+
+    async fn xrpc_create_session(
+        &self,
+        req: &mut Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let body: XrpcCreateSessionRequest = req.json().await.map_err(HttpError::worker)?;
+        let Some(account) = self
+            .store()
+            .get_account_by_identifier(&body.identifier)
+            .map_err(HttpError::worker)?
+        else {
+            return Err(HttpError::new(401, "invalid identifier or password"));
+        };
+        if !verify_password(&body.password, &account.password_hash).map_err(HttpError::auth)? {
+            return Err(HttpError::new(401, "invalid identifier or password"));
+        }
+        if !account.active {
+            return Err(HttpError::new(403, "AccountTakedown"));
+        }
+
+        let session = self.create_session_for_account(&account)?;
+        self.store()
+            .insert_session(&session.row)
+            .map_err(HttpError::worker)?;
+        json_response(200, &session_response(url, &account, Some(session.tokens)))
+            .map_err(HttpError::worker)
+    }
+
+    fn xrpc_get_session(&self, req: &Request, url: &worker::Url) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        json_response(200, &session_response(url, &account, None)).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_refresh_session(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, REFRESH_SCOPE)?;
+        let Some(session) = self
+            .store()
+            .get_session_by_refresh_jti(&claims.jti)
+            .map_err(HttpError::worker)?
+        else {
+            return Err(HttpError::new(401, "InvalidToken"));
+        };
+        if !session.active || session.refresh_jti != claims.jti {
+            return Err(HttpError::new(401, "InvalidToken"));
+        }
+        let account = self.account_for_claims(&claims)?;
+        let refreshed = self.create_session_for_account(&account)?;
+        self.store()
+            .rotate_session_refresh(&session.session_id, &refreshed.row.refresh_jti)
+            .map_err(HttpError::worker)?;
+        json_response(
+            200,
+            &session_response(url, &account, Some(refreshed.tokens)),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn xrpc_delete_session(&self, req: &Request) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, REFRESH_SCOPE)?;
+        self.store()
+            .delete_session_by_refresh_jti(&claims.jti)
+            .map_err(HttpError::worker)?;
+        empty_response(200).map_err(HttpError::worker)
     }
 
     fn xrpc_list_repos(&self, url: &worker::Url) -> Result<Response, HttpError> {
@@ -377,7 +561,7 @@ impl PdsDirectoryObject {
             .list_events_after(cursor, 500)
             .map_err(HttpError::worker)?;
         for event in events {
-            let frame = subscribe_repo_event_frame(&event)?;
+            let frame = subscribe_event_frame(&event)?;
             pair.server
                 .send_with_bytes(frame)
                 .map_err(HttpError::worker)?;
@@ -439,11 +623,144 @@ impl PdsDirectoryObject {
     }
 
     fn broadcast_repo_event(&self, event: &DirectoryEventRow) -> Result<(), HttpError> {
-        let frame = subscribe_repo_event_frame(event)?;
+        let frame = subscribe_event_frame(event)?;
         for socket in self.state.get_websockets() {
             let _ = socket.send_with_bytes(&frame);
         }
         Ok(())
+    }
+
+    async fn initialize_account_repo(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+        did: &str,
+        handle: &str,
+        signing_key_p256_hex: &str,
+    ) -> Result<InternalInitRepoResponse, HttpError> {
+        let namespace = self
+            .env
+            .durable_object("REPO_OBJECTS")
+            .map_err(HttpError::worker)?;
+        let id = namespace
+            .id_from_name(repo_name)
+            .map_err(HttpError::worker)?;
+        let stub = id.get_stub().map_err(HttpError::worker)?;
+        let body = json!({
+            "did": did,
+            "handle": handle,
+            "rev": generated_initial_repo_rev()?.to_string(),
+            "signingKeyP256Hex": signing_key_p256_hex,
+            "reset": false,
+            "notifyDirectory": false,
+        });
+        let headers = Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(HttpError::worker)?;
+        headers
+            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
+            .map_err(HttpError::worker)?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(JsValue::from_str(&body.to_string())));
+        let request = Request::new_with_init(
+            &format!("{}/repos/{}/init", request_origin(url), repo_name),
+            &init,
+        )
+        .map_err(HttpError::worker)?;
+        let mut response = stub
+            .fetch_with_request(request)
+            .await
+            .map_err(HttpError::worker)?;
+        if !(200..=299).contains(&response.status_code()) {
+            let text = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(HttpError::new(
+                response.status_code(),
+                format!("failed to initialize repo: {text}"),
+            ));
+        }
+        response.json().await.map_err(HttpError::worker)
+    }
+
+    fn create_session_for_account(
+        &self,
+        account: &DirectoryAccountRow,
+    ) -> Result<CreatedSession, HttpError> {
+        let now = current_unix_time();
+        let session_id = random_token_id()?;
+        let refresh_jti = random_token_id()?;
+        let secret = token_secret_from_env(&self.env)?;
+        let access_jwt = sign_token(
+            &secret,
+            &session_claims(
+                account.did.as_str(),
+                &account.handle,
+                &session_id,
+                ACCESS_SCOPE,
+                now,
+                ACCESS_TOKEN_TTL_SECONDS,
+            ),
+        )
+        .map_err(HttpError::auth)?;
+        let refresh_jwt = sign_token(
+            &secret,
+            &session_claims(
+                account.did.as_str(),
+                &account.handle,
+                &refresh_jti,
+                REFRESH_SCOPE,
+                now,
+                REFRESH_TOKEN_TTL_SECONDS,
+            ),
+        )
+        .map_err(HttpError::auth)?;
+        Ok(CreatedSession {
+            row: DirectorySessionRow {
+                session_id,
+                did: account.did.clone(),
+                refresh_jti,
+                active: true,
+            },
+            tokens: SessionTokens {
+                access_jwt,
+                refresh_jwt,
+            },
+        })
+    }
+
+    fn require_bearer_claims(
+        &self,
+        req: &Request,
+        scope: &str,
+    ) -> Result<crate::auth::TokenClaims, HttpError> {
+        let token = bearer_token(req)?;
+        verify_token(
+            &token_secret_from_env(&self.env)?,
+            &token,
+            scope,
+            current_unix_time(),
+        )
+        .map_err(HttpError::auth)
+    }
+
+    fn account_for_claims(
+        &self,
+        claims: &crate::auth::TokenClaims,
+    ) -> Result<DirectoryAccountRow, HttpError> {
+        let did = Did::new(claims.sub.clone()).map_err(HttpError::bad_request)?;
+        let Some(account) = self
+            .store()
+            .get_account_by_did(&did)
+            .map_err(HttpError::worker)?
+        else {
+            return Err(HttpError::new(401, "InvalidToken"));
+        };
+        if !account.active {
+            return Err(HttpError::new(403, "AccountTakedown"));
+        }
+        Ok(account)
     }
 }
 
@@ -763,11 +1080,11 @@ impl RepoObject {
         req: &Request,
         url: &worker::Url,
     ) -> Result<Response, HttpError> {
-        self.require_admin(req)?;
         let params = query_pairs(url);
         let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 500, 1000)?;
         let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
         let state = self.repo_state()?;
+        self.require_repo_write_auth(req, &state.did)?;
         let (refs, next_cursor) = self
             .store()
             .list_missing_blob_refs(limit, cursor.as_deref())
@@ -887,8 +1204,10 @@ impl RepoObject {
             .map_err(HttpError::worker)?;
         self.persist_commit_event(repo.storage(), &state, &event)
             .map_err(HttpError::worker)?;
-        self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
-            .await?;
+        if body.notify_directory.unwrap_or(true) {
+            self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
+                .await?;
+        }
 
         json_response(
             201,
@@ -1047,11 +1366,11 @@ impl RepoObject {
 
     async fn xrpc_create_record(&self, req: &mut Request) -> Result<Response, HttpError> {
         let body: XrpcCreateRecordRequest = req.json().await.map_err(HttpError::worker)?;
-        self.require_admin(req)?;
         let request_host = request_host(req)?;
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         ensure_repo_identifier(&previous_state, &identity, &body.repo)?;
+        self.require_repo_write_auth(req, &previous_state.did)?;
         ensure_swap_commit(&previous_state, body.swap_commit.as_deref())?;
 
         let collection = Nsid::new(body.collection).map_err(HttpError::bad_request)?;
@@ -1103,11 +1422,11 @@ impl RepoObject {
 
     async fn xrpc_put_record(&self, req: &mut Request) -> Result<Response, HttpError> {
         let body: XrpcPutRecordRequest = req.json().await.map_err(HttpError::worker)?;
-        self.require_admin(req)?;
         let request_host = request_host(req)?;
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         ensure_repo_identifier(&previous_state, &identity, &body.repo)?;
+        self.require_repo_write_auth(req, &previous_state.did)?;
         ensure_swap_commit(&previous_state, body.swap_commit.as_deref())?;
 
         let path = RepoPath::new(
@@ -1168,11 +1487,11 @@ impl RepoObject {
 
     async fn xrpc_delete_record(&self, req: &mut Request) -> Result<Response, HttpError> {
         let body: XrpcDeleteRecordRequest = req.json().await.map_err(HttpError::worker)?;
-        self.require_admin(req)?;
         let request_host = request_host(req)?;
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         ensure_repo_identifier(&previous_state, &identity, &body.repo)?;
+        self.require_repo_write_auth(req, &previous_state.did)?;
         ensure_swap_commit(&previous_state, body.swap_commit.as_deref())?;
 
         let path = RepoPath::new(
@@ -1226,11 +1545,11 @@ impl RepoObject {
 
     async fn xrpc_apply_writes(&self, req: &mut Request) -> Result<Response, HttpError> {
         let body: XrpcApplyWritesRequest = req.json().await.map_err(HttpError::worker)?;
-        self.require_admin(req)?;
         let request_host = request_host(req)?;
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         ensure_repo_identifier(&previous_state, &identity, &body.repo)?;
+        self.require_repo_write_auth(req, &previous_state.did)?;
         ensure_swap_commit(&previous_state, body.swap_commit.as_deref())?;
         if body.writes.is_empty() {
             return Err(HttpError::new(
@@ -1354,8 +1673,8 @@ impl RepoObject {
     }
 
     async fn xrpc_upload_blob(&self, req: &mut Request) -> Result<Response, HttpError> {
-        self.require_admin(req)?;
-        self.repo_state()?;
+        let state = self.repo_state()?;
+        self.require_repo_write_auth(req, &state.did)?;
         let mime_type = req
             .headers()
             .get("content-type")
@@ -1526,37 +1845,25 @@ impl RepoObject {
     }
 
     fn require_admin(&self, req: &Request) -> Result<(), HttpError> {
-        let token = self.admin_token()?;
-        let authorization = req
-            .headers()
-            .get("authorization")
-            .map_err(HttpError::worker)?;
-        let admin_header = req
-            .headers()
-            .get("x-pds-admin-token")
-            .map_err(HttpError::worker)?;
-        let expected_authorization = format!("Bearer {token}");
-
-        if authorization.as_deref() == Some(expected_authorization.as_str())
-            || admin_header.as_deref() == Some(token.as_str())
-        {
-            Ok(())
-        } else {
-            Err(HttpError::new(401, "admin token required"))
-        }
+        require_admin_with_env(&self.env, req)
     }
 
-    fn admin_token(&self) -> Result<String, HttpError> {
-        let token = self
-            .env
-            .secret("PDS_ADMIN_TOKEN")
-            .or_else(|_| self.env.var("PDS_ADMIN_TOKEN"))
-            .map_err(|_| HttpError::new(500, "PDS_ADMIN_TOKEN binding is required"))?
-            .to_string();
-        if token.is_empty() {
-            Err(HttpError::new(500, "PDS_ADMIN_TOKEN must not be empty"))
+    fn require_repo_write_auth(&self, req: &Request, did: &Did) -> Result<(), HttpError> {
+        if is_admin_authorized(&self.env, req)? {
+            return Ok(());
+        }
+        let token = bearer_token(req)?;
+        let claims = verify_token(
+            &token_secret_from_env(&self.env)?,
+            &token,
+            ACCESS_SCOPE,
+            current_unix_time(),
+        )
+        .map_err(HttpError::auth)?;
+        if claims.sub == did.as_str() {
+            Ok(())
         } else {
-            Ok(token)
+            Err(HttpError::new(403, "token does not match repo DID"))
         }
     }
 
@@ -1854,6 +2161,47 @@ struct InitRepoRequest {
     signing_key_p256_hex: String,
     #[serde(default)]
     reset: Option<bool>,
+    #[serde(default, rename = "notifyDirectory")]
+    notify_directory: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcCreateAccountRequest {
+    handle: String,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    did: Option<String>,
+    #[serde(default, rename = "plcOp")]
+    plc_op: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcCreateSessionRequest {
+    identifier: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InternalInitRepoResponse {
+    #[serde(rename = "publicKeyMultibase")]
+    public_key_multibase: String,
+    #[serde(rename = "latestCommit")]
+    latest_commit: String,
+    #[serde(rename = "latestRev")]
+    latest_rev: String,
+}
+
+struct CreatedSession {
+    row: DirectorySessionRow,
+    tokens: SessionTokens,
+}
+
+struct SessionTokens {
+    access_jwt: String,
+    refresh_jwt: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2020,6 +2368,10 @@ impl HttpError {
 
     fn identity(error: IdentityError) -> Self {
         Self::new(400, error.to_string())
+    }
+
+    fn auth(error: crate::auth::AuthError) -> Self {
+        Self::new(401, error.to_string())
     }
 
     fn car(error: CarError) -> Self {
@@ -2290,6 +2642,196 @@ fn ensure_blob_size_limit(byte_len: u64) -> Result<(), HttpError> {
     }
 }
 
+fn require_admin_with_env(env: &Env, req: &Request) -> Result<(), HttpError> {
+    if is_admin_authorized(env, req)? {
+        Ok(())
+    } else {
+        Err(HttpError::new(401, "admin token required"))
+    }
+}
+
+fn is_admin_authorized(env: &Env, req: &Request) -> Result<bool, HttpError> {
+    let token = admin_token_from_env(env)?;
+    let authorization = req
+        .headers()
+        .get("authorization")
+        .map_err(HttpError::worker)?;
+    let admin_header = req
+        .headers()
+        .get("x-pds-admin-token")
+        .map_err(HttpError::worker)?;
+    let expected_authorization = format!("Bearer {token}");
+    Ok(
+        authorization.as_deref() == Some(expected_authorization.as_str())
+            || admin_header.as_deref() == Some(token.as_str()),
+    )
+}
+
+fn admin_token_from_env(env: &Env) -> Result<String, HttpError> {
+    let token = env
+        .secret("PDS_ADMIN_TOKEN")
+        .or_else(|_| env.var("PDS_ADMIN_TOKEN"))
+        .map_err(|_| HttpError::new(500, "PDS_ADMIN_TOKEN binding is required"))?
+        .to_string();
+    if token.is_empty() {
+        Err(HttpError::new(500, "PDS_ADMIN_TOKEN must not be empty"))
+    } else {
+        Ok(token)
+    }
+}
+
+fn token_secret_from_env(env: &Env) -> Result<String, HttpError> {
+    let token = match env
+        .secret("PDS_JWT_SECRET")
+        .or_else(|_| env.var("PDS_JWT_SECRET"))
+    {
+        Ok(value) => value.to_string(),
+        Err(_) => admin_token_from_env(env)?,
+    };
+    if token.is_empty() {
+        Err(HttpError::new(500, "PDS_JWT_SECRET must not be empty"))
+    } else {
+        Ok(token)
+    }
+}
+
+fn bearer_token(req: &Request) -> Result<String, HttpError> {
+    let authorization = req
+        .headers()
+        .get("authorization")
+        .map_err(HttpError::worker)?
+        .ok_or_else(|| HttpError::new(401, "authorization bearer token required"))?;
+    authorization
+        .strip_prefix("Bearer ")
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_string())
+        .ok_or_else(|| HttpError::new(401, "authorization bearer token required"))
+}
+
+fn ensure_supported_account_handle(handle: &str, request_host: &str) -> Result<(), HttpError> {
+    if handle == request_host {
+        Ok(())
+    } else {
+        Err(HttpError::new(
+            400,
+            format!("UnsupportedDomain: this PDS currently supports only `{request_host}`"),
+        ))
+    }
+}
+
+fn ensure_password_strength(password: &str) -> Result<(), HttpError> {
+    if password.len() < 8 {
+        Err(HttpError::new(
+            400,
+            "InvalidPassword: password must be at least 8 characters",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn session_response(
+    url: &worker::Url,
+    account: &DirectoryAccountRow,
+    tokens: Option<SessionTokens>,
+) -> Value {
+    let mut body = json!({
+        "did": account.did.to_string(),
+        "handle": account.handle.clone(),
+        "active": account.active,
+        "didDoc": did_document(
+            account.did.as_str(),
+            &account.handle,
+            &account.public_key_multibase,
+            &request_origin(url),
+        ),
+    });
+    if let Some(status) = &account.status {
+        body["status"] = json!(status);
+    }
+    if let Some(email) = &account.email {
+        body["email"] = json!(email);
+        body["emailConfirmed"] = json!(false);
+        body["emailAuthFactor"] = json!(false);
+    }
+    if let Some(tokens) = tokens {
+        body["accessJwt"] = json!(tokens.access_jwt);
+        body["refreshJwt"] = json!(tokens.refresh_jwt);
+    }
+    body
+}
+
+fn generate_repo_signing_key_hex() -> Result<String, HttpError> {
+    for _ in 0..16 {
+        let bytes = random_bytes::<REPO_SIGNING_KEY_BYTES>()?;
+        let hex = hex_encode(&bytes);
+        if RepoSigningKey::from_p256_hex(&hex).is_ok() {
+            return Ok(hex);
+        }
+    }
+    Err(HttpError::new(500, "failed to generate repo signing key"))
+}
+
+fn random_token_id() -> Result<String, HttpError> {
+    Ok(BASE64_STANDARD.encode(random_bytes::<SESSION_ID_BYTES>()?))
+}
+
+fn random_bytes<const N: usize>() -> Result<[u8; N], HttpError> {
+    let mut bytes = [0_u8; N];
+    fill_random_bytes(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn fill_random_bytes(bytes: &mut [u8]) -> Result<(), HttpError> {
+    let array = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
+    let crypto = js_sys::Reflect::get(&js_sys::global(), &JsValue::from_str("crypto"))
+        .map_err(js_value_error)?;
+    let get_random_values = js_sys::Reflect::get(&crypto, &JsValue::from_str("getRandomValues"))
+        .map_err(js_value_error)?
+        .dyn_into::<js_sys::Function>()
+        .map_err(js_value_error)?;
+    get_random_values
+        .call1(&crypto, &array)
+        .map_err(js_value_error)?;
+    array.copy_to(bytes);
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn fill_random_bytes(bytes: &mut [u8]) -> Result<(), HttpError> {
+    getrandom::fill(bytes).map_err(|error| HttpError::new(500, error.to_string()))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn js_value_error(value: JsValue) -> HttpError {
+    HttpError::new(
+        500,
+        value
+            .as_string()
+            .unwrap_or_else(|| "JavaScript error".to_string()),
+    )
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    result
+}
+
+fn current_unix_time() -> i64 {
+    (worker::Date::now().as_millis() / 1000) as i64
+}
+
+fn generated_initial_repo_rev() -> Result<RepoRev, HttpError> {
+    let entropy = u64::from_le_bytes(random_bytes::<8>()?);
+    RepoRev::new(generated_tid_from_entropy(entropy, 0)).map_err(HttpError::bad_request)
+}
+
 fn generated_record_key(seed: &crate::cid::Cid) -> Result<RecordKey, HttpError> {
     RecordKey::new(generated_tid(seed)).map_err(HttpError::bad_request)
 }
@@ -2310,8 +2852,12 @@ fn generated_tid(seed: &crate::cid::Cid) -> String {
 }
 
 fn generated_tid_with_offset(seed: &crate::cid::Cid, offset: u64) -> String {
-    const TID_ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
     let entropy = seed.hash().digest().last().copied().unwrap_or_default() as u64;
+    generated_tid_from_entropy(entropy, offset)
+}
+
+fn generated_tid_from_entropy(entropy: u64, offset: u64) -> String {
+    const TID_ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
     let mut value = worker::Date::now()
         .as_millis()
         .saturating_mul(1000)
@@ -2337,7 +2883,11 @@ fn ensure_repo_identifier(
     }
 }
 
-fn subscribe_repo_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError> {
+fn subscribe_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError> {
+    if event.event_type == "account" {
+        return subscribe_account_event_frame(event);
+    }
+
     let commit = event
         .commit_cid
         .ok_or_else(|| HttpError::new(500, "directory commit event is missing commit cid"))?;
@@ -2388,6 +2938,26 @@ fn subscribe_repo_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, Http
     Ok(frame)
 }
 
+fn subscribe_account_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError> {
+    let payload =
+        from_str::<DirectoryAccountEventPayload>(&event.blobs_json).map_err(HttpError::worker)?;
+    let header = SubscribeReposHeader {
+        op: 1,
+        kind: "#account",
+    };
+    let body = SubscribeReposAccount {
+        seq: event.seq,
+        did: event.did.to_string(),
+        active: payload.active,
+        status: payload.status,
+        time: event.created_at.clone(),
+    };
+
+    let mut frame = encode_dag_cbor(&header).map_err(HttpError::worker)?;
+    frame.extend(encode_dag_cbor(&body).map_err(HttpError::worker)?);
+    Ok(frame)
+}
+
 #[derive(Serialize)]
 struct SubscribeReposHeader<'a> {
     op: i64,
@@ -2413,6 +2983,22 @@ struct SubscribeReposCommit {
     time: String,
 }
 
+#[derive(Deserialize)]
+struct DirectoryAccountEventPayload {
+    active: bool,
+    status: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SubscribeReposAccount {
+    seq: i64,
+    did: String,
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    time: String,
+}
+
 #[derive(Serialize)]
 struct SubscribeReposOp {
     action: String,
@@ -2431,13 +3017,17 @@ fn health_response() -> worker::Result<Response> {
     )
 }
 
-fn describe_server(_url: &worker::Url) -> worker::Result<Response> {
+fn describe_server(url: &worker::Url) -> worker::Result<Response> {
+    let domains = url
+        .host_str()
+        .map(|host| vec![host.to_string()])
+        .unwrap_or_default();
     json_response(
         200,
         &json!({
             "did": "did:gsv:pds",
-            "availableUserDomains": [],
-            "inviteCodeRequired": false,
+            "availableUserDomains": domains,
+            "inviteCodeRequired": true,
             "phoneVerificationRequired": false,
             "links": {},
             "contact": {},

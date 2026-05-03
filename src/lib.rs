@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod car;
 pub mod cbor;
 pub mod cid;

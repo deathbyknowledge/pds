@@ -119,11 +119,45 @@ pub const CREATE_DIRECTORY_EVENTS_DID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_directory_events_did_seq
      ON directory_events(did, seq)";
 
+pub const CREATE_DIRECTORY_ACCOUNTS: &str = "CREATE TABLE IF NOT EXISTS directory_accounts (
+    did                  TEXT PRIMARY KEY,
+    handle               TEXT NOT NULL UNIQUE,
+    email                TEXT,
+    password_hash        TEXT NOT NULL,
+    repo_name            TEXT NOT NULL UNIQUE,
+    public_key_multibase TEXT NOT NULL,
+    active               INTEGER NOT NULL DEFAULT 1,
+    status               TEXT,
+    created_at           INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at           INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_DIRECTORY_ACCOUNTS_HANDLE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_accounts_handle
+     ON directory_accounts(handle)";
+
+pub const CREATE_DIRECTORY_SESSIONS: &str = "CREATE TABLE IF NOT EXISTS directory_sessions (
+    session_id  TEXT PRIMARY KEY,
+    did         TEXT NOT NULL,
+    refresh_jti TEXT NOT NULL UNIQUE,
+    active      INTEGER NOT NULL DEFAULT 1,
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_DIRECTORY_SESSIONS_DID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_sessions_did
+     ON directory_sessions(did)";
+
 pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_REPOS,
     CREATE_DIRECTORY_REPOS_UPDATED_INDEX,
     CREATE_DIRECTORY_EVENTS,
     CREATE_DIRECTORY_EVENTS_DID_INDEX,
+    CREATE_DIRECTORY_ACCOUNTS,
+    CREATE_DIRECTORY_ACCOUNTS_HANDLE_INDEX,
+    CREATE_DIRECTORY_SESSIONS,
+    CREATE_DIRECTORY_SESSIONS_DID_INDEX,
 ];
 
 #[cfg(test)]
@@ -197,5 +231,9 @@ mod tests {
         assert!(joined.contains("blocks     BLOB"));
         assert!(joined.contains("ops_json   TEXT NOT NULL DEFAULT '[]'"));
         assert!(joined.contains("idx_directory_events_did_seq"));
+        assert!(joined.contains("directory_accounts"));
+        assert!(joined.contains("password_hash        TEXT NOT NULL"));
+        assert!(joined.contains("directory_sessions"));
+        assert!(joined.contains("refresh_jti TEXT NOT NULL UNIQUE"));
     }
 }

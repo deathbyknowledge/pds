@@ -70,6 +70,26 @@ pub struct DirectoryEventRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryAccountRow {
+    pub did: Did,
+    pub handle: String,
+    pub email: Option<String>,
+    pub password_hash: String,
+    pub repo_name: String,
+    pub public_key_multibase: String,
+    pub active: bool,
+    pub status: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectorySessionRow {
+    pub session_id: String,
+    pub did: Did,
+    pub refresh_jti: String,
+    pub active: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoBlobRow {
     pub cid: Cid,
     pub mime_type: String,
@@ -506,9 +526,150 @@ impl SqlDirectoryStore {
             "ALTER TABLE directory_events ADD COLUMN blocks BLOB",
             "ALTER TABLE directory_events ADD COLUMN ops_json TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE directory_events ADD COLUMN blobs_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE directory_accounts ADD COLUMN email TEXT",
+            "ALTER TABLE directory_accounts ADD COLUMN public_key_multibase TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE directory_accounts ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE directory_accounts ADD COLUMN status TEXT",
         ] {
             exec_ignore_duplicate_column(&self.sql, statement)?;
         }
+        Ok(())
+    }
+
+    pub fn insert_account(&self, row: &DirectoryAccountRow) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO directory_accounts (
+                did, handle, email, password_hash, repo_name, public_key_multibase, active, status
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(row.did.to_string()),
+                SqlStorageValue::from(row.handle.clone()),
+                optional_text(row.email.clone()),
+                SqlStorageValue::from(row.password_hash.clone()),
+                SqlStorageValue::from(row.repo_name.clone()),
+                SqlStorageValue::from(row.public_key_multibase.clone()),
+                SqlStorageValue::from(if row.active { 1_i64 } else { 0_i64 }),
+                optional_text(row.status.clone()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_account_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> worker::Result<Option<DirectoryAccountRow>> {
+        let rows: Vec<DirectoryAccountStorageRow> = self
+            .sql
+            .exec(
+                "SELECT did, handle, email, password_hash, repo_name, public_key_multibase,
+                        active, status
+                 FROM directory_accounts
+                 WHERE handle = ? OR did = ?
+                 LIMIT 1",
+                vec![
+                    SqlStorageValue::from(identifier.to_string()),
+                    SqlStorageValue::from(identifier.to_string()),
+                ],
+            )?
+            .to_array()?;
+        rows.into_iter()
+            .next()
+            .map(directory_account_from_row)
+            .transpose()
+    }
+
+    pub fn get_account_by_did(&self, did: &Did) -> worker::Result<Option<DirectoryAccountRow>> {
+        self.get_account_by_identifier(did.as_str())
+    }
+
+    pub fn append_account_event(
+        &self,
+        did: &Did,
+        active: bool,
+        status: Option<&str>,
+    ) -> worker::Result<DirectoryEventRow> {
+        self.sql.exec(
+            "INSERT INTO directory_events (
+                did, event_type, commit_cid, rev, since, blocks, ops_json, blobs_json
+             )
+             VALUES (?, 'account', NULL, NULL, NULL, NULL, ?, ?)",
+            vec![
+                SqlStorageValue::from(did.to_string()),
+                SqlStorageValue::from("[]".to_string()),
+                SqlStorageValue::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "active": active,
+                        "status": status,
+                    }))
+                    .map_err(worker_error)?,
+                ),
+            ],
+        )?;
+        let seq = last_insert_rowid(&self.sql)?;
+        self.get_event(seq)?
+            .ok_or_else(|| worker_error(std::io::Error::other("inserted account event not found")))
+    }
+
+    pub fn insert_session(&self, row: &DirectorySessionRow) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO directory_sessions (session_id, did, refresh_jti, active)
+             VALUES (?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(row.session_id.clone()),
+                SqlStorageValue::from(row.did.to_string()),
+                SqlStorageValue::from(row.refresh_jti.clone()),
+                SqlStorageValue::from(if row.active { 1_i64 } else { 0_i64 }),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_session_by_refresh_jti(
+        &self,
+        refresh_jti: &str,
+    ) -> worker::Result<Option<DirectorySessionRow>> {
+        let rows: Vec<DirectorySessionStorageRow> = self
+            .sql
+            .exec(
+                "SELECT session_id, did, refresh_jti, active
+                 FROM directory_sessions
+                 WHERE refresh_jti = ?
+                 LIMIT 1",
+                vec![SqlStorageValue::from(refresh_jti.to_string())],
+            )?
+            .to_array()?;
+        rows.into_iter()
+            .next()
+            .map(directory_session_from_row)
+            .transpose()
+    }
+
+    pub fn rotate_session_refresh(
+        &self,
+        session_id: &str,
+        refresh_jti: &str,
+    ) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_sessions
+             SET refresh_jti = ?, updated_at = unixepoch()
+             WHERE session_id = ? AND active = 1",
+            vec![
+                SqlStorageValue::from(refresh_jti.to_string()),
+                SqlStorageValue::from(session_id.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_session_by_refresh_jti(&self, refresh_jti: &str) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_sessions
+             SET active = 0, updated_at = unixepoch()
+             WHERE refresh_jti = ?",
+            vec![SqlStorageValue::from(refresh_jti.to_string())],
+        )?;
         Ok(())
     }
 
@@ -578,7 +739,7 @@ impl SqlDirectoryStore {
             "SELECT seq, did, event_type, commit_cid, rev, since, blocks, ops_json, blobs_json,
                     strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
                  FROM directory_events
-                 WHERE seq > ? AND event_type = 'commit'
+                 WHERE seq > ?
                  ORDER BY seq ASC
                  LIMIT ?",
             vec![
@@ -656,6 +817,10 @@ impl SqlDirectoryStore {
 
     pub fn repo_count(&self) -> worker::Result<i64> {
         count(&self.sql, "SELECT COUNT(*) AS n FROM directory_repos")
+    }
+
+    pub fn account_count(&self) -> worker::Result<i64> {
+        count(&self.sql, "SELECT COUNT(*) AS n FROM directory_accounts")
     }
 
     pub fn event_count(&self) -> worker::Result<i64> {
@@ -800,6 +965,32 @@ where
     row.into_directory_repo_row()
 }
 
+fn directory_account_from_row(
+    row: DirectoryAccountStorageRow,
+) -> worker::Result<DirectoryAccountRow> {
+    Ok(DirectoryAccountRow {
+        did: Did::new(row.did).map_err(worker_error)?,
+        handle: row.handle,
+        email: row.email,
+        password_hash: row.password_hash,
+        repo_name: row.repo_name,
+        public_key_multibase: row.public_key_multibase,
+        active: row.active != 0,
+        status: row.status,
+    })
+}
+
+fn directory_session_from_row(
+    row: DirectorySessionStorageRow,
+) -> worker::Result<DirectorySessionRow> {
+    Ok(DirectorySessionRow {
+        session_id: row.session_id,
+        did: Did::new(row.did).map_err(worker_error)?,
+        refresh_jti: row.refresh_jti,
+        active: row.active != 0,
+    })
+}
+
 trait IntoDirectoryRepoRow {
     fn into_directory_repo_row(self) -> worker::Result<DirectoryRepoRow>;
 }
@@ -824,6 +1015,26 @@ struct DirectoryRepoStorageRow {
     repo_name: String,
     head: String,
     rev: String,
+    active: i64,
+}
+
+#[derive(Deserialize)]
+struct DirectoryAccountStorageRow {
+    did: String,
+    handle: String,
+    email: Option<String>,
+    password_hash: String,
+    repo_name: String,
+    public_key_multibase: String,
+    active: i64,
+    status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DirectorySessionStorageRow {
+    session_id: String,
+    did: String,
+    refresh_jti: String,
     active: i64,
 }
 

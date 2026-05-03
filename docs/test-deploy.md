@@ -49,6 +49,18 @@ By default, the script generates a new P-256 signing key and prints it as
 `signingKeyP256Hex`. Keep that value only for disposable test repos, or pass
 `PDS_SIGNING_KEY_P256_HEX` explicitly when you need deterministic re-seeding.
 
+To exercise password-backed account sessions instead of the admin token write
+path, run:
+
+```bash
+export PDS_ACCOUNT_PASSWORD="<test-password>"
+npm run smoke:account
+```
+
+`createAccount` is admin-gated for now, so the smoke uses `PDS_ADMIN_TOKEN` for
+initial account creation, then logs in with the password and writes a record with
+the returned access token. Email is optional and not used by the smoke.
+
 Useful optional variables:
 
 - `PDS_HANDLE`: handle to publish in the DID document, defaults to the base URL
@@ -58,6 +70,10 @@ Useful optional variables:
 - `PDS_RESET=false`: keep an existing initialized repo instead of resetting it.
 - `PDS_RECORD_PATH`: record path, defaults to `app.gsv.record/seed`.
 - `PDS_RECORD_JSON`: JSON object to store instead of the default seed record.
+- `PDS_ACCOUNT_HANDLE`: account handle for `smoke:account`, defaults to the base
+  URL hostname.
+- `PDS_ACCOUNT_PASSWORD`: password for `smoke:account`, defaults to a local-only
+  test value.
 
 ## Local Smoke
 

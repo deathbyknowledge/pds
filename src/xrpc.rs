@@ -3,6 +3,11 @@
 use thiserror::Error;
 
 pub const SERVER_DESCRIBE_SERVER: &str = "com.atproto.server.describeServer";
+pub const SERVER_CREATE_ACCOUNT: &str = "com.atproto.server.createAccount";
+pub const SERVER_CREATE_SESSION: &str = "com.atproto.server.createSession";
+pub const SERVER_GET_SESSION: &str = "com.atproto.server.getSession";
+pub const SERVER_REFRESH_SESSION: &str = "com.atproto.server.refreshSession";
+pub const SERVER_DELETE_SESSION: &str = "com.atproto.server.deleteSession";
 pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
 pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
@@ -59,7 +64,13 @@ pub enum XrpcError {
 pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<XrpcRoute, XrpcError> {
     match method {
         SERVER_DESCRIBE_SERVER => Ok(XrpcRoute::Worker),
-        SYNC_LIST_REPOS | SYNC_SUBSCRIBE_REPOS => Ok(XrpcRoute::DirectoryObject),
+        SERVER_CREATE_ACCOUNT
+        | SERVER_CREATE_SESSION
+        | SERVER_GET_SESSION
+        | SERVER_REFRESH_SESSION
+        | SERVER_DELETE_SESSION
+        | SYNC_LIST_REPOS
+        | SYNC_SUBSCRIBE_REPOS => Ok(XrpcRoute::DirectoryObject),
         REPO_CREATE_RECORD
         | REPO_PUT_RECORD
         | REPO_DELETE_RECORD
@@ -183,19 +194,21 @@ mod tests {
     }
 
     #[test]
-    fn routes_list_repos_to_directory_object() {
-        assert_eq!(
-            route_xrpc_method(SYNC_LIST_REPOS, &[]).unwrap(),
-            XrpcRoute::DirectoryObject
-        );
-    }
-
-    #[test]
-    fn routes_subscribe_repos_to_directory_object() {
-        assert_eq!(
-            route_xrpc_method(SYNC_SUBSCRIBE_REPOS, &[]).unwrap(),
-            XrpcRoute::DirectoryObject
-        );
+    fn routes_directory_methods_to_directory_object() {
+        for method in [
+            SERVER_CREATE_ACCOUNT,
+            SERVER_CREATE_SESSION,
+            SERVER_GET_SESSION,
+            SERVER_REFRESH_SESSION,
+            SERVER_DELETE_SESSION,
+            SYNC_LIST_REPOS,
+            SYNC_SUBSCRIBE_REPOS,
+        ] {
+            assert_eq!(
+                route_xrpc_method(method, &[]).unwrap(),
+                XrpcRoute::DirectoryObject
+            );
+        }
     }
 
     #[test]
