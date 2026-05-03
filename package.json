@@ -5,6 +5,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "deploy:test": "scripts/deploy-test.sh",
+    "seed:test-repo": "node scripts/seed-test-repo.mjs",
     "build:worker": "worker-build --release .",
     "test:rust": "cargo test",
     "test": "cargo test"
