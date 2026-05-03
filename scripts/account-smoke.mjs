@@ -14,7 +14,7 @@ const collection = "app.gsv.accountSmoke";
 const rkey = `session-${Date.now().toString(36)}`;
 
 await expectOAuthDiscovery();
-await expectOAuthScaffoldEndpoints();
+const oauthPar = await expectOAuthParEndpoint();
 
 const created = await maybeCreateAccount();
 const session = await expectJson("create session", "POST", "/xrpc/com.atproto.server.createSession", {
@@ -38,6 +38,9 @@ await expectJson(
   },
   { authorization: `Bearer ${session.accessJwt}` },
 );
+
+await expectOAuthAuthorize(oauthPar, session.accessJwt);
+await expectOAuthTokenStub();
 
 const createRecord = await expectJson(
   "account createRecord",
@@ -180,15 +183,18 @@ async function expectOAuthDiscovery() {
   );
 }
 
-async function expectOAuthScaffoldEndpoints() {
+async function expectOAuthParEndpoint() {
   await expectStatus("OAuth PAR preflight", "OPTIONS", "/oauth/par", null, 204);
+  const state = `state-${Date.now().toString(36)}`;
+  const clientId = "http://localhost";
+  const redirectUri = "http://127.0.0.1/callback";
   const parBody = new URLSearchParams({
-    client_id: "http://localhost",
+    client_id: clientId,
     response_type: "code",
     code_challenge: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
     code_challenge_method: "S256",
-    state: `state-${Date.now().toString(36)}`,
-    redirect_uri: "http://127.0.0.1/callback",
+    state,
+    redirect_uri: redirectUri,
     scope: "atproto transition:generic",
     login_hint: handle,
   }).toString();
@@ -222,7 +228,53 @@ async function expectOAuthScaffoldEndpoints() {
   if (!par.request_uri) {
     throw new Error(`OAuth PAR response did not include request_uri`);
   }
-  await expectOAuthStub("OAuth authorize scaffold", "GET", "/oauth/authorize?client_id=http%3A%2F%2Flocalhost");
+  await expectStatus(
+    "OAuth authorize requires account session",
+    "GET",
+    `/oauth/authorize?client_id=${encodeQuery(clientId)}&request_uri=${encodeQuery(par.request_uri)}`,
+    null,
+    401,
+  );
+  return {
+    clientId,
+    redirectUri,
+    requestUri: par.request_uri,
+    state,
+  };
+}
+
+async function expectOAuthAuthorize(par, accessJwt) {
+  const response = await fetch(
+    `${config.baseUrl}/oauth/authorize?client_id=${encodeQuery(par.clientId)}&request_uri=${encodeQuery(par.requestUri)}`,
+    {
+      method: "GET",
+      headers: { authorization: `Bearer ${accessJwt}` },
+      redirect: "manual",
+    },
+  );
+  const text = await response.text();
+  if (response.status !== 302) {
+    throw new Error(`OAuth authorize expected redirect, got status=${response.status}: ${text}`);
+  }
+  const location = response.headers.get("location");
+  if (!location) {
+    throw new Error(`OAuth authorize redirect did not include Location header`);
+  }
+  const expectedRedirect = new URL(par.redirectUri);
+  const actualRedirect = new URL(location);
+  if (actualRedirect.origin !== expectedRedirect.origin || actualRedirect.pathname !== expectedRedirect.pathname) {
+    throw new Error(`OAuth authorize redirected to unexpected URI ${location}`);
+  }
+  if (
+    !actualRedirect.searchParams.get("code") ||
+    actualRedirect.searchParams.get("state") !== par.state ||
+    actualRedirect.searchParams.get("iss") !== baseOrigin
+  ) {
+    throw new Error(`OAuth authorize redirect had unexpected query ${location}`);
+  }
+}
+
+async function expectOAuthTokenStub() {
   await expectOAuthStub(
     "OAuth token scaffold",
     "POST",
@@ -306,4 +358,8 @@ function requiredEnv(name) {
 function optionalEnv(name, fallback = undefined) {
   const value = process.env[name];
   return value && value.length > 0 ? value : fallback;
+}
+
+function encodeQuery(value) {
+  return encodeURIComponent(value);
 }

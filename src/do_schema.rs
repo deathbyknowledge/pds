@@ -183,6 +183,32 @@ pub const CREATE_DIRECTORY_OAUTH_PAR_EXPIRES_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_directory_oauth_par_expires_at
      ON directory_oauth_par_requests(expires_at)";
 
+pub const CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES: &str =
+    "CREATE TABLE IF NOT EXISTS directory_oauth_authorization_codes (
+    code                  TEXT PRIMARY KEY,
+    request_uri           TEXT NOT NULL UNIQUE,
+    client_id             TEXT NOT NULL,
+    redirect_uri          TEXT NOT NULL,
+    scope                 TEXT NOT NULL,
+    state                 TEXT NOT NULL,
+    code_challenge        TEXT NOT NULL,
+    code_challenge_method TEXT NOT NULL,
+    did                   TEXT NOT NULL,
+    handle                TEXT NOT NULL,
+    dpop_nonce            TEXT NOT NULL,
+    expires_at            INTEGER NOT NULL,
+    consumed_at           INTEGER,
+    created_at            INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES_EXPIRES_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_oauth_authorization_codes_expires_at
+     ON directory_oauth_authorization_codes(expires_at)";
+
+pub const CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES_DID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_oauth_authorization_codes_did
+     ON directory_oauth_authorization_codes(did)";
+
 pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_REPOS,
     CREATE_DIRECTORY_REPOS_UPDATED_INDEX,
@@ -196,6 +222,9 @@ pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_SESSIONS_DID_INDEX,
     CREATE_DIRECTORY_OAUTH_PAR_REQUESTS,
     CREATE_DIRECTORY_OAUTH_PAR_EXPIRES_INDEX,
+    CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES,
+    CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES_EXPIRES_INDEX,
+    CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES_DID_INDEX,
 ];
 
 #[cfg(test)]
@@ -277,5 +306,8 @@ mod tests {
         assert!(joined.contains("refresh_jti TEXT NOT NULL UNIQUE"));
         assert!(joined.contains("directory_oauth_par_requests"));
         assert!(joined.contains("UNIQUE (client_id, state)"));
+        assert!(joined.contains("directory_oauth_authorization_codes"));
+        assert!(joined.contains("request_uri           TEXT NOT NULL UNIQUE"));
+        assert!(joined.contains("consumed_at           INTEGER"));
     }
 }

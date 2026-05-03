@@ -30,6 +30,12 @@ pub struct PushedAuthorizationRequest {
     pub client_assertion: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizationRequest {
+    pub client_id: String,
+    pub request_uri: String,
+}
+
 impl PushedAuthorizationRequest {
     pub fn requested_scopes(&self) -> BTreeSet<&str> {
         self.scope.split_whitespace().collect()
@@ -137,6 +143,21 @@ fn oauth_scopes() -> Vec<&'static str> {
     vec!["atproto", "transition:generic", "transition:email"]
 }
 
+pub fn parse_authorization_request(
+    params: &[(String, String)],
+) -> Result<AuthorizationRequest, OAuthRequestError> {
+    let fields = params_to_fields(params);
+    let client_id = required_single(&fields, "client_id")?;
+    validate_client_id(&client_id)?;
+    let request_uri = required_single(&fields, "request_uri")?;
+    validate_request_uri(&request_uri)?;
+
+    Ok(AuthorizationRequest {
+        client_id,
+        request_uri,
+    })
+}
+
 pub fn parse_pushed_authorization_request(
     body: &str,
 ) -> Result<PushedAuthorizationRequest, OAuthRequestError> {
@@ -235,6 +256,14 @@ fn parse_form_urlencoded(body: &str) -> Result<BTreeMap<String, Vec<String>>, OA
         fields.entry(key).or_default().push(value);
     }
     Ok(fields)
+}
+
+fn params_to_fields(params: &[(String, String)]) -> BTreeMap<String, Vec<String>> {
+    let mut fields = BTreeMap::<String, Vec<String>>::new();
+    for (key, value) in params {
+        fields.entry(key.clone()).or_default().push(value.clone());
+    }
+    fields
 }
 
 fn percent_decode_form(value: &str) -> Result<String, OAuthRequestError> {
@@ -380,6 +409,21 @@ fn validate_scope(value: &str) -> Result<(), OAuthRequestError> {
     Ok(())
 }
 
+fn validate_request_uri(value: &str) -> Result<(), OAuthRequestError> {
+    validate_nonempty_length("request_uri", value, 2048)?;
+    if value
+        .strip_prefix(OAUTH_REQUEST_URI_PREFIX)
+        .is_some_and(|token| !token.is_empty())
+    {
+        Ok(())
+    } else {
+        Err(invalid_param(
+            "request_uri",
+            "expected pushed authorization request URI".to_string(),
+        ))
+    }
+}
+
 fn validate_code_challenge(value: &str) -> Result<(), OAuthRequestError> {
     if !(43..=128).contains(&value.len()) {
         return Err(invalid_param(
@@ -504,6 +548,44 @@ mod tests {
         assert_eq!(request.scope, "atproto transition:generic");
         assert_eq!(request.login_hint.as_deref(), Some("alice.example"));
         assert!(request.requested_scopes().contains("atproto"));
+    }
+
+    #[test]
+    fn parses_authorization_request_from_par_reference() {
+        let request = parse_authorization_request(&[
+            ("client_id".to_string(), "http://localhost".to_string()),
+            (
+                "request_uri".to_string(),
+                format!("{OAUTH_REQUEST_URI_PREFIX}abc123"),
+            ),
+        ])
+        .unwrap();
+
+        assert_eq!(request.client_id, "http://localhost");
+        assert_eq!(
+            request.request_uri,
+            format!("{OAUTH_REQUEST_URI_PREFIX}abc123")
+        );
+    }
+
+    #[test]
+    fn rejects_authorization_request_without_par_reference() {
+        let error = parse_authorization_request(&[
+            ("client_id".to_string(), "http://localhost".to_string()),
+            (
+                "request_uri".to_string(),
+                "https://client.example/request".to_string(),
+            ),
+        ])
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OAuthRequestError::InvalidParameter {
+                parameter: "request_uri",
+                ..
+            }
+        ));
     }
 
     #[test]

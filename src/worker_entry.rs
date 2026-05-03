@@ -29,15 +29,16 @@ use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
     DirectoryAccountRow, DirectoryCommitEventInput, DirectoryEventRow,
-    DirectoryOauthParRequestInput, DirectoryRepoRow, DirectorySessionRow, RepoBlobRow,
-    RepoCommitEventInput, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
+    DirectoryOauthAuthorizationCodeInput, DirectoryOauthParRequestInput, DirectoryRepoRow,
+    DirectorySessionRow, RepoBlobRow, RepoCommitEventInput, RepoIdentityRow, RepoStateRow,
+    SqlDirectoryStore, SqlRepoStore,
 };
 use crate::identity::{IdentityError, RepoSigningKey};
 use crate::oauth::{
-    authorization_server_metadata, is_oauth_well_known_path, parse_pushed_authorization_request,
-    protected_resource_metadata, OAuthRequestError, OAUTH_AUTHORIZATION_SERVER_PATH,
-    OAUTH_AUTHORIZE_PATH, OAUTH_PAR_EXPIRES_IN_SECONDS, OAUTH_PAR_PATH,
-    OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
+    authorization_server_metadata, is_oauth_well_known_path, parse_authorization_request,
+    parse_pushed_authorization_request, protected_resource_metadata, OAuthRequestError,
+    OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_PAR_EXPIRES_IN_SECONDS,
+    OAUTH_PAR_PATH, OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
 };
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
@@ -71,8 +72,10 @@ const SESSION_ID_BYTES: usize = 24;
 const REPO_SIGNING_KEY_BYTES: usize = 32;
 const OAUTH_REQUEST_URI_BYTES: usize = 32;
 const OAUTH_DPOP_NONCE_BYTES: usize = 32;
+const OAUTH_AUTHORIZATION_CODE_BYTES: usize = 32;
 const ACCESS_TOKEN_TTL_SECONDS: i64 = 15 * 60;
 const REFRESH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
+const OAUTH_AUTHORIZATION_CODE_TTL_SECONDS: i64 = 5 * 60;
 
 #[event(fetch)]
 async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<Response> {
@@ -374,7 +377,7 @@ impl PdsDirectoryObject {
         }
         if parts.len() >= 2 && parts[0] == "oauth" {
             return match (req.method(), url.path()) {
-                (Method::Get, OAUTH_AUTHORIZE_PATH) => self.oauth_authorize(),
+                (Method::Get, OAUTH_AUTHORIZE_PATH) => self.oauth_authorize(req, &url),
                 (Method::Post, OAUTH_PAR_PATH) => {
                     self.oauth_pushed_authorization_request(req).await
                 }
@@ -650,13 +653,65 @@ impl PdsDirectoryObject {
         .map_err(HttpError::worker)
     }
 
-    fn oauth_authorize(&self) -> Result<Response, HttpError> {
-        oauth_error_response(
-            501,
-            "temporarily_unavailable",
-            "OAuth authorization UI is not implemented yet",
-        )
-        .map_err(HttpError::worker)
+    fn oauth_authorize(&self, req: &Request, url: &worker::Url) -> Result<Response, HttpError> {
+        let request = match parse_authorization_request(&query_pairs(url)) {
+            Ok(request) => request,
+            Err(error) => return oauth_request_error_response(error).map_err(HttpError::worker),
+        };
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        let now = current_unix_time();
+        let store = self.store();
+        store
+            .purge_expired_oauth_par_requests(now)
+            .map_err(HttpError::worker)?;
+        store
+            .purge_expired_oauth_authorization_codes(now)
+            .map_err(HttpError::worker)?;
+        let Some(par) = store
+            .get_oauth_par_request(&request.request_uri, now)
+            .map_err(HttpError::worker)?
+        else {
+            return oauth_error_response(400, "invalid_request", "unknown or expired request_uri")
+                .map_err(HttpError::worker);
+        };
+        if par.client_id != request.client_id {
+            return oauth_error_response(
+                400,
+                "invalid_request",
+                "client_id did not match request_uri",
+            )
+            .map_err(HttpError::worker);
+        }
+        if par.login_hint.as_deref().is_some_and(|login_hint| {
+            login_hint != account.handle.as_str() && login_hint != account.did.as_str()
+        }) {
+            return oauth_error_response(403, "access_denied", "login_hint did not match account")
+                .map_err(HttpError::worker);
+        }
+
+        let code = random_urlsafe_token::<OAUTH_AUTHORIZATION_CODE_BYTES>()?;
+        store
+            .insert_oauth_authorization_code(&DirectoryOauthAuthorizationCodeInput {
+                code: code.clone(),
+                request_uri: par.request_uri.clone(),
+                client_id: par.client_id.clone(),
+                redirect_uri: par.redirect_uri.clone(),
+                scope: par.scope.clone(),
+                state: par.state.clone(),
+                code_challenge: par.code_challenge.clone(),
+                code_challenge_method: par.code_challenge_method.clone(),
+                did: account.did,
+                handle: account.handle,
+                dpop_nonce: par.dpop_nonce,
+                expires_at: now.saturating_add(OAUTH_AUTHORIZATION_CODE_TTL_SECONDS),
+            })
+            .map_err(HttpError::worker)?;
+        store
+            .delete_oauth_par_request(&par.request_uri)
+            .map_err(HttpError::worker)?;
+
+        oauth_authorization_redirect(&par.redirect_uri, &code, &par.state, &request_origin(url))
     }
 
     async fn oauth_pushed_authorization_request(
@@ -3733,6 +3788,36 @@ fn oauth_error_response(
 
 fn oauth_request_error_response(error: OAuthRequestError) -> worker::Result<Response> {
     oauth_error_response(400, error.error_code(), &error.to_string())
+}
+
+fn oauth_authorization_redirect(
+    redirect_uri: &str,
+    code: &str,
+    state: &str,
+    issuer: &str,
+) -> Result<Response, HttpError> {
+    let mut redirect = ::url::Url::parse(redirect_uri)
+        .map_err(|error| HttpError::new(400, format!("invalid redirect_uri: {error}")))?;
+    {
+        let mut query = redirect.query_pairs_mut();
+        query.append_pair("code", code);
+        query.append_pair("state", state);
+        query.append_pair("iss", issuer);
+    }
+
+    let mut response = Response::empty()
+        .map_err(HttpError::worker)?
+        .with_status(302);
+    response
+        .headers_mut()
+        .set("location", redirect.as_str())
+        .map_err(HttpError::worker)?;
+    response
+        .headers_mut()
+        .set("cache-control", "no-store")
+        .map_err(HttpError::worker)?;
+    set_cors(&mut response).map_err(HttpError::worker)?;
+    Ok(response)
 }
 
 fn oauth_par_response(
