@@ -8,6 +8,9 @@ pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
 pub const SYNC_GET_LATEST_COMMIT: &str = "com.atproto.sync.getLatestCommit";
 pub const SYNC_GET_REPO_STATUS: &str = "com.atproto.sync.getRepoStatus";
+pub const SYNC_LIST_REPOS: &str = "com.atproto.sync.listRepos";
+pub const SYNC_LIST_BLOBS: &str = "com.atproto.sync.listBlobs";
+pub const SYNC_GET_BLOB: &str = "com.atproto.sync.getBlob";
 pub const SYNC_GET_RECORD: &str = "com.atproto.sync.getRecord";
 pub const SYNC_GET_REPO: &str = "com.atproto.sync.getRepo";
 
@@ -17,6 +20,7 @@ const MAX_LIST_LIMIT: usize = 100;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum XrpcRoute {
     Worker,
+    HostRepoObject,
     RepoObject { name: String },
     Unsupported,
 }
@@ -47,13 +51,19 @@ pub enum XrpcError {
 pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<XrpcRoute, XrpcError> {
     match method {
         SERVER_DESCRIBE_SERVER => Ok(XrpcRoute::Worker),
+        SYNC_LIST_REPOS => Ok(XrpcRoute::HostRepoObject),
         REPO_DESCRIBE_REPO | REPO_GET_RECORD | REPO_LIST_RECORDS => {
             let repo = required_param(query, "repo")?;
             Ok(XrpcRoute::RepoObject {
                 name: repo_object_name_from_identifier(&repo),
             })
         }
-        SYNC_GET_LATEST_COMMIT | SYNC_GET_REPO_STATUS | SYNC_GET_RECORD | SYNC_GET_REPO => {
+        SYNC_GET_LATEST_COMMIT
+        | SYNC_GET_REPO_STATUS
+        | SYNC_LIST_BLOBS
+        | SYNC_GET_BLOB
+        | SYNC_GET_RECORD
+        | SYNC_GET_REPO => {
             let did = required_param(query, "did")?;
             Ok(XrpcRoute::RepoObject {
                 name: repo_object_name_from_identifier(&did),
@@ -159,6 +169,14 @@ mod tests {
     }
 
     #[test]
+    fn routes_list_repos_to_host_repo_object() {
+        assert_eq!(
+            route_xrpc_method(SYNC_LIST_REPOS, &[]).unwrap(),
+            XrpcRoute::HostRepoObject
+        );
+    }
+
+    #[test]
     fn routes_repo_methods_to_repo_object_by_repo() {
         assert_eq!(
             route_xrpc_method(REPO_GET_RECORD, &query(&[("repo", "alice")])).unwrap(),
@@ -202,6 +220,22 @@ mod tests {
         );
         assert_eq!(
             route_xrpc_method(SYNC_GET_RECORD, &query(&[("did", "did:gsv:alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn routes_sync_blob_methods_to_repo_object_by_did() {
+        assert_eq!(
+            route_xrpc_method(SYNC_LIST_BLOBS, &query(&[("did", "did:gsv:alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            route_xrpc_method(SYNC_GET_BLOB, &query(&[("did", "did:gsv:alice")])).unwrap(),
             XrpcRoute::RepoObject {
                 name: "alice".to_string()
             }

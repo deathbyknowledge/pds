@@ -33,7 +33,8 @@ npm run seed:test-repo
 ```
 
 The seed script initializes a host-level `did:web:<host>` repo, writes one
-`app.gsv.record` record, verifies both well-known identity endpoints, reads it
+`app.gsv.record` record, verifies both well-known identity endpoints, checks the
+PDS-level repo listing, confirms the current empty blob listing, reads the record
 back through XRPC, downloads `com.atproto.sync.getRepo`, and prints PDSls links
 like:
 

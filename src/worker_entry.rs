@@ -16,8 +16,9 @@ use crate::identity::{IdentityError, RepoSigningKey};
 use crate::repo::{RepoError, RepoMutation, SignedRepository};
 use crate::xrpc::{
     at_uri, optional_param, parse_list_records_params, required_param, route_xrpc_method,
-    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_LIST_RECORDS, SERVER_DESCRIBE_SERVER,
-    SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO, SYNC_GET_REPO_STATUS,
+    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_LIST_RECORDS, SERVER_DESCRIBE_SERVER, SYNC_GET_BLOB,
+    SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO, SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS,
+    SYNC_LIST_REPOS,
 };
 use crate::xrpc::{XrpcError, XrpcRoute};
 
@@ -57,6 +58,21 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
         let query = query_pairs(&url);
         return match route_xrpc_method(parts[1], &query) {
             Ok(XrpcRoute::Worker) => describe_server(&url),
+            Ok(XrpcRoute::HostRepoObject) => {
+                let Some(host) = url.host_str() else {
+                    return json_response(
+                        400,
+                        &json!({
+                            "error": "InvalidRequest",
+                            "message": "request host is required",
+                        }),
+                    );
+                };
+                let namespace = env.durable_object("REPO_OBJECTS")?;
+                let id = namespace.id_from_name(host)?;
+                let stub = id.get_stub()?;
+                stub.fetch_with_request(req).await
+            }
             Ok(XrpcRoute::RepoObject { name }) => {
                 let namespace = env.durable_object("REPO_OBJECTS")?;
                 let id = namespace.id_from_name(&name)?;
@@ -107,6 +123,9 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcListRecords": "GET /xrpc/com.atproto.repo.listRecords?repo=:repo&collection=:nsid",
                 "xrpcGetLatestCommit": "GET /xrpc/com.atproto.sync.getLatestCommit?did=:did",
                 "xrpcGetRepoStatus": "GET /xrpc/com.atproto.sync.getRepoStatus?did=:did",
+                "xrpcListRepos": "GET /xrpc/com.atproto.sync.listRepos",
+                "xrpcListBlobs": "GET /xrpc/com.atproto.sync.listBlobs?did=:did",
+                "xrpcGetBlob": "GET /xrpc/com.atproto.sync.getBlob?did=:did&cid=:cid",
                 "xrpcSyncGetRecord": "GET /xrpc/com.atproto.sync.getRecord?did=:did&collection=:nsid&rkey=:rkey",
                 "xrpcSyncGetRepo": "GET /xrpc/com.atproto.sync.getRepo?did=:did",
                 "didWeb": "GET /.well-known/did.json",
@@ -204,6 +223,9 @@ impl RepoObject {
             REPO_LIST_RECORDS => self.xrpc_list_records(url).await,
             SYNC_GET_LATEST_COMMIT => self.xrpc_get_latest_commit(url),
             SYNC_GET_REPO_STATUS => self.xrpc_get_repo_status(url),
+            SYNC_LIST_REPOS => self.xrpc_list_repos(),
+            SYNC_LIST_BLOBS => self.xrpc_list_blobs(url),
+            SYNC_GET_BLOB => self.xrpc_get_blob(url),
             SYNC_GET_RECORD => self.xrpc_get_sync_record(url).await,
             SYNC_GET_REPO => self.xrpc_get_repo(url).await,
             SERVER_DESCRIBE_SERVER => describe_server(url).map_err(HttpError::worker),
@@ -404,6 +426,55 @@ impl RepoObject {
             }),
         )
         .map_err(HttpError::worker)
+    }
+
+    fn xrpc_list_repos(&self) -> Result<Response, HttpError> {
+        let state = self.store().get_repo_state().map_err(HttpError::worker)?;
+        let repos = state
+            .into_iter()
+            .map(|state| {
+                json!({
+                    "did": state.did.to_string(),
+                    "head": state.latest_commit.to_string(),
+                    "rev": state.latest_rev.to_string(),
+                    "active": true,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        json_response(
+            200,
+            &json!({
+                "repos": repos,
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn xrpc_list_blobs(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
+        let state = self.repo_state()?;
+        ensure_repo_did(&state, &did)?;
+
+        json_response(
+            200,
+            &json!({
+                "cids": [],
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn xrpc_get_blob(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
+        let cid = required_param(&params, "cid").map_err(HttpError::xrpc)?;
+        parse_cid(&cid).map_err(HttpError::bad_request)?;
+        let state = self.repo_state()?;
+        ensure_repo_did(&state, &did)?;
+
+        Err(HttpError::new(404, "blob not found"))
     }
 
     async fn xrpc_get_sync_record(&self, url: &worker::Url) -> Result<Response, HttpError> {

@@ -78,6 +78,22 @@ const mutation = await expectJson("seed record", "POST", `/repos/${encodePath(re
   record,
 });
 
+const listRepos = await expectJson(
+  "list repos",
+  "GET",
+  "/xrpc/com.atproto.sync.listRepos?limit=500",
+  null,
+  (body) => {
+    const hostedRepo = body.repos?.find((repo) => repo.did === did);
+    if (!hostedRepo) {
+      throw new Error(`listRepos did not include ${did}: ${JSON.stringify(body)}`);
+    }
+    if (hostedRepo.head !== mutation.latestCommit || hostedRepo.rev !== mutation.latestRev) {
+      throw new Error(`listRepos returned stale repo state: ${JSON.stringify(hostedRepo)}`);
+    }
+  },
+);
+
 const describe = await expectJson(
   "describe repo",
   "GET",
@@ -105,6 +121,18 @@ await expectJson(
   },
 );
 
+const listBlobs = await expectJson(
+  "list blobs",
+  "GET",
+  `/xrpc/com.atproto.sync.listBlobs?did=${encodeQuery(did)}`,
+  null,
+  (body) => {
+    if (!Array.isArray(body.cids) || body.cids.length !== 0) {
+      throw new Error(`expected no blobs, got ${JSON.stringify(body)}`);
+    }
+  },
+);
+
 await expectJson(
   "get record",
   "GET",
@@ -115,6 +143,14 @@ await expectJson(
       throw new Error(`unexpected record URI ${body.uri}`);
     }
   },
+);
+
+const missingBlob = await expectJsonStatus(
+  "missing blob",
+  "GET",
+  `/xrpc/com.atproto.sync.getBlob?did=${encodeQuery(did)}&cid=${encodeQuery(mutation.latestCommit)}`,
+  null,
+  404,
 );
 
 const repoCar = await request("GET", `/xrpc/com.atproto.sync.getRepo?did=${encodeQuery(did)}`);
@@ -144,6 +180,9 @@ console.log(
       publicKeyMultibase: init.publicKeyMultibase,
       latestCommit: mutation.latestCommit,
       latestRev: mutation.latestRev,
+      listedRepos: listRepos.repos.length,
+      listedBlobs: listBlobs.cids.length,
+      missingBlobStatus: missingBlob.status,
       collection,
       rkey,
       atRepoUri,
@@ -186,6 +225,28 @@ async function expectText(label, method, path, body, validate = undefined) {
   }
   validate?.(text);
   return text;
+}
+
+async function expectJsonStatus(label, method, path, body, expectedStatus) {
+  const response = await request(method, path, body);
+  const text = await response.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${label} returned non-JSON status=${response.status}: ${text}`, {
+      cause: error,
+    });
+  }
+  if (response.status !== expectedStatus) {
+    throw new Error(
+      `${label} returned status=${response.status}, expected ${expectedStatus}: ${JSON.stringify(parsed)}`,
+    );
+  }
+  if (parsed.error === "MethodNotFound") {
+    throw new Error(`${label} still returned MethodNotFound`);
+  }
+  return { status: response.status, body: parsed };
 }
 
 async function request(method, path, body = null) {
