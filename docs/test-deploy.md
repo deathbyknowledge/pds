@@ -34,10 +34,11 @@ npm run seed:test-repo
 
 The seed script initializes a host-level `did:web:<host>` repo, writes one
 `app.gsv.record` record, exercises `createRecord`/`putRecord`/`deleteRecord`,
-uploads and reads one blob, verifies both well-known identity endpoints, checks
-the PDS-level repo listing, checks `subscribeRepos` WebSocket replay, reads the
-record back through XRPC, downloads `com.atproto.sync.getRepo`, and prints PDSls
-links like:
+checks write preconditions and `applyWrites`, uploads and reads one blob, checks
+missing blob refs, verifies both well-known identity endpoints, checks the
+PDS-level repo listing, checks `subscribeRepos` WebSocket replay, reads the
+record back through XRPC, downloads full and `since`-bounded
+`com.atproto.sync.getRepo` CARs, and prints PDSls links like:
 
 ```text
 https://pdsls.dev/at://did:web:<your-worker-host>

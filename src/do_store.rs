@@ -74,6 +74,37 @@ pub struct RepoBlobRow {
     pub cid: Cid,
     pub mime_type: String,
     pub bytes: Vec<u8>,
+    pub byte_len: i64,
+    pub storage_kind: String,
+    pub storage_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoBlobRefRow {
+    pub path: RepoPath,
+    pub cid: Cid,
+    pub record_cid: Cid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoCommitEventInput {
+    pub rev: RepoRev,
+    pub since: Option<RepoRev>,
+    pub commit_cid: Cid,
+    pub blocks: Vec<u8>,
+    pub ops_json: String,
+    pub blobs_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoCommitEventRow {
+    pub seq: i64,
+    pub rev: RepoRev,
+    pub since: Option<RepoRev>,
+    pub commit_cid: Cid,
+    pub blocks: Vec<u8>,
+    pub ops_json: String,
+    pub blobs_json: String,
 }
 
 impl RepoIdentityRow {
@@ -90,6 +121,12 @@ impl SqlRepoStore {
     pub fn init_schema(&self) -> worker::Result<()> {
         for statement in ALL_SCHEMA_STATEMENTS {
             self.sql.exec(statement, None)?;
+        }
+        for statement in [
+            "ALTER TABLE repo_blobs ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'sqlite'",
+            "ALTER TABLE repo_blobs ADD COLUMN storage_key TEXT",
+        ] {
+            exec_ignore_duplicate_column(&self.sql, statement)?;
         }
         Ok(())
     }
@@ -190,6 +227,8 @@ impl SqlRepoStore {
 
     pub fn clear_all(&self) -> worker::Result<()> {
         self.sql.exec("DELETE FROM record_index", None)?;
+        self.sql.exec("DELETE FROM repo_blob_refs", None)?;
+        self.sql.exec("DELETE FROM repo_commit_events", None)?;
         self.sql.exec("DELETE FROM repo_blobs", None)?;
         self.sql.exec("DELETE FROM repo_blocks", None)?;
         self.sql.exec("DELETE FROM repo_identity", None)?;
@@ -197,11 +236,13 @@ impl SqlRepoStore {
         Ok(())
     }
 
-    pub fn put_blob(&self, mime_type: &str, bytes: Vec<u8>) -> worker::Result<RepoBlobRow> {
+    pub fn put_blob_bytes(&self, mime_type: &str, bytes: Vec<u8>) -> worker::Result<RepoBlobRow> {
         let cid = raw_cid(&bytes);
         self.sql.exec(
-            "INSERT OR IGNORE INTO repo_blobs (cid, mime_type, bytes, byte_len)
-             VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO repo_blobs (
+                cid, mime_type, bytes, byte_len, storage_kind, storage_key
+             )
+             VALUES (?, ?, ?, ?, 'sqlite', NULL)",
             vec![
                 SqlStorageValue::from(cid.to_string()),
                 SqlStorageValue::from(mime_type.to_string()),
@@ -213,46 +254,62 @@ impl SqlRepoStore {
         Ok(RepoBlobRow {
             cid,
             mime_type: mime_type.to_string(),
+            byte_len: bytes.len() as i64,
             bytes,
+            storage_kind: "sqlite".to_string(),
+            storage_key: None,
+        })
+    }
+
+    pub fn put_blob_metadata(
+        &self,
+        cid: Cid,
+        mime_type: &str,
+        byte_len: usize,
+        storage_kind: &str,
+        storage_key: Option<&str>,
+    ) -> worker::Result<RepoBlobRow> {
+        self.sql.exec(
+            "INSERT INTO repo_blobs (
+                cid, mime_type, bytes, byte_len, storage_kind, storage_key
+             )
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(cid) DO UPDATE SET
+                mime_type = excluded.mime_type,
+                byte_len = excluded.byte_len,
+                storage_kind = excluded.storage_kind,
+                storage_key = excluded.storage_key",
+            vec![
+                SqlStorageValue::from(cid.to_string()),
+                SqlStorageValue::from(mime_type.to_string()),
+                SqlStorageValue::Blob(Vec::new()),
+                SqlStorageValue::from(byte_len as i64),
+                SqlStorageValue::from(storage_kind.to_string()),
+                optional_text(storage_key.map(|key| key.to_string())),
+            ],
+        )?;
+
+        Ok(RepoBlobRow {
+            cid,
+            mime_type: mime_type.to_string(),
+            bytes: Vec::new(),
+            byte_len: byte_len as i64,
+            storage_kind: storage_kind.to_string(),
+            storage_key: storage_key.map(|key| key.to_string()),
         })
     }
 
     pub fn get_blob(&self, cid: &Cid) -> worker::Result<Option<RepoBlobRow>> {
-        #[derive(Deserialize)]
-        struct Row {
-            mime_type: String,
-        }
-
-        let rows: Vec<Row> = self
-            .sql
-            .exec(
-                "SELECT mime_type FROM repo_blobs WHERE cid = ?",
-                vec![SqlStorageValue::from(cid.to_string())],
-            )?
-            .to_array()?;
-        let Some(row) = rows.into_iter().next() else {
-            return Ok(None);
-        };
-
         let cursor = self.sql.exec(
-            "SELECT bytes FROM repo_blobs WHERE cid = ?",
+            "SELECT cid, mime_type, bytes, byte_len, storage_kind, storage_key
+             FROM repo_blobs
+             WHERE cid = ?",
             vec![SqlStorageValue::from(cid.to_string())],
         )?;
         let Some(raw_row) = cursor.raw().next() else {
             return Ok(None);
         };
-        let values = raw_row?;
-        let Some(SqlStorageValue::Blob(bytes)) = values.into_iter().next() else {
-            return Err(worker_error(std::io::Error::other(
-                "blob query returned non-blob bytes",
-            )));
-        };
-
-        Ok(Some(RepoBlobRow {
-            cid: *cid,
-            mime_type: row.mime_type,
-            bytes,
-        }))
+        Ok(Some(repo_blob_from_values(raw_row?)?))
     }
 
     pub fn list_blob_cids(
@@ -303,6 +360,135 @@ impl SqlRepoStore {
         };
 
         Ok((cids, next_cursor))
+    }
+
+    pub fn replace_blob_refs(
+        &self,
+        path: &RepoPath,
+        record_cid: Cid,
+        blob_cids: &[Cid],
+    ) -> worker::Result<()> {
+        self.delete_blob_refs(path)?;
+        for cid in blob_cids {
+            self.sql.exec(
+                "INSERT OR IGNORE INTO repo_blob_refs (path, cid, record_cid)
+                 VALUES (?, ?, ?)",
+                vec![
+                    SqlStorageValue::from(path.as_mst_key()),
+                    SqlStorageValue::from(cid.to_string()),
+                    SqlStorageValue::from(record_cid.to_string()),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn delete_blob_refs(&self, path: &RepoPath) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM repo_blob_refs WHERE path = ?",
+            vec![SqlStorageValue::from(path.as_mst_key())],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_missing_blob_refs(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> worker::Result<(Vec<RepoBlobRefRow>, Option<String>)> {
+        let query_limit = limit.saturating_add(1);
+        let rows = if let Some(cursor) = cursor {
+            self.sql.exec(
+                "SELECT refs.path, refs.cid, refs.record_cid
+                 FROM repo_blob_refs refs
+                 LEFT JOIN repo_blobs blobs ON blobs.cid = refs.cid
+                 WHERE blobs.cid IS NULL AND (refs.path || ' ' || refs.cid) > ?
+                 ORDER BY refs.path ASC, refs.cid ASC
+                 LIMIT ?",
+                vec![
+                    SqlStorageValue::from(cursor.to_string()),
+                    SqlStorageValue::from(query_limit as i64),
+                ],
+            )?
+        } else {
+            self.sql.exec(
+                "SELECT refs.path, refs.cid, refs.record_cid
+                 FROM repo_blob_refs refs
+                 LEFT JOIN repo_blobs blobs ON blobs.cid = refs.cid
+                 WHERE blobs.cid IS NULL
+                 ORDER BY refs.path ASC, refs.cid ASC
+                 LIMIT ?",
+                vec![SqlStorageValue::from(query_limit as i64)],
+            )?
+        };
+
+        let mut refs = Vec::new();
+        for row in rows.raw() {
+            refs.push(blob_ref_from_values(row?)?);
+        }
+        let has_more = refs.len() > limit;
+        refs.truncate(limit);
+        let next_cursor = if has_more {
+            refs.last()
+                .map(|row| format!("{} {}", row.path.as_mst_key(), row.cid))
+        } else {
+            None
+        };
+        Ok((refs, next_cursor))
+    }
+
+    pub fn append_commit_event(&self, event: &RepoCommitEventInput) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO repo_commit_events (
+                rev, since, commit_cid, blocks, ops_json, blobs_json
+             )
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(rev) DO UPDATE SET
+                since = excluded.since,
+                commit_cid = excluded.commit_cid,
+                blocks = excluded.blocks,
+                ops_json = excluded.ops_json,
+                blobs_json = excluded.blobs_json",
+            vec![
+                SqlStorageValue::from(event.rev.to_string()),
+                optional_text(event.since.as_ref().map(|rev| rev.to_string())),
+                SqlStorageValue::from(event.commit_cid.to_string()),
+                SqlStorageValue::Blob(event.blocks.clone()),
+                SqlStorageValue::from(event.ops_json.clone()),
+                SqlStorageValue::from(event.blobs_json.clone()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_commit_events_after_rev(
+        &self,
+        since: &RepoRev,
+    ) -> worker::Result<Vec<RepoCommitEventRow>> {
+        let rows = self.sql.exec(
+            "SELECT seq, rev, since, commit_cid, blocks, ops_json, blobs_json
+             FROM repo_commit_events
+             WHERE seq > (
+                SELECT seq FROM repo_commit_events WHERE rev = ?
+             )
+             ORDER BY seq ASC",
+            vec![SqlStorageValue::from(since.to_string())],
+        )?;
+
+        rows.raw()
+            .map(|row| repo_commit_event_from_values(row?))
+            .collect()
+    }
+
+    pub fn has_commit_event_rev(&self, rev: &RepoRev) -> worker::Result<bool> {
+        let rows: Vec<CountRow> = self
+            .sql
+            .exec(
+                "SELECT COUNT(*) AS n FROM repo_commit_events WHERE rev = ?",
+                vec![SqlStorageValue::from(rev.to_string())],
+            )?
+            .to_array()?;
+        Ok(rows.first().is_some_and(|row| row.n > 0))
     }
 }
 
@@ -641,6 +827,11 @@ struct DirectoryRepoStorageRow {
     active: i64,
 }
 
+#[derive(Deserialize)]
+struct CountRow {
+    n: i64,
+}
+
 fn worker_error(error: impl std::error::Error) -> WorkerError {
     WorkerError::RustError(error.to_string())
 }
@@ -702,6 +893,63 @@ fn directory_event_from_values(values: Vec<SqlStorageValue>) -> worker::Result<D
     })
 }
 
+fn repo_blob_from_values(values: Vec<SqlStorageValue>) -> worker::Result<RepoBlobRow> {
+    let mut values = values.into_iter();
+    let cid = parse_cid(&next_string(&mut values, "cid")?).map_err(worker_error)?;
+    let mime_type = next_string(&mut values, "mime_type")?;
+    let bytes = next_blob(&mut values, "bytes")?;
+    let byte_len = next_i64(&mut values, "byte_len")?;
+    let storage_kind = next_string(&mut values, "storage_kind")?;
+    let storage_key = next_optional_string(&mut values, "storage_key")?;
+
+    Ok(RepoBlobRow {
+        cid,
+        mime_type,
+        bytes,
+        byte_len,
+        storage_kind,
+        storage_key,
+    })
+}
+
+fn blob_ref_from_values(values: Vec<SqlStorageValue>) -> worker::Result<RepoBlobRefRow> {
+    let mut values = values.into_iter();
+    let path = RepoPath::parse(&next_string(&mut values, "path")?).map_err(worker_error)?;
+    let cid = parse_cid(&next_string(&mut values, "cid")?).map_err(worker_error)?;
+    let record_cid = parse_cid(&next_string(&mut values, "record_cid")?).map_err(worker_error)?;
+
+    Ok(RepoBlobRefRow {
+        path,
+        cid,
+        record_cid,
+    })
+}
+
+fn repo_commit_event_from_values(
+    values: Vec<SqlStorageValue>,
+) -> worker::Result<RepoCommitEventRow> {
+    let mut values = values.into_iter();
+    let seq = next_i64(&mut values, "seq")?;
+    let rev = RepoRev::new(next_string(&mut values, "rev")?).map_err(worker_error)?;
+    let since = next_optional_string(&mut values, "since")?
+        .map(|value| RepoRev::new(value).map_err(worker_error))
+        .transpose()?;
+    let commit_cid = parse_cid(&next_string(&mut values, "commit_cid")?).map_err(worker_error)?;
+    let blocks = next_blob(&mut values, "blocks")?;
+    let ops_json = next_string(&mut values, "ops_json")?;
+    let blobs_json = next_string(&mut values, "blobs_json")?;
+
+    Ok(RepoCommitEventRow {
+        seq,
+        rev,
+        since,
+        commit_cid,
+        blocks,
+        ops_json,
+        blobs_json,
+    })
+}
+
 fn next_i64(values: &mut impl Iterator<Item = SqlStorageValue>, name: &str) -> worker::Result<i64> {
     match values.next() {
         Some(SqlStorageValue::Integer(value)) => Ok(value),
@@ -745,6 +993,21 @@ fn next_optional_string(
     }
 }
 
+fn next_blob(
+    values: &mut impl Iterator<Item = SqlStorageValue>,
+    name: &str,
+) -> worker::Result<Vec<u8>> {
+    match values.next() {
+        Some(SqlStorageValue::Blob(value)) => Ok(value),
+        Some(other) => Err(worker_error(std::io::Error::other(format!(
+            "expected blob column `{name}`, got {other:?}"
+        )))),
+        None => Err(worker_error(std::io::Error::other(format!(
+            "missing column `{name}`"
+        )))),
+    }
+}
+
 fn next_optional_blob(
     values: &mut impl Iterator<Item = SqlStorageValue>,
     name: &str,
@@ -766,11 +1029,6 @@ fn storage_error(error: WorkerError) -> StorageError {
 }
 
 fn count(sql: &SqlStorage, query: &str) -> worker::Result<i64> {
-    #[derive(Deserialize)]
-    struct Row {
-        n: i64,
-    }
-
-    let row: Row = sql.exec(query, None)?.one()?;
+    let row: CountRow = sql.exec(query, None)?.one()?;
     Ok(row.n)
 }

@@ -2,36 +2,42 @@ use std::collections::BTreeSet;
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, json, to_string, Value};
 use wasm_bindgen::JsValue;
 use worker::{
-    durable_object, event, Context, DurableObject, Env, Headers, Method, Request, RequestInit,
-    Response, SqlStorage, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
+    durable_object, event, Context, DurableObject, Env, Headers, HttpMetadata, Method, Request,
+    RequestInit, Response, SqlStorage, State, WebSocket, WebSocketIncomingMessage, WebSocketPair,
 };
 
-use crate::car::{encode_car_from_store, CarError};
+use crate::car::{decode_car, encode_car, encode_car_from_store, CarBlock, CarError};
 use crate::cbor::encode_dag_cbor;
-use crate::cid::parse_cid;
+use crate::cid::{parse_cid, raw_cid};
 use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
-    DirectoryCommitEventInput, DirectoryEventRow, DirectoryRepoRow, RepoIdentityRow, RepoStateRow,
-    SqlDirectoryStore, SqlRepoStore,
+    DirectoryCommitEventInput, DirectoryEventRow, DirectoryRepoRow, RepoBlobRow,
+    RepoCommitEventInput, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
 };
 use crate::identity::{IdentityError, RepoSigningKey};
-use crate::repo::{RepoError, RepoMutation, RepoOperation, SignedRepository};
+use crate::repo::{
+    RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
+};
 use crate::xrpc::{
     at_uri, optional_param, parse_list_records_params, required_param, route_xrpc_method,
-    REPO_CREATE_RECORD, REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_LIST_RECORDS,
-    REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_DESCRIBE_SERVER, SYNC_GET_BLOB,
-    SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO, SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS,
-    SYNC_LIST_REPOS, SYNC_SUBSCRIBE_REPOS,
+    REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD,
+    REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
+    SERVER_DESCRIBE_SERVER, SYNC_GET_BLOB, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
+    SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS, SYNC_SUBSCRIBE_REPOS,
 };
 use crate::xrpc::{XrpcError, XrpcRoute};
 
 const DID_DOCUMENT_PATH: &str = "/.well-known/did.json";
 const ATPROTO_DID_PATH: &str = "/.well-known/atproto-did";
+const BLOB_BUCKET_BINDING: &str = "BLOB_BUCKET";
+const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
+const MAX_APPLY_WRITES: usize = 200;
 
 #[event(fetch)]
 async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<Response> {
@@ -148,7 +154,9 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcCreateRecord": "POST /xrpc/com.atproto.repo.createRecord",
                 "xrpcPutRecord": "POST /xrpc/com.atproto.repo.putRecord",
                 "xrpcDeleteRecord": "POST /xrpc/com.atproto.repo.deleteRecord",
+                "xrpcApplyWrites": "POST /xrpc/com.atproto.repo.applyWrites",
                 "xrpcUploadBlob": "POST /xrpc/com.atproto.repo.uploadBlob",
+                "xrpcListMissingBlobs": "GET /xrpc/com.atproto.repo.listMissingBlobs",
                 "xrpcGetLatestCommit": "GET /xrpc/com.atproto.sync.getLatestCommit?did=:did",
                 "xrpcGetRepoStatus": "GET /xrpc/com.atproto.sync.getRepoStatus?did=:did",
                 "xrpcListRepos": "GET /xrpc/com.atproto.sync.listRepos",
@@ -490,15 +498,17 @@ impl RepoObject {
             (Method::Get, SYNC_GET_LATEST_COMMIT) => self.xrpc_get_latest_commit(url),
             (Method::Get, SYNC_GET_REPO_STATUS) => self.xrpc_get_repo_status(url),
             (Method::Get, SYNC_LIST_BLOBS) => self.xrpc_list_blobs(url),
-            (Method::Get, SYNC_GET_BLOB) => self.xrpc_get_blob(url),
+            (Method::Get, SYNC_GET_BLOB) => self.xrpc_get_blob(url).await,
             (Method::Get, SYNC_GET_RECORD) => self.xrpc_get_sync_record(url).await,
             (Method::Get, SYNC_GET_REPO) => self.xrpc_get_repo(url).await,
+            (Method::Get, REPO_LIST_MISSING_BLOBS) => self.xrpc_list_missing_blobs(req, url),
             (Method::Get, SERVER_DESCRIBE_SERVER) => {
                 describe_server(url).map_err(HttpError::worker)
             }
             (Method::Post, REPO_CREATE_RECORD) => self.xrpc_create_record(req).await,
             (Method::Post, REPO_PUT_RECORD) => self.xrpc_put_record(req).await,
             (Method::Post, REPO_DELETE_RECORD) => self.xrpc_delete_record(req).await,
+            (Method::Post, REPO_APPLY_WRITES) => self.xrpc_apply_writes(req).await,
             (Method::Post, REPO_UPLOAD_BLOB) => self.xrpc_upload_blob(req).await,
             (
                 _,
@@ -515,7 +525,9 @@ impl RepoObject {
                 | REPO_CREATE_RECORD
                 | REPO_PUT_RECORD
                 | REPO_DELETE_RECORD
-                | REPO_UPLOAD_BLOB,
+                | REPO_APPLY_WRITES
+                | REPO_UPLOAD_BLOB
+                | REPO_LIST_MISSING_BLOBS,
             ) => Err(HttpError::new(405, "method not allowed")),
             _ => Err(HttpError::new(404, "unsupported XRPC method")),
         }
@@ -741,7 +753,42 @@ impl RepoObject {
         json_response(200, &body).map_err(HttpError::worker)
     }
 
-    fn xrpc_get_blob(&self, url: &worker::Url) -> Result<Response, HttpError> {
+    fn xrpc_list_missing_blobs(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        self.require_admin(req)?;
+        let params = query_pairs(url);
+        let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 500, 1000)?;
+        let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
+        let state = self.repo_state()?;
+        let (refs, next_cursor) = self
+            .store()
+            .list_missing_blob_refs(limit, cursor.as_deref())
+            .map_err(HttpError::worker)?;
+
+        let mut body = json!({
+            "blobs": refs
+                .into_iter()
+                .map(|row| json!({
+                    "cid": row.cid.to_string(),
+                    "recordUri": at_uri(
+                        state.did.as_str(),
+                        row.path.collection.as_str(),
+                        row.path.rkey.as_str()
+                    ),
+                }))
+                .collect::<Vec<_>>(),
+        });
+        if let Some(cursor) = next_cursor {
+            body["cursor"] = json!(cursor);
+        }
+
+        json_response(200, &body).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_get_blob(&self, url: &worker::Url) -> Result<Response, HttpError> {
         let params = query_pairs(url);
         let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
         let cid = required_param(&params, "cid").map_err(HttpError::xrpc)?;
@@ -751,8 +798,10 @@ impl RepoObject {
         let Some(blob) = self.store().get_blob(&cid).map_err(HttpError::worker)? else {
             return Err(HttpError::new(404, "blob not found"));
         };
+        let mime_type = blob.mime_type.clone();
+        let bytes = self.load_blob_bytes(blob).await?;
 
-        blob_response(blob.bytes, &blob.mime_type).map_err(HttpError::worker)
+        blob_response(bytes, &mime_type).map_err(HttpError::worker)
     }
 
     async fn xrpc_get_sync_record(&self, url: &worker::Url) -> Result<Response, HttpError> {
@@ -778,18 +827,17 @@ impl RepoObject {
     async fn xrpc_get_repo(&self, url: &worker::Url) -> Result<Response, HttpError> {
         let params = query_pairs(url);
         let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
-        if optional_param(&params, "since").is_some_and(|value| !value.is_empty()) {
-            return Err(HttpError::new(
-                501,
-                "com.atproto.sync.getRepo diff export is not implemented yet",
-            ));
-        }
-
         let (state, mut repo) = self.open_repo_with_state()?;
         ensure_repo_did(&state, &did)?;
-        let cids = repo.export_cids().await.map_err(HttpError::repo)?;
-        let car = encode_car_from_store(&[state.latest_commit], cids, repo.storage())
-            .map_err(HttpError::car)?;
+        let car = if let Some(since) =
+            optional_param(&params, "since").filter(|value| !value.is_empty())
+        {
+            self.repo_diff_car_since(&state, &since)?
+        } else {
+            let cids = repo.export_cids().await.map_err(HttpError::repo)?;
+            encode_car_from_store(&[state.latest_commit], cids, repo.storage())
+                .map_err(HttpError::car)?
+        };
         car_response(car).map_err(HttpError::worker)
     }
 
@@ -834,6 +882,8 @@ impl RepoObject {
         repo.storage()
             .put_repo_identity(&identity)
             .map_err(HttpError::worker)?;
+        self.persist_commit_event(repo.storage(), &state, &event)
+            .map_err(HttpError::worker)?;
         self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
             .await?;
 
@@ -862,6 +912,7 @@ impl RepoObject {
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
+        let blob_cids = extract_record_blob_refs(&body.record)?;
         let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
         let mutation = repo
             .create_record(path.clone(), &body.record, rev, &signing_key)
@@ -872,11 +923,19 @@ impl RepoObject {
                 &mut repo,
                 &mutation,
                 Some(previous_state.latest_rev.clone()),
+                blob_cids.clone(),
             )
             .await?;
         let state = self
             .persist_mutation(repo.storage(), &mutation)
             .map_err(HttpError::worker)?;
+        self.persist_commit_event(repo.storage(), &state, &event)
+            .map_err(HttpError::worker)?;
+        if let Some(record_cid) = mutation.record_cid {
+            repo.storage()
+                .replace_blob_refs(&path, record_cid, &blob_cids)
+                .map_err(HttpError::worker)?;
+        }
         self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
             .await?;
         json_response(201, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
@@ -893,6 +952,7 @@ impl RepoObject {
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
+        let blob_cids = extract_record_blob_refs(&body.record)?;
         let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
         let mutation = repo
             .update_record(path.clone(), &body.record, rev, &signing_key)
@@ -903,11 +963,19 @@ impl RepoObject {
                 &mut repo,
                 &mutation,
                 Some(previous_state.latest_rev.clone()),
+                blob_cids.clone(),
             )
             .await?;
         let state = self
             .persist_mutation(repo.storage(), &mutation)
             .map_err(HttpError::worker)?;
+        self.persist_commit_event(repo.storage(), &state, &event)
+            .map_err(HttpError::worker)?;
+        if let Some(record_cid) = mutation.record_cid {
+            repo.storage()
+                .replace_blob_refs(&path, record_cid, &blob_cids)
+                .map_err(HttpError::worker)?;
+        }
         self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
             .await?;
         json_response(200, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
@@ -934,10 +1002,16 @@ impl RepoObject {
                 &mut repo,
                 &mutation,
                 Some(previous_state.latest_rev.clone()),
+                Vec::new(),
             )
             .await?;
         let state = self
             .persist_mutation(repo.storage(), &mutation)
+            .map_err(HttpError::worker)?;
+        self.persist_commit_event(repo.storage(), &state, &event)
+            .map_err(HttpError::worker)?;
+        repo.storage()
+            .delete_blob_refs(&path)
             .map_err(HttpError::worker)?;
         self.notify_directory(&request_host, repo_name, &identity, &state, Some(&event))
             .await?;
@@ -975,6 +1049,7 @@ impl RepoObject {
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         ensure_repo_identifier(&previous_state, &identity, &body.repo)?;
+        ensure_swap_commit(&previous_state, body.swap_commit.as_deref())?;
 
         let collection = Nsid::new(body.collection).map_err(HttpError::bad_request)?;
         let rkey = if let Some(rkey) = body.rkey {
@@ -983,6 +1058,7 @@ impl RepoObject {
             generated_record_key(&previous_state.latest_commit)?
         };
         let path = RepoPath::new(collection, rkey);
+        let blob_cids = extract_record_blob_refs(&body.record)?;
         let rev = generated_repo_rev(&previous_state.latest_commit)?;
         let mutation = repo
             .create_record(path.clone(), &body.record, rev, &signing_key)
@@ -993,11 +1069,19 @@ impl RepoObject {
                 &mut repo,
                 &mutation,
                 Some(previous_state.latest_rev.clone()),
+                blob_cids.clone(),
             )
             .await?;
         let state = self
             .persist_mutation(repo.storage(), &mutation)
             .map_err(HttpError::worker)?;
+        self.persist_commit_event(repo.storage(), &state, &event)
+            .map_err(HttpError::worker)?;
+        if let Some(record_cid) = mutation.record_cid {
+            repo.storage()
+                .replace_blob_refs(&path, record_cid, &blob_cids)
+                .map_err(HttpError::worker)?;
+        }
         self.notify_directory(
             &request_host,
             &identity.handle,
@@ -1021,18 +1105,23 @@ impl RepoObject {
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         ensure_repo_identifier(&previous_state, &identity, &body.repo)?;
+        ensure_swap_commit(&previous_state, body.swap_commit.as_deref())?;
 
         let path = RepoPath::new(
             Nsid::new(body.collection).map_err(HttpError::bad_request)?,
             RecordKey::new(body.rkey).map_err(HttpError::bad_request)?,
         );
-        let rev = generated_repo_rev(&previous_state.latest_commit)?;
-        let exists = repo
+        let existing = repo
             .get_record::<Value>(&path)
             .await
-            .map_err(HttpError::repo)?
-            .is_some();
-        let mutation = if exists {
+            .map_err(HttpError::repo)?;
+        ensure_swap_record_field(
+            existing.as_ref().map(|record| record.cid),
+            &body.swap_record,
+        )?;
+        let blob_cids = extract_record_blob_refs(&body.record)?;
+        let rev = generated_repo_rev(&previous_state.latest_commit)?;
+        let mutation = if existing.is_some() {
             repo.update_record(path.clone(), &body.record, rev, &signing_key)
                 .await
         } else {
@@ -1045,11 +1134,19 @@ impl RepoObject {
                 &mut repo,
                 &mutation,
                 Some(previous_state.latest_rev.clone()),
+                blob_cids.clone(),
             )
             .await?;
         let state = self
             .persist_mutation(repo.storage(), &mutation)
             .map_err(HttpError::worker)?;
+        self.persist_commit_event(repo.storage(), &state, &event)
+            .map_err(HttpError::worker)?;
+        if let Some(record_cid) = mutation.record_cid {
+            repo.storage()
+                .replace_blob_refs(&path, record_cid, &blob_cids)
+                .map_err(HttpError::worker)?;
+        }
         self.notify_directory(
             &request_host,
             &identity.handle,
@@ -1073,11 +1170,24 @@ impl RepoObject {
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         ensure_repo_identifier(&previous_state, &identity, &body.repo)?;
+        ensure_swap_commit(&previous_state, body.swap_commit.as_deref())?;
 
         let path = RepoPath::new(
             Nsid::new(body.collection).map_err(HttpError::bad_request)?,
             RecordKey::new(body.rkey).map_err(HttpError::bad_request)?,
         );
+        let existing = repo
+            .get_record::<Value>(&path)
+            .await
+            .map_err(HttpError::repo)?;
+        ensure_optional_swap_record(
+            existing.as_ref().map(|record| record.cid),
+            body.swap_record.as_deref(),
+        )?;
+        if existing.is_none() {
+            return json_response(200, &xrpc_noop_delete_response(&previous_state))
+                .map_err(HttpError::worker);
+        }
         let rev = generated_repo_rev(&previous_state.latest_commit)?;
         let mutation = repo
             .delete_record(&path, rev, &signing_key)
@@ -1088,10 +1198,16 @@ impl RepoObject {
                 &mut repo,
                 &mutation,
                 Some(previous_state.latest_rev.clone()),
+                Vec::new(),
             )
             .await?;
         let state = self
             .persist_mutation(repo.storage(), &mutation)
+            .map_err(HttpError::worker)?;
+        self.persist_commit_event(repo.storage(), &state, &event)
+            .map_err(HttpError::worker)?;
+        repo.storage()
+            .delete_blob_refs(&path)
             .map_err(HttpError::worker)?;
         self.notify_directory(
             &request_host,
@@ -1105,6 +1221,135 @@ impl RepoObject {
         json_response(200, &xrpc_delete_mutation_response(&mutation)).map_err(HttpError::worker)
     }
 
+    async fn xrpc_apply_writes(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let body: XrpcApplyWritesRequest = req.json().await.map_err(HttpError::worker)?;
+        self.require_admin(req)?;
+        let request_host = request_host(req)?;
+        let (previous_state, identity, signing_key, mut repo) =
+            self.open_repo_for_write_with_state()?;
+        ensure_repo_identifier(&previous_state, &identity, &body.repo)?;
+        ensure_swap_commit(&previous_state, body.swap_commit.as_deref())?;
+        if body.writes.is_empty() {
+            return Err(HttpError::new(
+                400,
+                "applyWrites requires at least one write",
+            ));
+        }
+        if body.writes.len() > MAX_APPLY_WRITES {
+            return Err(HttpError::new(
+                400,
+                format!("applyWrites supports at most {MAX_APPLY_WRITES} writes"),
+            ));
+        }
+
+        let mut writes = Vec::new();
+        let mut blob_ref_updates = Vec::new();
+        let mut event_blobs = BTreeSet::new();
+        for (write_index, raw_write) in body.writes.into_iter().enumerate() {
+            let kind = parse_apply_write_kind(&raw_write.write_type)?;
+            let collection = Nsid::new(raw_write.collection).map_err(HttpError::bad_request)?;
+            match kind {
+                RepoOperationAction::Create => {
+                    let record = raw_write.value.ok_or_else(|| {
+                        HttpError::new(400, "applyWrites create requires `value`")
+                    })?;
+                    let rkey = if let Some(rkey) = raw_write.rkey {
+                        RecordKey::new(rkey).map_err(HttpError::bad_request)?
+                    } else {
+                        generated_record_key_with_offset(
+                            &previous_state.latest_commit,
+                            write_index,
+                        )?
+                    };
+                    let path = RepoPath::new(collection, rkey);
+                    let blobs = extract_record_blob_refs(&record)?;
+                    event_blobs.extend(blobs.iter().copied());
+                    blob_ref_updates.push((path.clone(), Some(blobs)));
+                    writes.push(RepoWrite::Create { path, record });
+                }
+                RepoOperationAction::Update => {
+                    let record = raw_write.value.ok_or_else(|| {
+                        HttpError::new(400, "applyWrites update requires `value`")
+                    })?;
+                    let rkey = raw_write
+                        .rkey
+                        .ok_or_else(|| HttpError::new(400, "applyWrites update requires `rkey`"))?;
+                    let path = RepoPath::new(
+                        collection,
+                        RecordKey::new(rkey).map_err(HttpError::bad_request)?,
+                    );
+                    let blobs = extract_record_blob_refs(&record)?;
+                    event_blobs.extend(blobs.iter().copied());
+                    blob_ref_updates.push((path.clone(), Some(blobs)));
+                    writes.push(RepoWrite::Update { path, record });
+                }
+                RepoOperationAction::Delete => {
+                    let rkey = raw_write
+                        .rkey
+                        .ok_or_else(|| HttpError::new(400, "applyWrites delete requires `rkey`"))?;
+                    let path = RepoPath::new(
+                        collection,
+                        RecordKey::new(rkey).map_err(HttpError::bad_request)?,
+                    );
+                    blob_ref_updates.push((path.clone(), None));
+                    writes.push(RepoWrite::Delete { path });
+                }
+            }
+        }
+
+        let rev = generated_repo_rev(&previous_state.latest_commit)?;
+        let mutation = repo
+            .apply_writes(writes, rev, &signing_key)
+            .await
+            .map_err(HttpError::repo)?;
+        let event = self
+            .commit_event_payload(
+                &mut repo,
+                &mutation,
+                Some(previous_state.latest_rev.clone()),
+                event_blobs.into_iter().collect(),
+            )
+            .await?;
+        let state = self
+            .persist_mutation(repo.storage(), &mutation)
+            .map_err(HttpError::worker)?;
+        self.persist_commit_event(repo.storage(), &state, &event)
+            .map_err(HttpError::worker)?;
+        for (path, blobs) in blob_ref_updates {
+            match blobs {
+                Some(blobs) => {
+                    if let Some(record_cid) = mutation
+                        .ops
+                        .iter()
+                        .rev()
+                        .find(|op| op.path == path)
+                        .and_then(|op| op.cid)
+                    {
+                        repo.storage()
+                            .replace_blob_refs(&path, record_cid, &blobs)
+                            .map_err(HttpError::worker)?;
+                    }
+                }
+                None => {
+                    repo.storage()
+                        .delete_blob_refs(&path)
+                        .map_err(HttpError::worker)?;
+                }
+            }
+        }
+        self.notify_directory(
+            &request_host,
+            &identity.handle,
+            &identity,
+            &state,
+            Some(&event),
+        )
+        .await?;
+
+        json_response(200, &xrpc_apply_writes_response(&state.did, &mutation))
+            .map_err(HttpError::worker)
+    }
+
     async fn xrpc_upload_blob(&self, req: &mut Request) -> Result<Response, HttpError> {
         self.require_admin(req)?;
         self.repo_state()?;
@@ -1116,10 +1361,13 @@ impl RepoObject {
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| "application/octet-stream".to_string());
         let bytes = req.bytes().await.map_err(HttpError::worker)?;
-        let blob = self
-            .store()
-            .put_blob(&mime_type, bytes)
-            .map_err(HttpError::worker)?;
+        if bytes.len() > MAX_BLOB_BYTES {
+            return Err(HttpError::new(
+                413,
+                format!("blob too large: max {MAX_BLOB_BYTES} bytes"),
+            ));
+        }
+        let blob = self.put_blob(&mime_type, bytes).await?;
 
         json_response(
             200,
@@ -1128,7 +1376,7 @@ impl RepoObject {
                     "$type": "blob",
                     "ref": {"$link": blob.cid.to_string()},
                     "mimeType": blob.mime_type,
-                    "size": blob.bytes.len(),
+                    "size": blob.byte_len,
                 },
             }),
         )
@@ -1367,12 +1615,16 @@ impl RepoObject {
         repo: &mut SignedRepository<SqlRepoStore>,
         mutation: &RepoMutation,
         since: Option<RepoRev>,
+        blobs: Vec<crate::cid::Cid>,
     ) -> Result<DirectoryCommitEventPayload, HttpError> {
-        self.repo_commit_event_payload(
+        let cids = mutation_diff_cids(repo, mutation).await?;
+        self.repo_commit_event_payload_from_cids(
             repo,
             mutation.commit_cid,
             since,
             directory_commit_ops(&mutation.ops),
+            blobs,
+            cids,
         )
         .await
     }
@@ -1385,14 +1637,132 @@ impl RepoObject {
         ops: Vec<DirectoryCommitOp>,
     ) -> Result<DirectoryCommitEventPayload, HttpError> {
         let cids = repo.export_cids().await.map_err(HttpError::repo)?;
+        self.repo_commit_event_payload_from_cids(repo, commit_cid, since, ops, Vec::new(), cids)
+            .await
+    }
+
+    async fn repo_commit_event_payload_from_cids(
+        &self,
+        repo: &mut SignedRepository<SqlRepoStore>,
+        commit_cid: crate::cid::Cid,
+        since: Option<RepoRev>,
+        ops: Vec<DirectoryCommitOp>,
+        blobs: Vec<crate::cid::Cid>,
+        cids: Vec<crate::cid::Cid>,
+    ) -> Result<DirectoryCommitEventPayload, HttpError> {
         let blocks =
             encode_car_from_store(&[commit_cid], cids, repo.storage()).map_err(HttpError::car)?;
         Ok(DirectoryCommitEventPayload {
             since,
             blocks,
             ops,
-            blobs: Vec::new(),
+            blobs: blobs.into_iter().map(|cid| cid.to_string()).collect(),
         })
+    }
+
+    fn persist_commit_event(
+        &self,
+        store: &SqlRepoStore,
+        state: &RepoStateRow,
+        event: &DirectoryCommitEventPayload,
+    ) -> worker::Result<()> {
+        store.append_commit_event(&RepoCommitEventInput {
+            rev: state.latest_rev.clone(),
+            since: event.since.clone(),
+            commit_cid: state.latest_commit,
+            blocks: event.blocks.clone(),
+            ops_json: to_string(&event.ops)?,
+            blobs_json: to_string(&event.blobs)?,
+        })
+    }
+
+    async fn put_blob(&self, mime_type: &str, bytes: Vec<u8>) -> Result<RepoBlobRow, HttpError> {
+        let cid = raw_cid(&bytes);
+        if let Ok(bucket) = self.env.bucket(BLOB_BUCKET_BINDING) {
+            let key = blob_storage_key(&cid);
+            bucket
+                .put(key.clone(), bytes.clone())
+                .http_metadata(HttpMetadata {
+                    content_type: Some(mime_type.to_string()),
+                    content_language: None,
+                    content_disposition: None,
+                    content_encoding: None,
+                    cache_control: None,
+                    cache_expiry: None,
+                })
+                .execute()
+                .await
+                .map_err(HttpError::worker)?;
+            self.store()
+                .put_blob_metadata(cid, mime_type, bytes.len(), "r2", Some(&key))
+                .map_err(HttpError::worker)
+        } else {
+            self.store()
+                .put_blob_bytes(mime_type, bytes)
+                .map_err(HttpError::worker)
+        }
+    }
+
+    async fn load_blob_bytes(&self, blob: RepoBlobRow) -> Result<Vec<u8>, HttpError> {
+        if blob.storage_kind == "r2" {
+            let key = blob
+                .storage_key
+                .clone()
+                .unwrap_or_else(|| blob_storage_key(&blob.cid));
+            let bucket = self.env.bucket(BLOB_BUCKET_BINDING).map_err(|_| {
+                HttpError::new(500, "BLOB_BUCKET binding is required to read this blob")
+            })?;
+            let Some(object) = bucket.get(key).execute().await.map_err(HttpError::worker)? else {
+                return Err(HttpError::new(404, "blob not found"));
+            };
+            let Some(body) = object.body() else {
+                return Err(HttpError::new(
+                    500,
+                    "R2 blob object returned without a body",
+                ));
+            };
+            body.bytes().await.map_err(HttpError::worker)
+        } else {
+            Ok(blob.bytes)
+        }
+    }
+
+    fn repo_diff_car_since(&self, state: &RepoStateRow, since: &str) -> Result<Vec<u8>, HttpError> {
+        let since = RepoRev::new(since.to_string()).map_err(HttpError::bad_request)?;
+        if since == state.latest_rev {
+            return encode_car(&[state.latest_commit], Vec::<CarBlock>::new())
+                .map_err(HttpError::car);
+        }
+        let store = self.store();
+        if !store
+            .has_commit_event_rev(&since)
+            .map_err(HttpError::worker)?
+        {
+            return Err(HttpError::new(
+                400,
+                format!("unknown since revision `{since}`"),
+            ));
+        }
+        let events = store
+            .list_commit_events_after_rev(&since)
+            .map_err(HttpError::worker)?;
+        if events.is_empty() {
+            return encode_car(&[state.latest_commit], Vec::<CarBlock>::new())
+                .map_err(HttpError::car);
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut blocks = Vec::new();
+        for event in events {
+            let decoded = decode_car(&event.blocks).map_err(HttpError::car)?;
+            for block in decoded.blocks {
+                if seen.insert(block.cid) {
+                    blocks.push(block);
+                }
+            }
+        }
+
+        encode_car(&[state.latest_commit], blocks).map_err(HttpError::car)
     }
 
     fn persist_mutation(
@@ -1438,7 +1808,7 @@ struct XrpcCreateRecordRequest {
     #[serde(default, rename = "validate")]
     _validate: Option<bool>,
     #[serde(default, rename = "swapCommit")]
-    _swap_commit: Option<String>,
+    swap_commit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1450,9 +1820,9 @@ struct XrpcPutRecordRequest {
     #[serde(default, rename = "validate")]
     _validate: Option<bool>,
     #[serde(default, rename = "swapRecord")]
-    _swap_record: Option<String>,
+    swap_record: SwapRecordField,
     #[serde(default, rename = "swapCommit")]
-    _swap_commit: Option<String>,
+    swap_commit: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1461,9 +1831,49 @@ struct XrpcDeleteRecordRequest {
     collection: String,
     rkey: String,
     #[serde(default, rename = "swapRecord")]
-    _swap_record: Option<String>,
+    swap_record: Option<String>,
     #[serde(default, rename = "swapCommit")]
-    _swap_commit: Option<String>,
+    swap_commit: Option<String>,
+}
+
+#[derive(Debug, Default)]
+enum SwapRecordField {
+    #[default]
+    Missing,
+    Absent,
+    Cid(String),
+}
+
+impl<'de> Deserialize<'de> for SwapRecordField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(Self::Cid)
+            .map_or(Ok(Self::Absent), Ok)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcApplyWritesRequest {
+    repo: String,
+    #[serde(default, rename = "validate")]
+    _validate: Option<bool>,
+    writes: Vec<XrpcApplyWriteRequest>,
+    #[serde(default, rename = "swapCommit")]
+    swap_commit: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcApplyWriteRequest {
+    #[serde(rename = "$type")]
+    write_type: String,
+    collection: String,
+    #[serde(default)]
+    rkey: Option<String>,
+    #[serde(default)]
+    value: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1600,6 +2010,44 @@ fn xrpc_delete_mutation_response(mutation: &RepoMutation) -> Value {
     })
 }
 
+fn xrpc_noop_delete_response(state: &RepoStateRow) -> Value {
+    json!({
+        "commit": {
+            "cid": state.latest_commit.to_string(),
+            "rev": state.latest_rev.to_string(),
+        },
+    })
+}
+
+fn xrpc_apply_writes_response(did: &Did, mutation: &RepoMutation) -> Value {
+    json!({
+        "commit": {
+            "cid": mutation.commit_cid.to_string(),
+            "rev": mutation.commit.rev.to_string(),
+        },
+        "results": mutation.ops
+            .iter()
+            .map(|op| match op.action {
+                RepoOperationAction::Create => json!({
+                    "$type": "com.atproto.repo.applyWrites#createResult",
+                    "uri": at_uri(did.as_str(), op.path.collection.as_str(), op.path.rkey.as_str()),
+                    "cid": op.cid.map(|cid| cid.to_string()),
+                    "validationStatus": "unknown",
+                }),
+                RepoOperationAction::Update => json!({
+                    "$type": "com.atproto.repo.applyWrites#updateResult",
+                    "uri": at_uri(did.as_str(), op.path.collection.as_str(), op.path.rkey.as_str()),
+                    "cid": op.cid.map(|cid| cid.to_string()),
+                    "validationStatus": "unknown",
+                }),
+                RepoOperationAction::Delete => json!({
+                    "$type": "com.atproto.repo.applyWrites#deleteResult",
+                }),
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
 fn directory_commit_ops(ops: &[RepoOperation]) -> Vec<DirectoryCommitOp> {
     ops.iter()
         .map(|op| DirectoryCommitOp {
@@ -1611,8 +2059,136 @@ fn directory_commit_ops(ops: &[RepoOperation]) -> Vec<DirectoryCommitOp> {
         .collect()
 }
 
+async fn mutation_diff_cids(
+    repo: &mut SignedRepository<SqlRepoStore>,
+    mutation: &RepoMutation,
+) -> Result<Vec<crate::cid::Cid>, HttpError> {
+    let mut seen = BTreeSet::new();
+    let mut cids = Vec::new();
+    for op in &mutation.ops {
+        for cid in repo
+            .extract_record_cids(&op.path)
+            .await
+            .map_err(HttpError::repo)?
+        {
+            if seen.insert(cid) {
+                cids.push(cid);
+            }
+        }
+    }
+    if seen.insert(mutation.commit_cid) {
+        cids.insert(0, mutation.commit_cid);
+    }
+    Ok(cids)
+}
+
+fn extract_record_blob_refs(record: &Value) -> Result<Vec<crate::cid::Cid>, HttpError> {
+    let mut cids = BTreeSet::new();
+    collect_record_blob_refs(record, &mut cids)?;
+    Ok(cids.into_iter().collect())
+}
+
+fn collect_record_blob_refs(
+    value: &Value,
+    cids: &mut BTreeSet<crate::cid::Cid>,
+) -> Result<(), HttpError> {
+    match value {
+        Value::Object(map) => {
+            if map.get("$type").and_then(Value::as_str) == Some("blob") {
+                if let Some(cid) = map
+                    .get("ref")
+                    .and_then(Value::as_object)
+                    .and_then(|ref_obj| ref_obj.get("$link"))
+                    .and_then(Value::as_str)
+                {
+                    cids.insert(parse_cid(cid).map_err(HttpError::bad_request)?);
+                }
+            }
+            for value in map.values() {
+                collect_record_blob_refs(value, cids)?;
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_record_blob_refs(value, cids)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn ensure_swap_commit(state: &RepoStateRow, swap_commit: Option<&str>) -> Result<(), HttpError> {
+    let Some(swap_commit) = swap_commit else {
+        return Ok(());
+    };
+    let cid = parse_cid(swap_commit).map_err(HttpError::bad_request)?;
+    if cid == state.latest_commit {
+        Ok(())
+    } else {
+        Err(invalid_swap("swapCommit did not match current repo commit"))
+    }
+}
+
+fn ensure_optional_swap_record(
+    current: Option<crate::cid::Cid>,
+    swap_record: Option<&str>,
+) -> Result<(), HttpError> {
+    let Some(swap_record) = swap_record else {
+        return Ok(());
+    };
+    let expected = parse_cid(swap_record).map_err(HttpError::bad_request)?;
+    if current == Some(expected) {
+        Ok(())
+    } else {
+        Err(invalid_swap("swapRecord did not match current record"))
+    }
+}
+
+fn ensure_swap_record_field(
+    current: Option<crate::cid::Cid>,
+    swap_record: &SwapRecordField,
+) -> Result<(), HttpError> {
+    match swap_record {
+        SwapRecordField::Missing => Ok(()),
+        SwapRecordField::Absent if current.is_none() => Ok(()),
+        SwapRecordField::Absent => Err(invalid_swap("swapRecord expected the record to be absent")),
+        SwapRecordField::Cid(expected) => ensure_optional_swap_record(current, Some(expected)),
+    }
+}
+
+fn invalid_swap(message: &str) -> HttpError {
+    HttpError::new(400, format!("InvalidSwap: {message}"))
+}
+
+fn parse_apply_write_kind(value: &str) -> Result<RepoOperationAction, HttpError> {
+    if value.ends_with("#create") || value == "create" {
+        Ok(RepoOperationAction::Create)
+    } else if value.ends_with("#update") || value == "update" {
+        Ok(RepoOperationAction::Update)
+    } else if value.ends_with("#delete") || value == "delete" {
+        Ok(RepoOperationAction::Delete)
+    } else {
+        Err(HttpError::new(
+            400,
+            format!("unsupported applyWrites op type `{value}`"),
+        ))
+    }
+}
+
+fn blob_storage_key(cid: &crate::cid::Cid) -> String {
+    format!("blobs/{cid}")
+}
+
 fn generated_record_key(seed: &crate::cid::Cid) -> Result<RecordKey, HttpError> {
     RecordKey::new(generated_tid(seed)).map_err(HttpError::bad_request)
+}
+
+fn generated_record_key_with_offset(
+    seed: &crate::cid::Cid,
+    offset: usize,
+) -> Result<RecordKey, HttpError> {
+    RecordKey::new(generated_tid_with_offset(seed, offset as u64)).map_err(HttpError::bad_request)
 }
 
 fn generated_repo_rev(seed: &crate::cid::Cid) -> Result<RepoRev, HttpError> {
@@ -1620,12 +2196,17 @@ fn generated_repo_rev(seed: &crate::cid::Cid) -> Result<RepoRev, HttpError> {
 }
 
 fn generated_tid(seed: &crate::cid::Cid) -> String {
+    generated_tid_with_offset(seed, 0)
+}
+
+fn generated_tid_with_offset(seed: &crate::cid::Cid, offset: u64) -> String {
     const TID_ALPHABET: &[u8; 32] = b"234567abcdefghijklmnopqrstuvwxyz";
     let entropy = seed.hash().digest().last().copied().unwrap_or_default() as u64;
     let mut value = worker::Date::now()
         .as_millis()
         .saturating_mul(1000)
-        .saturating_add(entropy);
+        .saturating_add(entropy)
+        .saturating_add(offset);
     let mut bytes = [b'2'; 13];
     for byte in bytes.iter_mut().rev() {
         *byte = TID_ALPHABET[(value & 31) as usize];

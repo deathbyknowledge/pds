@@ -137,8 +137,8 @@ const xrpcDelete = await expectJson(
   },
 );
 
-const latestCommit = xrpcDelete.commit.cid;
-const latestRev = xrpcDelete.commit.rev;
+let latestCommit = xrpcDelete.commit.cid;
+let latestRev = xrpcDelete.commit.rev;
 
 const blobBytes = new TextEncoder().encode("hello from a GSV blob");
 const uploadBlob = await expectJson(
@@ -157,6 +157,103 @@ const blobCid = uploadBlob.blob.ref?.$link;
 if (!blobCid) {
   throw new Error(`uploadBlob response did not include blob ref: ${JSON.stringify(uploadBlob)}`);
 }
+
+const applySinceRev = latestRev;
+await expectJsonStatus(
+  "stale swapCommit",
+  "POST",
+  "/xrpc/com.atproto.repo.putRecord",
+  {
+    repo: did,
+    collection,
+    rkey: "swap-stale",
+    swapCommit: xrpcPut.commit.cid,
+    record: {
+      $type: collection,
+      text: "this should not commit",
+    },
+  },
+  400,
+);
+
+await expectJsonStatus(
+  "swapRecord absent assertion",
+  "POST",
+  "/xrpc/com.atproto.repo.putRecord",
+  {
+    repo: did,
+    collection,
+    rkey,
+    swapRecord: null,
+    record: {
+      $type: collection,
+      text: "this should not overwrite an existing record",
+    },
+  },
+  400,
+);
+
+const applyWrites = await expectJson(
+  "XRPC applyWrites",
+  "POST",
+  "/xrpc/com.atproto.repo.applyWrites",
+  {
+    repo: did,
+    swapCommit: latestCommit,
+    writes: [
+      {
+        $type: "com.atproto.repo.applyWrites#create",
+        collection,
+        rkey: "apply-seed",
+        value: {
+          $type: collection,
+          text: "created through applyWrites",
+          attachment: blobRef(blobCid, "text/plain", blobBytes.byteLength),
+        },
+      },
+      {
+        $type: "com.atproto.repo.applyWrites#create",
+        collection,
+        rkey: "missing-blob-ref",
+        value: {
+          $type: collection,
+          text: "references a missing blob",
+          attachment: blobRef(mutation.latestCommit, "application/octet-stream", 1),
+        },
+      },
+      {
+        $type: "com.atproto.repo.applyWrites#create",
+        collection,
+        value: {
+          $type: collection,
+          text: "created through applyWrites with generated rkey A",
+        },
+      },
+      {
+        $type: "com.atproto.repo.applyWrites#create",
+        collection,
+        value: {
+          $type: collection,
+          text: "created through applyWrites with generated rkey B",
+        },
+      },
+    ],
+  },
+  (body) => {
+    if (!body.commit?.cid || body.results?.length !== 4) {
+      throw new Error(`unexpected applyWrites response ${JSON.stringify(body)}`);
+    }
+    const generatedUris = body.results.slice(2).map((result) => result.uri);
+    if (
+      generatedUris.some((uri) => typeof uri !== "string" || !uri.startsWith(`at://${did}/${collection}/`)) ||
+      generatedUris[0] === generatedUris[1]
+    ) {
+      throw new Error(`applyWrites generated duplicate or invalid rkeys ${JSON.stringify(body)}`);
+    }
+  },
+);
+latestCommit = applyWrites.commit.cid;
+latestRev = applyWrites.commit.rev;
 
 await expectJson("directory sync", "POST", `/repos/${encodePath(repo)}/directory-sync`, null, (body) => {
   if (body.ok !== true || body.latestCommit !== latestCommit || body.latestRev !== latestRev) {
@@ -219,6 +316,22 @@ const listBlobs = await expectJson(
   },
 );
 
+const missingBlobRefs = await expectJson(
+  "list missing blobs",
+  "GET",
+  "/xrpc/com.atproto.repo.listMissingBlobs",
+  null,
+  (body) => {
+    const expectedUri = `at://${did}/${collection}/missing-blob-ref`;
+    const match = body.blobs?.find(
+      (blob) => blob.cid === mutation.latestCommit && blob.recordUri === expectedUri,
+    );
+    if (!match) {
+      throw new Error(`expected missing blob ref ${expectedUri}, got ${JSON.stringify(body)}`);
+    }
+  },
+);
+
 await expectBytes(
   "get blob",
   "GET",
@@ -274,6 +387,18 @@ if (!repoCar.ok || !contentType.includes("application/vnd.ipld.car") || carBytes
   );
 }
 
+const repoDiffCar = await request(
+  "GET",
+  `/xrpc/com.atproto.sync.getRepo?did=${encodeQuery(did)}&since=${encodeQuery(applySinceRev)}`,
+);
+const diffContentType = repoDiffCar.headers.get("content-type") ?? "";
+const diffCarBytes = await repoDiffCar.arrayBuffer();
+if (!repoDiffCar.ok || !diffContentType.includes("application/vnd.ipld.car") || diffCarBytes.byteLength === 0) {
+  throw new Error(
+    `getRepo diff CAR check failed: status=${repoDiffCar.status} content-type=${diffContentType} bytes=${diffCarBytes.byteLength}`,
+  );
+}
+
 const atRepoUri = `at://${did}`;
 const atRecordUri = `${atRepoUri}/${collection}/${rkey}`;
 const pdslsRepoUrl = `https://pdsls.dev/${atRepoUri}`;
@@ -296,8 +421,10 @@ console.log(
       xrpcCreateCommit: xrpcCreate.commit.cid,
       xrpcPutCommit: xrpcPut.commit.cid,
       xrpcDeleteCommit: xrpcDelete.commit.cid,
+      applyWritesCommit: applyWrites.commit.cid,
       listedRepos: listRepos.repos.length,
       listedBlobs: listBlobs.cids.length,
+      missingBlobRefs: missingBlobRefs.blobs.length,
       subscribeRepos,
       blobCid,
       missingBlobStatus: missingBlob.status,
@@ -306,6 +433,7 @@ console.log(
       atRepoUri,
       atRecordUri,
       carBytes: carBytes.byteLength,
+      diffCarBytes: diffCarBytes.byteLength,
       pdslsRepoUrl,
       pdslsRecordUrl,
       generatedSigningKey: config.signingKeyHex ? false : true,
@@ -472,6 +600,15 @@ function repoNameFromDidOrHandle(did, handle) {
 function atprotoServiceEndpoint(didDocument) {
   return didDocument.service?.find((service) => service.id === "#atproto_pds")
     ?.serviceEndpoint;
+}
+
+function blobRef(cid, mimeType, size) {
+  return {
+    $type: "blob",
+    ref: { $link: cid },
+    mimeType,
+    size,
+  };
 }
 
 function parseRecordPath(path) {

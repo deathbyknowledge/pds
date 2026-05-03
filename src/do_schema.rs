@@ -22,11 +22,13 @@ pub const CREATE_REPO_BLOCKS: &str = "CREATE TABLE IF NOT EXISTS repo_blocks (
 )";
 
 pub const CREATE_REPO_BLOBS: &str = "CREATE TABLE IF NOT EXISTS repo_blobs (
-    cid        TEXT PRIMARY KEY,
-    mime_type  TEXT NOT NULL,
-    bytes      BLOB NOT NULL,
-    byte_len   INTEGER NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+    cid          TEXT PRIMARY KEY,
+    mime_type    TEXT NOT NULL,
+    bytes        BLOB NOT NULL,
+    byte_len     INTEGER NOT NULL,
+    storage_kind TEXT NOT NULL DEFAULT 'sqlite',
+    storage_key  TEXT,
+    created_at   INTEGER NOT NULL DEFAULT (unixepoch())
 )";
 
 pub const CREATE_REPO_BLOBS_CREATED_INDEX: &str =
@@ -45,6 +47,33 @@ pub const CREATE_RECORD_COLLECTION_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_record_index_collection_path
      ON record_index(collection, path)";
 
+pub const CREATE_REPO_BLOB_REFS: &str = "CREATE TABLE IF NOT EXISTS repo_blob_refs (
+    path       TEXT NOT NULL,
+    cid        TEXT NOT NULL,
+    record_cid TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (path, cid)
+)";
+
+pub const CREATE_REPO_BLOB_REFS_CID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_repo_blob_refs_cid_path
+     ON repo_blob_refs(cid, path)";
+
+pub const CREATE_REPO_COMMIT_EVENTS: &str = "CREATE TABLE IF NOT EXISTS repo_commit_events (
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    rev        TEXT NOT NULL UNIQUE,
+    since      TEXT,
+    commit_cid TEXT NOT NULL,
+    blocks     BLOB NOT NULL,
+    ops_json   TEXT NOT NULL DEFAULT '[]',
+    blobs_json TEXT NOT NULL DEFAULT '[]',
+    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_REPO_COMMIT_EVENTS_REV_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_repo_commit_events_rev
+     ON repo_commit_events(rev)";
+
 pub const ALL_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_REPO_STATE,
     CREATE_REPO_IDENTITY,
@@ -53,6 +82,10 @@ pub const ALL_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_REPO_BLOBS_CREATED_INDEX,
     CREATE_RECORD_INDEX,
     CREATE_RECORD_COLLECTION_INDEX,
+    CREATE_REPO_BLOB_REFS,
+    CREATE_REPO_BLOB_REFS_CID_INDEX,
+    CREATE_REPO_COMMIT_EVENTS,
+    CREATE_REPO_COMMIT_EVENTS_REV_INDEX,
 ];
 
 pub const CREATE_DIRECTORY_REPOS: &str = "CREATE TABLE IF NOT EXISTS directory_repos (
@@ -106,6 +139,8 @@ mod tests {
         assert!(joined.contains("repo_blocks"));
         assert!(joined.contains("repo_blobs"));
         assert!(joined.contains("record_index"));
+        assert!(joined.contains("repo_blob_refs"));
+        assert!(joined.contains("repo_commit_events"));
         assert!(joined.contains("idx_record_index_collection_path"));
     }
 
@@ -131,9 +166,23 @@ mod tests {
 
     #[test]
     fn repo_blobs_store_raw_bytes_by_cid() {
-        assert!(CREATE_REPO_BLOBS.contains("cid        TEXT PRIMARY KEY"));
-        assert!(CREATE_REPO_BLOBS.contains("mime_type  TEXT NOT NULL"));
-        assert!(CREATE_REPO_BLOBS.contains("bytes      BLOB NOT NULL"));
+        assert!(CREATE_REPO_BLOBS.contains("cid          TEXT PRIMARY KEY"));
+        assert!(CREATE_REPO_BLOBS.contains("mime_type    TEXT NOT NULL"));
+        assert!(CREATE_REPO_BLOBS.contains("bytes        BLOB NOT NULL"));
+        assert!(CREATE_REPO_BLOBS.contains("storage_kind TEXT NOT NULL DEFAULT 'sqlite'"));
+    }
+
+    #[test]
+    fn blob_refs_track_record_references() {
+        assert!(CREATE_REPO_BLOB_REFS.contains("PRIMARY KEY (path, cid)"));
+        assert!(CREATE_REPO_BLOB_REFS.contains("record_cid TEXT NOT NULL"));
+    }
+
+    #[test]
+    fn commit_events_store_diff_car_payloads() {
+        assert!(CREATE_REPO_COMMIT_EVENTS.contains("rev        TEXT NOT NULL UNIQUE"));
+        assert!(CREATE_REPO_COMMIT_EVENTS.contains("blocks     BLOB NOT NULL"));
+        assert!(CREATE_REPO_COMMIT_EVENTS.contains("blobs_json TEXT NOT NULL DEFAULT '[]'"));
     }
 
     #[test]

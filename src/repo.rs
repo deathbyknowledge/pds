@@ -87,6 +87,13 @@ impl RepoOperationAction {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RepoWrite<T> {
+    Create { path: RepoPath, record: T },
+    Update { path: RepoPath, record: T },
+    Delete { path: RepoPath },
+}
+
 #[derive(Clone, Debug)]
 pub struct Repository<S> {
     storage: S,
@@ -185,24 +192,8 @@ where
         rev: RepoRev,
         signer: &impl CommitSigner,
     ) -> Result<RepoMutation, RepoError> {
-        if self.mst_get(&path).await?.is_some() {
-            return Err(RepoError::RecordAlreadyExists { path });
-        }
-
-        let block = encode_block(record)?;
-        self.storage_mut()
-            .put_block_with_cid(block.cid, block.bytes.clone())?;
-        let mst_root = self.mst_add(path.clone(), block.cid).await?;
-        let op = RepoOperation {
-            action: RepoOperationAction::Create,
-            path: path.clone(),
-            cid: Some(block.cid),
-            prev: None,
-        };
-        let mutation = self.commit_root(mst_root, Some(block.cid), vec![op], rev, signer)?;
-        self.storage_mut().put_record_pointer(path, block.cid)?;
-
-        Ok(mutation)
+        self.apply_writes(vec![RepoWrite::Create { path, record }], rev, signer)
+            .await
     }
 
     pub async fn update_record<T: Serialize>(
@@ -212,24 +203,8 @@ where
         rev: RepoRev,
         signer: &impl CommitSigner,
     ) -> Result<RepoMutation, RepoError> {
-        let Some(previous) = self.mst_get(&path).await? else {
-            return Err(RepoError::RecordNotFound { path });
-        };
-
-        let block = encode_block(record)?;
-        self.storage_mut()
-            .put_block_with_cid(block.cid, block.bytes.clone())?;
-        let mst_root = self.mst_update(path.clone(), block.cid).await?;
-        let op = RepoOperation {
-            action: RepoOperationAction::Update,
-            path: path.clone(),
-            cid: Some(block.cid),
-            prev: Some(previous),
-        };
-        let mutation = self.commit_root(mst_root, Some(block.cid), vec![op], rev, signer)?;
-        self.storage_mut().put_record_pointer(path, block.cid)?;
-
-        Ok(mutation)
+        self.apply_writes(vec![RepoWrite::Update { path, record }], rev, signer)
+            .await
     }
 
     pub async fn delete_record(
@@ -238,19 +213,93 @@ where
         rev: RepoRev,
         signer: &impl CommitSigner,
     ) -> Result<RepoMutation, RepoError> {
-        let Some(previous) = self.mst_get(path).await? else {
-            return Err(RepoError::RecordNotFound { path: path.clone() });
+        self.apply_writes(
+            vec![RepoWrite::<()>::Delete { path: path.clone() }],
+            rev,
+            signer,
+        )
+        .await
+    }
+
+    pub async fn apply_writes<T: Serialize>(
+        &mut self,
+        writes: Vec<RepoWrite<T>>,
+        rev: RepoRev,
+        signer: &impl CommitSigner,
+    ) -> Result<RepoMutation, RepoError> {
+        let mut record_blocks = Vec::new();
+        let mut index_updates = Vec::new();
+        let mut ops = Vec::new();
+
+        let mst_root = {
+            let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
+            for write in writes {
+                match write {
+                    RepoWrite::Create { path, record } => {
+                        if tree.get(&path).await?.is_some() {
+                            return Err(RepoError::RecordAlreadyExists { path });
+                        }
+                        let block = encode_block(&record)?;
+                        tree.add(path.clone(), block.cid).await?;
+                        record_blocks.push((block.cid, block.bytes));
+                        index_updates.push((path.clone(), Some(block.cid)));
+                        ops.push(RepoOperation {
+                            action: RepoOperationAction::Create,
+                            path,
+                            cid: Some(block.cid),
+                            prev: None,
+                        });
+                    }
+                    RepoWrite::Update { path, record } => {
+                        let Some(previous) = tree.get(&path).await? else {
+                            return Err(RepoError::RecordNotFound { path });
+                        };
+                        let block = encode_block(&record)?;
+                        tree.update(path.clone(), block.cid).await?;
+                        record_blocks.push((block.cid, block.bytes));
+                        index_updates.push((path.clone(), Some(block.cid)));
+                        ops.push(RepoOperation {
+                            action: RepoOperationAction::Update,
+                            path,
+                            cid: Some(block.cid),
+                            prev: Some(previous),
+                        });
+                    }
+                    RepoWrite::Delete { path } => {
+                        let Some(previous) = tree.get(&path).await? else {
+                            return Err(RepoError::RecordNotFound { path });
+                        };
+                        tree.delete(&path).await?;
+                        index_updates.push((path.clone(), None));
+                        ops.push(RepoOperation {
+                            action: RepoOperationAction::Delete,
+                            path,
+                            cid: None,
+                            prev: Some(previous),
+                        });
+                    }
+                }
+            }
+
+            let root = tree.root();
+            {
+                let storage = tree.into_storage()?;
+                for (cid, bytes) in &record_blocks {
+                    storage.put_block_with_cid(*cid, bytes.clone())?;
+                }
+            }
+            root
         };
 
-        let mst_root = self.mst_delete(path).await?;
-        let op = RepoOperation {
-            action: RepoOperationAction::Delete,
-            path: path.clone(),
-            cid: None,
-            prev: Some(previous),
-        };
-        let mutation = self.commit_root(mst_root, None, vec![op], rev, signer)?;
-        self.storage_mut().delete_record_pointer(path)?;
+        let record_cid = index_updates.iter().rev().find_map(|(_, cid)| *cid);
+        let mutation = self.commit_root(mst_root, record_cid, ops, rev, signer)?;
+        for (path, cid) in index_updates {
+            if let Some(cid) = cid {
+                self.storage_mut().put_record_pointer(path, cid)?;
+            } else {
+                self.storage_mut().delete_record_pointer(&path)?;
+            }
+        }
 
         Ok(mutation)
     }
@@ -331,27 +380,6 @@ where
             record_cid,
             ops,
         })
-    }
-
-    async fn mst_add(&mut self, path: RepoPath, cid: Cid) -> Result<Cid, RepoError> {
-        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
-        tree.add(path, cid).await?;
-        let root = tree.root();
-        Ok(root)
-    }
-
-    async fn mst_update(&mut self, path: RepoPath, cid: Cid) -> Result<Cid, RepoError> {
-        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
-        tree.update(path, cid).await?;
-        let root = tree.root();
-        Ok(root)
-    }
-
-    async fn mst_delete(&mut self, path: &RepoPath) -> Result<Cid, RepoError> {
-        let mut tree = MerkleSearchTree::open(&mut self.storage, self.latest.commit.data);
-        tree.delete(path).await?;
-        let root = tree.root();
-        Ok(root)
     }
 
     async fn mst_get(&mut self, path: &RepoPath) -> Result<Option<Cid>, RepoError> {
@@ -743,6 +771,70 @@ mod tests {
             assert!(repo.storage().has_block(&old_record_cid).unwrap());
             assert!(repo
                 .get_record::<TestRecord>(&path)
+                .await
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn signed_apply_writes_batches_multiple_ops_into_one_commit() {
+        block_on(async {
+            let mut repo = signed_repo().await;
+            let signer = HashSigner(b"repo-key");
+            let existing = repo
+                .create_record(
+                    path("existing"),
+                    &record("old"),
+                    rev("3jqfcqzm3fo3j"),
+                    &signer,
+                )
+                .await
+                .unwrap();
+            let previous_commit = existing.commit_cid;
+            let old_record = existing.record_cid.unwrap();
+
+            let mutation = repo
+                .apply_writes(
+                    vec![
+                        RepoWrite::Update {
+                            path: path("existing"),
+                            record: record("new"),
+                        },
+                        RepoWrite::Create {
+                            path: path("created"),
+                            record: record("created"),
+                        },
+                        RepoWrite::Delete {
+                            path: path("created"),
+                        },
+                    ],
+                    rev("3jqfcqzm3fo4j"),
+                    &signer,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(mutation.commit.prev, Some(previous_commit));
+            assert_eq!(mutation.ops.len(), 3);
+            assert_eq!(mutation.ops[0].action, RepoOperationAction::Update);
+            assert_eq!(mutation.ops[0].path, path("existing"));
+            assert_eq!(mutation.ops[0].prev, Some(old_record));
+            assert_eq!(mutation.ops[1].action, RepoOperationAction::Create);
+            assert_eq!(mutation.ops[1].path, path("created"));
+            assert_eq!(mutation.ops[2].action, RepoOperationAction::Delete);
+            assert_eq!(mutation.ops[2].path, path("created"));
+            assert_eq!(mutation.ops[2].prev, mutation.ops[1].cid);
+            assert_eq!(
+                repo.get_record::<TestRecord>(&path("existing"))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .record,
+                record("new")
+            );
+            assert!(repo
+                .get_record::<TestRecord>(&path("created"))
                 .await
                 .unwrap()
                 .is_none());
