@@ -162,6 +162,27 @@ pub const CREATE_DIRECTORY_SESSIONS_DID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_directory_sessions_did
      ON directory_sessions(did)";
 
+pub const CREATE_DIRECTORY_OAUTH_PAR_REQUESTS: &str =
+    "CREATE TABLE IF NOT EXISTS directory_oauth_par_requests (
+    request_uri           TEXT PRIMARY KEY,
+    client_id             TEXT NOT NULL,
+    redirect_uri          TEXT NOT NULL,
+    scope                 TEXT NOT NULL,
+    state                 TEXT NOT NULL,
+    code_challenge        TEXT NOT NULL,
+    code_challenge_method TEXT NOT NULL,
+    login_hint            TEXT,
+    dpop_nonce            TEXT NOT NULL,
+    params_json           TEXT NOT NULL,
+    expires_at            INTEGER NOT NULL,
+    created_at            INTEGER NOT NULL DEFAULT (unixepoch()),
+    UNIQUE (client_id, state)
+)";
+
+pub const CREATE_DIRECTORY_OAUTH_PAR_EXPIRES_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_oauth_par_expires_at
+     ON directory_oauth_par_requests(expires_at)";
+
 pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_REPOS,
     CREATE_DIRECTORY_REPOS_UPDATED_INDEX,
@@ -173,6 +194,8 @@ pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_ACCOUNTS_HANDLE_INDEX,
     CREATE_DIRECTORY_SESSIONS,
     CREATE_DIRECTORY_SESSIONS_DID_INDEX,
+    CREATE_DIRECTORY_OAUTH_PAR_REQUESTS,
+    CREATE_DIRECTORY_OAUTH_PAR_EXPIRES_INDEX,
 ];
 
 #[cfg(test)]
@@ -252,5 +275,7 @@ mod tests {
         assert!(joined.contains("password_hash        TEXT NOT NULL"));
         assert!(joined.contains("directory_sessions"));
         assert!(joined.contains("refresh_jti TEXT NOT NULL UNIQUE"));
+        assert!(joined.contains("directory_oauth_par_requests"));
+        assert!(joined.contains("UNIQUE (client_id, state)"));
     }
 }

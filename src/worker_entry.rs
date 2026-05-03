@@ -2,7 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::engine::general_purpose::{
+    STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD,
+};
 use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::de::Deserializer;
@@ -26,15 +28,16 @@ use crate::cid::{parse_cid, raw_cid, raw_cid_from_sha256_digest};
 use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
-    DirectoryAccountRow, DirectoryCommitEventInput, DirectoryEventRow, DirectoryRepoRow,
-    DirectorySessionRow, RepoBlobRow, RepoCommitEventInput, RepoIdentityRow, RepoStateRow,
-    SqlDirectoryStore, SqlRepoStore,
+    DirectoryAccountRow, DirectoryCommitEventInput, DirectoryEventRow,
+    DirectoryOauthParRequestInput, DirectoryRepoRow, DirectorySessionRow, RepoBlobRow,
+    RepoCommitEventInput, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
 };
 use crate::identity::{IdentityError, RepoSigningKey};
 use crate::oauth::{
-    authorization_server_metadata, is_oauth_well_known_path, protected_resource_metadata,
-    OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_PAR_PATH,
-    OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_TOKEN_PATH,
+    authorization_server_metadata, is_oauth_well_known_path, parse_pushed_authorization_request,
+    protected_resource_metadata, OAuthRequestError, OAUTH_AUTHORIZATION_SERVER_PATH,
+    OAUTH_AUTHORIZE_PATH, OAUTH_PAR_EXPIRES_IN_SECONDS, OAUTH_PAR_PATH,
+    OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
 };
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
@@ -66,6 +69,8 @@ const MAX_APPLY_WRITES: usize = 200;
 const PASSWORD_SALT_BYTES: usize = 16;
 const SESSION_ID_BYTES: usize = 24;
 const REPO_SIGNING_KEY_BYTES: usize = 32;
+const OAUTH_REQUEST_URI_BYTES: usize = 32;
+const OAUTH_DPOP_NONCE_BYTES: usize = 32;
 const ACCESS_TOKEN_TTL_SECONDS: i64 = 15 * 60;
 const REFRESH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
 
@@ -658,14 +663,58 @@ impl PdsDirectoryObject {
         &self,
         req: &mut Request,
     ) -> Result<Response, HttpError> {
-        ensure_form_urlencoded(req)?;
-        let _ = req.text().await.map_err(HttpError::worker)?;
-        oauth_error_response(
-            501,
-            "temporarily_unavailable",
-            "OAuth pushed authorization requests are not implemented yet",
-        )
-        .map_err(HttpError::worker)
+        if let Err(error) = ensure_form_urlencoded(req) {
+            return oauth_error_response(415, "invalid_request", &error.message)
+                .map_err(HttpError::worker);
+        }
+        let body = req.text().await.map_err(HttpError::worker)?;
+        let request = match parse_pushed_authorization_request(&body) {
+            Ok(request) => request,
+            Err(error) => return oauth_request_error_response(error).map_err(HttpError::worker),
+        };
+
+        let now = current_unix_time();
+        let store = self.store();
+        store
+            .purge_expired_oauth_par_requests(now)
+            .map_err(HttpError::worker)?;
+        if store
+            .has_oauth_par_state(&request.client_id, &request.state, now)
+            .map_err(HttpError::worker)?
+        {
+            return oauth_error_response(
+                400,
+                "invalid_request",
+                "duplicate OAuth state for this client",
+            )
+            .map_err(HttpError::worker);
+        }
+
+        let request_uri = format!(
+            "{OAUTH_REQUEST_URI_PREFIX}{}",
+            random_urlsafe_token::<OAUTH_REQUEST_URI_BYTES>()?
+        );
+        let dpop_nonce = random_urlsafe_token::<OAUTH_DPOP_NONCE_BYTES>()?;
+        let expires_at = now.saturating_add(OAUTH_PAR_EXPIRES_IN_SECONDS);
+        let params_json = to_string(&request.to_json()).map_err(HttpError::worker)?;
+        store
+            .insert_oauth_par_request(&DirectoryOauthParRequestInput {
+                request_uri: request_uri.clone(),
+                client_id: request.client_id,
+                redirect_uri: request.redirect_uri,
+                scope: request.scope,
+                state: request.state,
+                code_challenge: request.code_challenge,
+                code_challenge_method: request.code_challenge_method,
+                login_hint: request.login_hint,
+                dpop_nonce: dpop_nonce.clone(),
+                params_json,
+                expires_at,
+            })
+            .map_err(HttpError::worker)?;
+
+        oauth_par_response(&request_uri, OAUTH_PAR_EXPIRES_IN_SECONDS, &dpop_nonce)
+            .map_err(HttpError::worker)
     }
 
     async fn oauth_token(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -3043,7 +3092,7 @@ fn ensure_form_urlencoded(req: &Request) -> Result<(), HttpError> {
         .map_err(HttpError::worker)?
         .and_then(|value| value.split(';').next().map(|part| part.trim().to_string()))
         .unwrap_or_default();
-    if content_type == "application/x-www-form-urlencoded" {
+    if content_type.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
         Ok(())
     } else {
         Err(HttpError::new(
@@ -3207,6 +3256,10 @@ fn generate_repo_signing_key_hex() -> Result<String, HttpError> {
 
 fn random_token_id() -> Result<String, HttpError> {
     Ok(BASE64_STANDARD.encode(random_bytes::<SESSION_ID_BYTES>()?))
+}
+
+fn random_urlsafe_token<const N: usize>() -> Result<String, HttpError> {
+    Ok(BASE64_URL_SAFE_NO_PAD.encode(random_bytes::<N>()?))
 }
 
 fn random_bytes<const N: usize>() -> Result<[u8; N], HttpError> {
@@ -3674,6 +3727,26 @@ fn oauth_error_response(
     }))?
     .with_status(status);
     response.headers_mut().set("cache-control", "no-store")?;
+    set_cors(&mut response)?;
+    Ok(response)
+}
+
+fn oauth_request_error_response(error: OAuthRequestError) -> worker::Result<Response> {
+    oauth_error_response(400, error.error_code(), &error.to_string())
+}
+
+fn oauth_par_response(
+    request_uri: &str,
+    expires_in: i64,
+    dpop_nonce: &str,
+) -> worker::Result<Response> {
+    let mut response = Response::from_json(&json!({
+        "request_uri": request_uri,
+        "expires_in": expires_in,
+    }))?
+    .with_status(201);
+    response.headers_mut().set("cache-control", "no-store")?;
+    response.headers_mut().set("dpop-nonce", dpop_nonce)?;
     set_cors(&mut response)?;
     Ok(response)
 }

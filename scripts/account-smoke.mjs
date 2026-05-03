@@ -182,13 +182,46 @@ async function expectOAuthDiscovery() {
 
 async function expectOAuthScaffoldEndpoints() {
   await expectStatus("OAuth PAR preflight", "OPTIONS", "/oauth/par", null, 204);
-  await expectOAuthStub(
-    "OAuth PAR scaffold",
+  const parBody = new URLSearchParams({
+    client_id: "http://localhost",
+    response_type: "code",
+    code_challenge: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ",
+    code_challenge_method: "S256",
+    state: `state-${Date.now().toString(36)}`,
+    redirect_uri: "http://127.0.0.1/callback",
+    scope: "atproto transition:generic",
+    login_hint: handle,
+  }).toString();
+  const par = await expectJson(
+    "OAuth PAR",
     "POST",
     "/oauth/par",
-    "client_id=http%3A%2F%2Flocalhost&response_type=code",
+    parBody,
+    (body, response) => {
+      if (
+        typeof body.request_uri !== "string" ||
+        !body.request_uri.startsWith("urn:ietf:params:oauth:request_uri:") ||
+        body.expires_in !== 300
+      ) {
+        throw new Error(`unexpected OAuth PAR response ${JSON.stringify(body)}`);
+      }
+      if (!response.headers.get("dpop-nonce")) {
+        throw new Error(`OAuth PAR response did not include DPoP-Nonce header`);
+      }
+    },
     { "content-type": "application/x-www-form-urlencoded" },
   );
+  await expectStatus(
+    "OAuth duplicate PAR state",
+    "POST",
+    "/oauth/par",
+    parBody,
+    400,
+    { "content-type": "application/x-www-form-urlencoded" },
+  );
+  if (!par.request_uri) {
+    throw new Error(`OAuth PAR response did not include request_uri`);
+  }
   await expectOAuthStub("OAuth authorize scaffold", "GET", "/oauth/authorize?client_id=http%3A%2F%2Flocalhost");
   await expectOAuthStub(
     "OAuth token scaffold",
@@ -232,7 +265,7 @@ async function expectJson(label, method, path, body, validate = undefined, extra
   if (!response.ok) {
     throw new Error(`${label} failed status=${response.status}: ${JSON.stringify(parsed)}`);
   }
-  validate?.(parsed);
+  validate?.(parsed, response);
   return parsed;
 }
 

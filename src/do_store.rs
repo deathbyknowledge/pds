@@ -90,6 +90,21 @@ pub struct DirectorySessionRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryOauthParRequestInput {
+    pub request_uri: String,
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub scope: String,
+    pub state: String,
+    pub code_challenge: String,
+    pub code_challenge_method: String,
+    pub login_hint: Option<String>,
+    pub dpop_nonce: String,
+    pub params_json: String,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoBlobRow {
     pub cid: Cid,
     pub mime_type: String,
@@ -678,6 +693,63 @@ impl SqlDirectoryStore {
              SET active = 0, updated_at = unixepoch()
              WHERE refresh_jti = ?",
             vec![SqlStorageValue::from(refresh_jti.to_string())],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_oauth_par_request(
+        &self,
+        row: &DirectoryOauthParRequestInput,
+    ) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO directory_oauth_par_requests (
+                request_uri, client_id, redirect_uri, scope, state, code_challenge,
+                code_challenge_method, login_hint, dpop_nonce, params_json, expires_at
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(row.request_uri.clone()),
+                SqlStorageValue::from(row.client_id.clone()),
+                SqlStorageValue::from(row.redirect_uri.clone()),
+                SqlStorageValue::from(row.scope.clone()),
+                SqlStorageValue::from(row.state.clone()),
+                SqlStorageValue::from(row.code_challenge.clone()),
+                SqlStorageValue::from(row.code_challenge_method.clone()),
+                optional_text(row.login_hint.clone()),
+                SqlStorageValue::from(row.dpop_nonce.clone()),
+                SqlStorageValue::from(row.params_json.clone()),
+                SqlStorageValue::from(row.expires_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_oauth_par_state(
+        &self,
+        client_id: &str,
+        state: &str,
+        now: i64,
+    ) -> worker::Result<bool> {
+        let rows: Vec<CountRow> = self
+            .sql
+            .exec(
+                "SELECT COUNT(*) AS n
+                 FROM directory_oauth_par_requests
+                 WHERE client_id = ? AND state = ? AND expires_at > ?",
+                vec![
+                    SqlStorageValue::from(client_id.to_string()),
+                    SqlStorageValue::from(state.to_string()),
+                    SqlStorageValue::from(now),
+                ],
+            )?
+            .to_array()?;
+        Ok(rows.first().is_some_and(|row| row.n > 0))
+    }
+
+    pub fn purge_expired_oauth_par_requests(&self, now: i64) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM directory_oauth_par_requests WHERE expires_at <= ?",
+            vec![SqlStorageValue::from(now)],
         )?;
         Ok(())
     }
