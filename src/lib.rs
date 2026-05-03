@@ -12,6 +12,7 @@ pub mod identity;
 pub mod model;
 pub mod mst;
 pub mod repo;
+pub mod repo_import;
 pub mod service;
 pub mod storage;
 pub mod xrpc;

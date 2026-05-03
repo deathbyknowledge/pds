@@ -34,15 +34,21 @@ use crate::identity::{IdentityError, RepoSigningKey};
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
 };
+use crate::repo_import::{
+    diff_imported_records, extract_record_blob_refs as extract_import_record_blob_refs,
+    validate_imported_repo, ImportRepoOp, RepoImportError,
+};
+use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 use crate::xrpc::{
     at_uri, optional_param, parse_get_blocks_params, parse_list_records_params, required_param,
     route_xrpc_method, REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD,
-    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS,
-    REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION,
-    SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION, SERVER_REFRESH_SESSION,
-    SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT, SYNC_GET_HEAD, SYNC_GET_HOST_STATUS,
-    SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO, SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS,
-    SYNC_LIST_REPOS, SYNC_LIST_REPOS_BY_COLLECTION, SYNC_SUBSCRIBE_REPOS,
+    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO, REPO_LIST_MISSING_BLOBS,
+    REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_CREATE_ACCOUNT,
+    SERVER_CREATE_SESSION, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION,
+    SERVER_REFRESH_SESSION, SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT, SYNC_GET_HEAD,
+    SYNC_GET_HOST_STATUS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
+    SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS, SYNC_LIST_REPOS_BY_COLLECTION,
+    SYNC_SUBSCRIBE_REPOS,
 };
 use crate::xrpc::{XrpcError, XrpcRoute};
 
@@ -50,6 +56,7 @@ const DID_DOCUMENT_PATH: &str = "/.well-known/did.json";
 const ATPROTO_DID_PATH: &str = "/.well-known/atproto-did";
 const BLOB_BUCKET_BINDING: &str = "BLOB_BUCKET";
 const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
+const MAX_IMPORT_REPO_BYTES: usize = 25 * 1024 * 1024;
 const MAX_APPLY_WRITES: usize = 200;
 const PASSWORD_SALT_BYTES: usize = 16;
 const SESSION_ID_BYTES: usize = 24;
@@ -178,6 +185,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcPutRecord": "POST /xrpc/com.atproto.repo.putRecord",
                 "xrpcDeleteRecord": "POST /xrpc/com.atproto.repo.deleteRecord",
                 "xrpcApplyWrites": "POST /xrpc/com.atproto.repo.applyWrites",
+                "xrpcImportRepo": "POST /xrpc/com.atproto.repo.importRepo",
                 "xrpcUploadBlob": "POST /xrpc/com.atproto.repo.uploadBlob",
                 "xrpcListMissingBlobs": "GET /xrpc/com.atproto.repo.listMissingBlobs",
                 "xrpcGetLatestCommit": "GET /xrpc/com.atproto.sync.getLatestCommit?did=:did",
@@ -921,6 +929,7 @@ impl RepoObject {
             (Method::Post, REPO_PUT_RECORD) => self.xrpc_put_record(req).await,
             (Method::Post, REPO_DELETE_RECORD) => self.xrpc_delete_record(req).await,
             (Method::Post, REPO_APPLY_WRITES) => self.xrpc_apply_writes(req).await,
+            (Method::Post, REPO_IMPORT_REPO) => self.xrpc_import_repo(req).await,
             (Method::Post, REPO_UPLOAD_BLOB) => self.xrpc_upload_blob(req).await,
             (
                 _,
@@ -941,6 +950,7 @@ impl RepoObject {
                 | REPO_PUT_RECORD
                 | REPO_DELETE_RECORD
                 | REPO_APPLY_WRITES
+                | REPO_IMPORT_REPO
                 | REPO_UPLOAD_BLOB
                 | REPO_LIST_MISSING_BLOBS,
             ) => Err(HttpError::new(405, "method not allowed")),
@@ -1849,6 +1859,79 @@ impl RepoObject {
             .map_err(HttpError::worker)
     }
 
+    async fn xrpc_import_repo(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let request_host = request_host(req)?;
+        let (previous_state, identity, mut existing_repo) = self.open_repo_with_identity()?;
+        self.require_repo_write_auth(req, &previous_state.did)?;
+        ensure_import_repo_content_type(req)?;
+        let content_length = request_content_length(req)?
+            .ok_or_else(|| HttpError::new(411, "importRepo requires a content-length header"))?;
+        ensure_import_repo_size_limit(content_length)?;
+
+        let existing_records = existing_repo
+            .entries()
+            .await
+            .map_err(HttpError::repo)?
+            .into_iter()
+            .map(|entry| (entry.path, entry.cid))
+            .collect::<Vec<_>>();
+        let bytes = req.bytes().await.map_err(HttpError::worker)?;
+        ensure_import_repo_size_limit(bytes.len() as u64)?;
+        let decoded = decode_car(&bytes).map_err(|error| HttpError::new(400, error.to_string()))?;
+        let imported = validate_imported_repo(decoded, &previous_state.did)
+            .await
+            .map_err(HttpError::import)?;
+        let ops = diff_imported_records(existing_records, &imported.records);
+        let event = DirectoryCommitEventPayload {
+            since: Some(previous_state.latest_rev.clone()),
+            blocks: imported.current_car.clone(),
+            ops: directory_import_ops(&ops),
+            blobs: imported_blob_strings(&imported.records),
+        };
+        let state = RepoStateRow {
+            did: previous_state.did.clone(),
+            latest_commit: imported.root,
+            latest_rev: imported.rev.clone(),
+        };
+        let record_paths = imported
+            .records
+            .iter()
+            .map(|record| record.path.clone())
+            .collect::<Vec<_>>();
+
+        let mut store = self.store();
+        store
+            .clear_repo_data_for_import()
+            .map_err(HttpError::worker)?;
+        for block in &imported.blocks {
+            store
+                .put_block_with_cid(block.cid, block.bytes.clone())
+                .map_err(HttpError::storage)?;
+        }
+        store.put_repo_state(&state).map_err(HttpError::worker)?;
+        for record in &imported.records {
+            store
+                .put_record_pointer(record.path.clone(), record.cid)
+                .map_err(HttpError::storage)?;
+            store
+                .replace_blob_refs(&record.path, record.cid, &record.blob_cids)
+                .map_err(HttpError::worker)?;
+        }
+        self.persist_commit_event(&store, &state, &event)
+            .map_err(HttpError::worker)?;
+        self.notify_directory(
+            &request_host,
+            &identity.handle,
+            &identity,
+            &state,
+            Some(&record_paths),
+            Some(&event),
+        )
+        .await?;
+
+        empty_response(200).map_err(HttpError::worker)
+    }
+
     async fn xrpc_upload_blob(&self, req: &mut Request) -> Result<Response, HttpError> {
         let state = self.repo_state()?;
         self.require_repo_write_auth(req, &state.did)?;
@@ -2560,6 +2643,14 @@ impl HttpError {
         Self::new(401, error.to_string())
     }
 
+    fn storage(error: StorageError) -> Self {
+        Self::new(500, error.to_string())
+    }
+
+    fn import(error: RepoImportError) -> Self {
+        Self::new(400, error.to_string())
+    }
+
     fn car(error: CarError) -> Self {
         match error {
             CarError::MissingBlock { .. } => Self::new(500, error.to_string()),
@@ -2662,6 +2753,27 @@ fn directory_commit_ops(ops: &[RepoOperation]) -> Vec<DirectoryCommitOp> {
         .collect()
 }
 
+fn directory_import_ops(ops: &[ImportRepoOp]) -> Vec<DirectoryCommitOp> {
+    ops.iter()
+        .map(|op| DirectoryCommitOp {
+            action: op.action.as_str().to_string(),
+            path: op.path.to_string(),
+            cid: op.cid.map(|cid| cid.to_string()),
+            prev: op.prev.map(|cid| cid.to_string()),
+        })
+        .collect()
+}
+
+fn imported_blob_strings(records: &[crate::repo_import::ImportedRecord]) -> Vec<String> {
+    records
+        .iter()
+        .flat_map(|record| record.blob_cids.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|cid| cid.to_string())
+        .collect()
+}
+
 async fn repo_record_paths(
     repo: &mut SignedRepository<SqlRepoStore>,
 ) -> Result<Vec<RepoPath>, HttpError> {
@@ -2727,39 +2839,7 @@ async fn mutation_diff_cids(
 }
 
 fn extract_record_blob_refs(record: &Value) -> Result<Vec<crate::cid::Cid>, HttpError> {
-    let mut cids = BTreeSet::new();
-    collect_record_blob_refs(record, &mut cids)?;
-    Ok(cids.into_iter().collect())
-}
-
-fn collect_record_blob_refs(
-    value: &Value,
-    cids: &mut BTreeSet<crate::cid::Cid>,
-) -> Result<(), HttpError> {
-    match value {
-        Value::Object(map) => {
-            if map.get("$type").and_then(Value::as_str) == Some("blob") {
-                if let Some(cid) = map
-                    .get("ref")
-                    .and_then(Value::as_object)
-                    .and_then(|ref_obj| ref_obj.get("$link"))
-                    .and_then(Value::as_str)
-                {
-                    cids.insert(parse_cid(cid).map_err(HttpError::bad_request)?);
-                }
-            }
-            for value in map.values() {
-                collect_record_blob_refs(value, cids)?;
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_record_blob_refs(value, cids)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
+    extract_import_record_blob_refs(record).map_err(HttpError::import)
 }
 
 fn ensure_swap_commit(state: &RepoStateRow, swap_commit: Option<&str>) -> Result<(), HttpError> {
@@ -2856,6 +2936,34 @@ fn request_content_length(req: &Request) -> Result<Option<u64>, HttpError> {
         .parse::<u64>()
         .map(Some)
         .map_err(|error| HttpError::new(400, format!("invalid content-length header: {error}")))
+}
+
+fn ensure_import_repo_content_type(req: &Request) -> Result<(), HttpError> {
+    let content_type = req
+        .headers()
+        .get("content-type")
+        .map_err(HttpError::worker)?
+        .and_then(|value| value.split(';').next().map(|part| part.trim().to_string()))
+        .unwrap_or_default();
+    if content_type == "application/vnd.ipld.car" {
+        Ok(())
+    } else {
+        Err(HttpError::new(
+            415,
+            "importRepo requires content-type application/vnd.ipld.car",
+        ))
+    }
+}
+
+fn ensure_import_repo_size_limit(byte_len: u64) -> Result<(), HttpError> {
+    if byte_len > MAX_IMPORT_REPO_BYTES as u64 {
+        Err(HttpError::new(
+            413,
+            format!("repo import too large: max {MAX_IMPORT_REPO_BYTES} bytes"),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn ensure_blob_size_limit(byte_len: u64) -> Result<(), HttpError> {

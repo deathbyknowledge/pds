@@ -256,6 +256,15 @@ impl SqlRepoStore {
         Ok(())
     }
 
+    pub fn clear_repo_data_for_import(&self) -> worker::Result<()> {
+        self.sql.exec("DELETE FROM record_index", None)?;
+        self.sql.exec("DELETE FROM repo_blob_refs", None)?;
+        self.sql.exec("DELETE FROM repo_commit_events", None)?;
+        self.sql.exec("DELETE FROM repo_blocks", None)?;
+        self.sql.exec("DELETE FROM repo_state", None)?;
+        Ok(())
+    }
+
     pub fn put_blob_bytes(&self, mime_type: &str, bytes: Vec<u8>) -> worker::Result<RepoBlobRow> {
         let cid = raw_cid(&bytes);
         self.sql.exec(

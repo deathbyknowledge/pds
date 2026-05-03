@@ -476,6 +476,102 @@ if (!repoDiffCar.ok || !diffContentType.includes("application/vnd.ipld.car") || 
   );
 }
 
+const importSourceCommit = latestCommit;
+const importSourceRev = latestRev;
+const importSourceBytes = new Uint8Array(carBytes);
+const importProbeRkey = `import-probe-${Date.now().toString(36)}`;
+const importProbe = await expectJson(
+  "import probe createRecord",
+  "POST",
+  "/xrpc/com.atproto.repo.createRecord",
+  {
+    repo: did,
+    collection,
+    rkey: importProbeRkey,
+    record: {
+      $type: collection,
+      text: "temporary record that importRepo should remove",
+      createdAt: new Date().toISOString(),
+    },
+  },
+  (body) => {
+    if (!body.commit?.cid || !body.commit?.rev) {
+      throw new Error(`unexpected import probe createRecord response ${JSON.stringify(body)}`);
+    }
+  },
+);
+latestCommit = importProbe.commit.cid;
+latestRev = importProbe.commit.rev;
+
+await expectJson(
+  "import probe exists",
+  "GET",
+  `/xrpc/com.atproto.repo.getRecord?repo=${encodeQuery(did)}&collection=${encodeQuery(collection)}&rkey=${encodeQuery(importProbeRkey)}`,
+  null,
+  (body) => {
+    if (body.uri !== `at://${did}/${collection}/${importProbeRkey}`) {
+      throw new Error(`unexpected import probe record ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+await expectStatus(
+  "import repo",
+  "POST",
+  "/xrpc/com.atproto.repo.importRepo",
+  importSourceBytes,
+  200,
+  { "content-type": "application/vnd.ipld.car" },
+);
+
+const importedHead = await expectJson(
+  "latest after import",
+  "GET",
+  `/xrpc/com.atproto.sync.getLatestCommit?did=${encodeQuery(did)}`,
+  null,
+  (body) => {
+    if (body.cid !== importSourceCommit || body.rev !== importSourceRev) {
+      throw new Error(`importRepo did not restore source head: ${JSON.stringify(body)}`);
+    }
+  },
+);
+latestCommit = importedHead.cid;
+latestRev = importedHead.rev;
+
+await expectJsonStatus(
+  "import removed probe",
+  "GET",
+  `/xrpc/com.atproto.repo.getRecord?repo=${encodeQuery(did)}&collection=${encodeQuery(collection)}&rkey=${encodeQuery(importProbeRkey)}`,
+  null,
+  404,
+);
+
+const listReposAfterImport = await expectJson(
+  "list repos after import",
+  "GET",
+  "/xrpc/com.atproto.sync.listRepos?limit=500",
+  null,
+  (body) => {
+    const hostedRepo = body.repos?.find((repo) => repo.did === did);
+    if (!hostedRepo || hostedRepo.head !== latestCommit || hostedRepo.rev !== latestRev) {
+      throw new Error(`listRepos returned stale imported repo state: ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+const reposByCollectionAfterImport = await expectJson(
+  "list repos by collection after import",
+  "GET",
+  `/xrpc/com.atproto.sync.listReposByCollection?collection=${encodeQuery(collection)}&limit=500`,
+  null,
+  (body) => {
+    const hostedRepo = body.repos?.find((repo) => repo.did === did);
+    if (!hostedRepo) {
+      throw new Error(`listReposByCollection lost imported repo ${did}: ${JSON.stringify(body)}`);
+    }
+  },
+);
+
 const atRepoUri = `at://${did}`;
 const atRecordUri = `${atRepoUri}/${collection}/${rkey}`;
 const pdslsRepoUrl = `https://pdsls.dev/${atRepoUri}`;
@@ -517,6 +613,12 @@ console.log(
       blocksCarBytes: blocksCarBytes.byteLength,
       diffCarBytes: diffCarBytes.byteLength,
       missingBlockStatus: missingBlock.status,
+      importSourceCommit,
+      importSourceRev,
+      importProbeCommit: importProbe.commit.cid,
+      importProbeRemoved: true,
+      listedReposAfterImport: listReposAfterImport.repos.length,
+      listedReposByCollectionAfterImport: reposByCollectionAfterImport.repos.length,
       pdslsRepoUrl,
       pdslsRecordUrl,
       generatedSigningKey: config.signingKeyHex ? false : true,
@@ -564,6 +666,15 @@ async function expectBytes(label, method, path, body, validate = undefined, extr
   }
   await validate?.(response, bytes);
   return bytes;
+}
+
+async function expectStatus(label, method, path, body, expectedStatus, extraHeaders = {}) {
+  const response = await request(method, path, body, extraHeaders);
+  const text = await response.text();
+  if (response.status !== expectedStatus) {
+    throw new Error(`${label} returned status=${response.status}, expected ${expectedStatus}: ${text}`);
+  }
+  return { status: response.status, body: text };
 }
 
 async function expectJsonStatus(label, method, path, body, expectedStatus) {
@@ -644,6 +755,7 @@ async function request(method, path, body = null, extraHeaders = {}) {
   if (body !== null) {
     if (body instanceof Uint8Array) {
       payload = body;
+      headers["content-length"] = headers["content-length"] ?? String(body.byteLength);
     } else {
       headers["content-type"] = headers["content-type"] ?? "application/json";
       payload = JSON.stringify(body);

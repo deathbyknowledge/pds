@@ -15,6 +15,7 @@ pub const REPO_CREATE_RECORD: &str = "com.atproto.repo.createRecord";
 pub const REPO_PUT_RECORD: &str = "com.atproto.repo.putRecord";
 pub const REPO_DELETE_RECORD: &str = "com.atproto.repo.deleteRecord";
 pub const REPO_APPLY_WRITES: &str = "com.atproto.repo.applyWrites";
+pub const REPO_IMPORT_REPO: &str = "com.atproto.repo.importRepo";
 pub const REPO_UPLOAD_BLOB: &str = "com.atproto.repo.uploadBlob";
 pub const REPO_LIST_MISSING_BLOBS: &str = "com.atproto.repo.listMissingBlobs";
 pub const SYNC_GET_LATEST_COMMIT: &str = "com.atproto.sync.getLatestCommit";
@@ -92,6 +93,7 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | REPO_PUT_RECORD
         | REPO_DELETE_RECORD
         | REPO_APPLY_WRITES
+        | REPO_IMPORT_REPO
         | REPO_UPLOAD_BLOB
         | REPO_LIST_MISSING_BLOBS => Ok(XrpcRoute::HostRepoObject),
         REPO_DESCRIBE_REPO | REPO_GET_RECORD | REPO_LIST_RECORDS => {
@@ -268,6 +270,7 @@ mod tests {
             REPO_PUT_RECORD,
             REPO_DELETE_RECORD,
             REPO_APPLY_WRITES,
+            REPO_IMPORT_REPO,
             REPO_UPLOAD_BLOB,
             REPO_LIST_MISSING_BLOBS,
         ] {
