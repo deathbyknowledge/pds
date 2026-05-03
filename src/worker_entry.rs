@@ -31,6 +31,11 @@ use crate::do_store::{
     SqlDirectoryStore, SqlRepoStore,
 };
 use crate::identity::{IdentityError, RepoSigningKey};
+use crate::oauth::{
+    authorization_server_metadata, is_oauth_well_known_path, protected_resource_metadata,
+    OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_PAR_PATH,
+    OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_TOKEN_PATH,
+};
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
 };
@@ -73,8 +78,32 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
         .split('/')
         .collect::<Vec<_>>();
 
+    if req.method() == Method::Options {
+        return empty_response(204);
+    }
+
     if req.method() == Method::Get && url.path() == "/xrpc/_health" {
         return health_response();
+    }
+
+    if req.method() == Method::Get && is_oauth_well_known_path(url.path()) {
+        return oauth_metadata_response(&url);
+    }
+
+    if parts.len() >= 2 && parts[0] == "oauth" {
+        let Some(host) = url.host_str() else {
+            return json_response(
+                400,
+                &json!({
+                    "error": "InvalidRequest",
+                    "message": "request host is required",
+                }),
+            );
+        };
+        let namespace = env.durable_object("DIRECTORY_OBJECTS")?;
+        let id = namespace.id_from_name(host)?;
+        let stub = id.get_stub()?;
+        return stub.fetch_with_request(req).await;
     }
 
     if req.method() == Method::Get && is_host_identity_path(url.path()) {
@@ -172,6 +201,11 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "recordDelete": "DELETE /repos/:name/records",
                 "recordRead": "GET /repos/:name/records?path=collection/rkey",
                 "recordList": "GET /repos/:name/records?collection=nsid",
+                "oauthProtectedResource": "GET /.well-known/oauth-protected-resource",
+                "oauthAuthorizationServer": "GET /.well-known/oauth-authorization-server",
+                "oauthPar": "POST /oauth/par",
+                "oauthAuthorize": "GET /oauth/authorize",
+                "oauthToken": "POST /oauth/token",
                 "xrpcDescribeServer": "GET /xrpc/com.atproto.server.describeServer",
                 "xrpcCreateAccount": "POST /xrpc/com.atproto.server.createAccount",
                 "xrpcCreateSession": "POST /xrpc/com.atproto.server.createSession",
@@ -332,6 +366,19 @@ impl PdsDirectoryObject {
             && parts[1] == SYNC_SUBSCRIBE_REPOS
         {
             return self.xrpc_subscribe_repos(req, &url);
+        }
+        if parts.len() >= 2 && parts[0] == "oauth" {
+            return match (req.method(), url.path()) {
+                (Method::Get, OAUTH_AUTHORIZE_PATH) => self.oauth_authorize(),
+                (Method::Post, OAUTH_PAR_PATH) => {
+                    self.oauth_pushed_authorization_request(req).await
+                }
+                (Method::Post, OAUTH_TOKEN_PATH) => self.oauth_token(req).await,
+                (_, OAUTH_AUTHORIZE_PATH | OAUTH_PAR_PATH | OAUTH_TOKEN_PATH) => {
+                    Err(HttpError::new(405, "method not allowed"))
+                }
+                _ => Err(HttpError::new(404, "unsupported OAuth endpoint")),
+            };
         }
         if parts.len() >= 2 && parts[0] == "xrpc" {
             return match (req.method(), parts[1]) {
@@ -594,6 +641,40 @@ impl PdsDirectoryObject {
                 "accountCount": store.account_count().map_err(HttpError::worker)?,
                 "status": "active",
             }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn oauth_authorize(&self) -> Result<Response, HttpError> {
+        oauth_error_response(
+            501,
+            "temporarily_unavailable",
+            "OAuth authorization UI is not implemented yet",
+        )
+        .map_err(HttpError::worker)
+    }
+
+    async fn oauth_pushed_authorization_request(
+        &self,
+        req: &mut Request,
+    ) -> Result<Response, HttpError> {
+        ensure_form_urlencoded(req)?;
+        let _ = req.text().await.map_err(HttpError::worker)?;
+        oauth_error_response(
+            501,
+            "temporarily_unavailable",
+            "OAuth pushed authorization requests are not implemented yet",
+        )
+        .map_err(HttpError::worker)
+    }
+
+    async fn oauth_token(&self, req: &mut Request) -> Result<Response, HttpError> {
+        ensure_form_urlencoded(req)?;
+        let _ = req.text().await.map_err(HttpError::worker)?;
+        oauth_error_response(
+            501,
+            "temporarily_unavailable",
+            "OAuth token exchange is not implemented yet",
         )
         .map_err(HttpError::worker)
     }
@@ -2955,6 +3036,23 @@ fn ensure_import_repo_content_type(req: &Request) -> Result<(), HttpError> {
     }
 }
 
+fn ensure_form_urlencoded(req: &Request) -> Result<(), HttpError> {
+    let content_type = req
+        .headers()
+        .get("content-type")
+        .map_err(HttpError::worker)?
+        .and_then(|value| value.split(';').next().map(|part| part.trim().to_string()))
+        .unwrap_or_default();
+    if content_type == "application/x-www-form-urlencoded" {
+        Ok(())
+    } else {
+        Err(HttpError::new(
+            415,
+            "OAuth endpoint requires content-type application/x-www-form-urlencoded",
+        ))
+    }
+}
+
 fn ensure_import_repo_size_limit(byte_len: u64) -> Result<(), HttpError> {
     if byte_len > MAX_IMPORT_REPO_BYTES as u64 {
         Err(HttpError::new(
@@ -3376,6 +3474,21 @@ fn describe_server(url: &worker::Url) -> worker::Result<Response> {
     )
 }
 
+fn oauth_metadata_response(url: &worker::Url) -> worker::Result<Response> {
+    let origin = request_origin(url);
+    let metadata = match url.path() {
+        OAUTH_PROTECTED_RESOURCE_PATH => protected_resource_metadata(&origin),
+        OAUTH_AUTHORIZATION_SERVER_PATH => authorization_server_metadata(&origin),
+        _ => json!({}),
+    };
+    let mut response = Response::from_json(&metadata)?.with_status(200);
+    response
+        .headers_mut()
+        .set("cache-control", "public, max-age=300")?;
+    set_cors(&mut response)?;
+    Ok(response)
+}
+
 fn did_document(
     did: &str,
     handle: &str,
@@ -3550,6 +3663,21 @@ fn json_response(status: u16, value: &impl Serialize) -> worker::Result<Response
     Ok(response)
 }
 
+fn oauth_error_response(
+    status: u16,
+    error: &str,
+    error_description: &str,
+) -> worker::Result<Response> {
+    let mut response = Response::from_json(&json!({
+        "error": error,
+        "error_description": error_description,
+    }))?
+    .with_status(status);
+    response.headers_mut().set("cache-control", "no-store")?;
+    set_cors(&mut response)?;
+    Ok(response)
+}
+
 fn text_response(status: u16, value: &str) -> worker::Result<Response> {
     let mut response = Response::from_bytes(value.as_bytes().to_vec())?.with_status(status);
     response.headers_mut().set("content-type", "text/plain")?;
@@ -3572,8 +3700,9 @@ fn set_cors(response: &mut Response) -> worker::Result<()> {
     )?;
     headers.set(
         "Access-Control-Allow-Headers",
-        "authorization, content-type, x-pds-admin-token",
+        "authorization, content-type, dpop, x-pds-admin-token",
     )?;
+    headers.set("Access-Control-Expose-Headers", "dpop-nonce")?;
     Ok(())
 }
 

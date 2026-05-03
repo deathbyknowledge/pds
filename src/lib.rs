@@ -11,6 +11,7 @@ pub mod do_schema;
 pub mod identity;
 pub mod model;
 pub mod mst;
+pub mod oauth;
 pub mod repo;
 pub mod repo_import;
 pub mod service;

@@ -8,9 +8,13 @@ const config = {
 };
 
 const base = new URL(config.baseUrl);
+const baseOrigin = base.origin;
 const handle = config.handle ?? base.hostname;
 const collection = "app.gsv.accountSmoke";
 const rkey = `session-${Date.now().toString(36)}`;
+
+await expectOAuthDiscovery();
+await expectOAuthScaffoldEndpoints();
 
 const created = await maybeCreateAccount();
 const session = await expectJson("create session", "POST", "/xrpc/com.atproto.server.createSession", {
@@ -131,6 +135,89 @@ async function maybeCreateAccount() {
   throw new Error(`createAccount failed status=${response.status}: ${JSON.stringify(body)}`);
 }
 
+async function expectOAuthDiscovery() {
+  await expectJson(
+    "OAuth protected resource metadata",
+    "GET",
+    "/.well-known/oauth-protected-resource",
+    null,
+    (body) => {
+      if (body.resource !== baseOrigin || body.authorization_servers?.[0] !== baseOrigin) {
+        throw new Error(`unexpected protected resource metadata ${JSON.stringify(body)}`);
+      }
+      if (!body.scopes_supported?.includes("atproto")) {
+        throw new Error(`protected resource metadata did not advertise atproto scope ${JSON.stringify(body)}`);
+      }
+    },
+  );
+
+  await expectJson(
+    "OAuth authorization server metadata",
+    "GET",
+    "/.well-known/oauth-authorization-server",
+    null,
+    (body) => {
+      if (body.issuer !== baseOrigin) {
+        throw new Error(`unexpected OAuth issuer ${JSON.stringify(body)}`);
+      }
+      if (body.authorization_endpoint !== `${baseOrigin}/oauth/authorize`) {
+        throw new Error(`unexpected authorization endpoint ${JSON.stringify(body)}`);
+      }
+      if (body.token_endpoint !== `${baseOrigin}/oauth/token`) {
+        throw new Error(`unexpected token endpoint ${JSON.stringify(body)}`);
+      }
+      if (body.pushed_authorization_request_endpoint !== `${baseOrigin}/oauth/par`) {
+        throw new Error(`unexpected PAR endpoint ${JSON.stringify(body)}`);
+      }
+      if (
+        body.require_pushed_authorization_requests !== true ||
+        body.client_id_metadata_document_supported !== true ||
+        !body.dpop_signing_alg_values_supported?.includes("ES256")
+      ) {
+        throw new Error(`OAuth metadata is missing required atproto capabilities ${JSON.stringify(body)}`);
+      }
+    },
+  );
+}
+
+async function expectOAuthScaffoldEndpoints() {
+  await expectStatus("OAuth PAR preflight", "OPTIONS", "/oauth/par", null, 204);
+  await expectOAuthStub(
+    "OAuth PAR scaffold",
+    "POST",
+    "/oauth/par",
+    "client_id=http%3A%2F%2Flocalhost&response_type=code",
+    { "content-type": "application/x-www-form-urlencoded" },
+  );
+  await expectOAuthStub("OAuth authorize scaffold", "GET", "/oauth/authorize?client_id=http%3A%2F%2Flocalhost");
+  await expectOAuthStub(
+    "OAuth token scaffold",
+    "POST",
+    "/oauth/token",
+    "grant_type=authorization_code&code=stub",
+    { "content-type": "application/x-www-form-urlencoded" },
+  );
+}
+
+async function expectOAuthStub(label, method, path, body = null, extraHeaders = {}) {
+  const response = await request(method, path, body, extraHeaders);
+  const text = await response.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${label} returned non-JSON status=${response.status}: ${text}`, {
+      cause: error,
+    });
+  }
+  if (response.status !== 501 || parsed.error !== "temporarily_unavailable") {
+    throw new Error(`${label} returned unexpected response status=${response.status}: ${JSON.stringify(parsed)}`);
+  }
+  if (parsed.error === "MethodNotFound") {
+    throw new Error(`${label} still returned MethodNotFound`);
+  }
+}
+
 async function expectJson(label, method, path, body, validate = undefined, extraHeaders = {}) {
   const response = await request(method, path, body, extraHeaders);
   const text = await response.text();
@@ -162,7 +249,9 @@ async function request(method, path, body = null, extraHeaders = {}) {
     ...extraHeaders,
   };
   let requestBody = body;
-  if (body && !(body instanceof Uint8Array)) {
+  if (typeof body === "string") {
+    requestBody = body;
+  } else if (body && !(body instanceof Uint8Array)) {
     headers["content-type"] = headers["content-type"] ?? "application/json";
     requestBody = JSON.stringify(body);
   }
