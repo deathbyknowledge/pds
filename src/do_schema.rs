@@ -172,6 +172,7 @@ pub const CREATE_DIRECTORY_OAUTH_PAR_REQUESTS: &str =
     code_challenge        TEXT NOT NULL,
     code_challenge_method TEXT NOT NULL,
     login_hint            TEXT,
+    dpop_jkt              TEXT NOT NULL DEFAULT '',
     dpop_nonce            TEXT NOT NULL,
     params_json           TEXT NOT NULL,
     expires_at            INTEGER NOT NULL,
@@ -195,6 +196,7 @@ pub const CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES: &str =
     code_challenge_method TEXT NOT NULL,
     did                   TEXT NOT NULL,
     handle                TEXT NOT NULL,
+    dpop_jkt              TEXT NOT NULL DEFAULT '',
     dpop_nonce            TEXT NOT NULL,
     expires_at            INTEGER NOT NULL,
     consumed_at           INTEGER,
@@ -208,6 +210,18 @@ pub const CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES_EXPIRES_INDEX: &str =
 pub const CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES_DID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_directory_oauth_authorization_codes_did
      ON directory_oauth_authorization_codes(did)";
+
+pub const CREATE_DIRECTORY_DPOP_JTIS: &str = "CREATE TABLE IF NOT EXISTS directory_dpop_jtis (
+    jkt        TEXT NOT NULL,
+    jti        TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (jkt, jti)
+)";
+
+pub const CREATE_DIRECTORY_DPOP_JTIS_EXPIRES_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_dpop_jtis_expires_at
+     ON directory_dpop_jtis(expires_at)";
 
 pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_REPOS,
@@ -225,6 +239,8 @@ pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES,
     CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES_EXPIRES_INDEX,
     CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES_DID_INDEX,
+    CREATE_DIRECTORY_DPOP_JTIS,
+    CREATE_DIRECTORY_DPOP_JTIS_EXPIRES_INDEX,
 ];
 
 #[cfg(test)]
@@ -309,5 +325,7 @@ mod tests {
         assert!(joined.contains("directory_oauth_authorization_codes"));
         assert!(joined.contains("request_uri           TEXT NOT NULL UNIQUE"));
         assert!(joined.contains("consumed_at           INTEGER"));
+        assert!(joined.contains("dpop_jkt"));
+        assert!(joined.contains("directory_dpop_jtis"));
     }
 }

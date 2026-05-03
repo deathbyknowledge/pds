@@ -30,6 +30,10 @@ pub struct TokenClaims {
     pub client_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpop_jkt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dpop_nonce: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -166,6 +170,8 @@ pub fn session_claims(
         handle: handle.to_string(),
         client_id: None,
         oauth_scope: None,
+        dpop_jkt: None,
+        dpop_nonce: None,
     }
 }
 
@@ -178,10 +184,14 @@ pub fn oauth_session_claims(
     ttl_seconds: i64,
     client_id: &str,
     oauth_scope: &str,
+    dpop_jkt: &str,
+    dpop_nonce: &str,
 ) -> TokenClaims {
     let mut claims = session_claims(did, handle, jti, scope, now, ttl_seconds);
     claims.client_id = Some(client_id.to_string());
     claims.oauth_scope = Some(oauth_scope.to_string());
+    claims.dpop_jkt = Some(dpop_jkt.to_string());
+    claims.dpop_nonce = Some(dpop_nonce.to_string());
     claims
 }
 

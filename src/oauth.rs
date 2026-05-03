@@ -161,6 +161,88 @@ fn oauth_scopes() -> Vec<&'static str> {
     vec!["atproto", "transition:generic", "transition:email"]
 }
 
+pub fn is_localhost_client_id(client_id: &str) -> bool {
+    Url::parse(client_id).is_ok_and(|url| {
+        url.scheme() == "http"
+            && url.host_str() == Some("localhost")
+            && url.port().is_none()
+            && url.path() == "/"
+    })
+}
+
+pub fn validate_client_metadata(
+    client_id: &str,
+    metadata: Option<&Value>,
+    redirect_uri: &str,
+    scope: &str,
+) -> Result<(), OAuthRequestError> {
+    if is_localhost_client_id(client_id) {
+        return validate_localhost_client_metadata(client_id, redirect_uri, scope);
+    }
+
+    let metadata = metadata.ok_or_else(|| {
+        invalid_param(
+            "client_id",
+            "client metadata document is required".to_string(),
+        )
+    })?;
+    if metadata.get("client_id").and_then(Value::as_str) != Some(client_id) {
+        return Err(invalid_param(
+            "client_id",
+            "client metadata client_id did not match".to_string(),
+        ));
+    }
+    if !json_array_contains(metadata.get("grant_types"), "authorization_code") {
+        return Err(invalid_param(
+            "client_id",
+            "client metadata must include authorization_code grant".to_string(),
+        ));
+    }
+    if !json_array_contains(metadata.get("response_types"), "code") {
+        return Err(invalid_param(
+            "client_id",
+            "client metadata must include code response type".to_string(),
+        ));
+    }
+    if metadata
+        .get("dpop_bound_access_tokens")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err(invalid_param(
+            "client_id",
+            "client metadata must require DPoP-bound access tokens".to_string(),
+        ));
+    }
+    if metadata
+        .get("token_endpoint_auth_method")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        != "none"
+    {
+        return Err(OAuthRequestError::UnsupportedClientAuthentication);
+    }
+    if !metadata
+        .get("redirect_uris")
+        .and_then(Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some(redirect_uri))
+        })
+    {
+        return Err(invalid_param(
+            "redirect_uri",
+            "redirect_uri is not declared by client metadata".to_string(),
+        ));
+    }
+    let declared_scope = metadata
+        .get("scope")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_param("scope", "client metadata must declare scope".to_string()))?;
+    validate_requested_scope_subset(declared_scope, scope)
+}
+
 pub fn parse_authorization_request(
     params: &[(String, String)],
 ) -> Result<AuthorizationRequest, OAuthRequestError> {
@@ -500,6 +582,78 @@ fn validate_scope(value: &str) -> Result<(), OAuthRequestError> {
     Ok(())
 }
 
+fn validate_localhost_client_metadata(
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+) -> Result<(), OAuthRequestError> {
+    let url =
+        Url::parse(client_id).map_err(|error| invalid_param("client_id", error.to_string()))?;
+    let declared_redirects = url
+        .query_pairs()
+        .filter(|(key, _)| key == "redirect_uri")
+        .map(|(_, value)| value.to_string())
+        .collect::<Vec<_>>();
+    let declared_redirects = if declared_redirects.is_empty() {
+        vec!["http://127.0.0.1/".to_string(), "http://[::1]/".to_string()]
+    } else {
+        declared_redirects
+    };
+    if !declared_redirects
+        .iter()
+        .any(|declared| localhost_redirect_matches(declared, redirect_uri))
+    {
+        return Err(invalid_param(
+            "redirect_uri",
+            "redirect_uri is not declared by localhost client metadata".to_string(),
+        ));
+    }
+
+    let declared_scope = url
+        .query_pairs()
+        .find(|(key, _)| key == "scope")
+        .map(|(_, value)| value.to_string())
+        .unwrap_or_else(|| "atproto".to_string());
+    validate_requested_scope_subset(&declared_scope, scope)
+}
+
+fn localhost_redirect_matches(declared: &str, requested: &str) -> bool {
+    let Ok(declared) = Url::parse(declared) else {
+        return false;
+    };
+    let Ok(requested) = Url::parse(requested) else {
+        return false;
+    };
+    declared.scheme() == "http"
+        && requested.scheme() == "http"
+        && is_loopback_host(declared.host_str())
+        && is_loopback_host(requested.host_str())
+        && declared.host_str() == requested.host_str()
+        && declared.path() == requested.path()
+}
+
+fn validate_requested_scope_subset(
+    declared_scope: &str,
+    requested_scope: &str,
+) -> Result<(), OAuthRequestError> {
+    let declared = declared_scope.split_whitespace().collect::<BTreeSet<_>>();
+    for requested in requested_scope.split_whitespace() {
+        if !declared.contains(requested) {
+            return Err(invalid_param(
+                "scope",
+                format!("scope `{requested}` is not declared by client metadata"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn json_array_contains(value: Option<&Value>, needle: &str) -> bool {
+    value
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(needle)))
+}
+
 fn validate_request_uri(value: &str) -> Result<(), OAuthRequestError> {
     validate_nonempty_length("request_uri", value, 2048)?;
     if value
@@ -696,6 +850,57 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn validates_localhost_client_metadata_from_query_params() {
+        validate_client_metadata(
+            "http://localhost?redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback&scope=atproto%20transition%3Ageneric",
+            None,
+            "http://127.0.0.1:4321/callback",
+            "atproto transition:generic",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rejects_scope_not_declared_by_client_metadata() {
+        let error = validate_client_metadata(
+            "http://localhost?redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback&scope=atproto",
+            None,
+            "http://127.0.0.1/callback",
+            "atproto transition:generic",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OAuthRequestError::InvalidParameter {
+                parameter: "scope",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validates_public_client_metadata_document() {
+        let metadata = json!({
+            "client_id": "https://client.example.com/oauth.json",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "redirect_uris": ["https://client.example.com/callback"],
+            "scope": "atproto transition:generic",
+            "dpop_bound_access_tokens": true,
+            "token_endpoint_auth_method": "none",
+        });
+
+        validate_client_metadata(
+            "https://client.example.com/oauth.json",
+            Some(&metadata),
+            "https://client.example.com/callback",
+            "atproto",
+        )
+        .unwrap();
     }
 
     #[test]

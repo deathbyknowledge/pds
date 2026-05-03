@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, randomUUID, sign as cryptoSign } from "node:crypto";
 
 const config = {
   baseUrl: requiredEnv("PDS_BASE_URL").replace(/\/+$/, ""),
@@ -13,6 +13,8 @@ const baseOrigin = base.origin;
 const handle = config.handle ?? base.hostname;
 const collection = "app.gsv.accountSmoke";
 const rkey = `session-${Date.now().toString(36)}`;
+const dpopKey = generateKeyPairSync("ec", { namedCurve: "P-256" });
+const dpopPublicJwk = dpopKey.publicKey.export({ format: "jwk" });
 
 await expectOAuthDiscovery();
 const oauthPar = await expectOAuthParEndpoint();
@@ -52,9 +54,15 @@ await expectJson(
       throw new Error(`unexpected OAuth getSession response ${JSON.stringify(body)}`);
     }
   },
-  { authorization: `DPoP ${oauthToken.access_token}` },
+  {
+    authorization: `DPoP ${oauthToken.access_token}`,
+    dpop: dpopProof("GET", "/xrpc/com.atproto.server.getSession", {
+      accessToken: oauthToken.access_token,
+      nonce: oauthToken.dpopNonce,
+    }),
+  },
 );
-await expectOAuthRefresh(oauthPar.clientId, oauthToken.refresh_token);
+await expectOAuthRefresh(oauthPar.clientId, oauthToken.refresh_token, oauthToken.dpopNonce);
 
 const createRecord = await expectJson(
   "account createRecord",
@@ -200,8 +208,9 @@ async function expectOAuthDiscovery() {
 async function expectOAuthParEndpoint() {
   await expectStatus("OAuth PAR preflight", "OPTIONS", "/oauth/par", null, 204);
   const state = `state-${Date.now().toString(36)}`;
-  const clientId = "http://localhost";
   const redirectUri = "http://127.0.0.1/callback";
+  const scope = "atproto transition:generic";
+  const clientId = `http://localhost?redirect_uri=${encodeQuery(redirectUri)}&scope=${encodeQuery(scope)}`;
   const codeVerifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
   const parBody = new URLSearchParams({
     client_id: clientId,
@@ -210,9 +219,10 @@ async function expectOAuthParEndpoint() {
     code_challenge_method: "S256",
     state,
     redirect_uri: redirectUri,
-    scope: "atproto transition:generic",
+    scope,
     login_hint: handle,
   }).toString();
+  let parDpopNonce;
   const par = await expectJson(
     "OAuth PAR",
     "POST",
@@ -229,8 +239,12 @@ async function expectOAuthParEndpoint() {
       if (!response.headers.get("dpop-nonce")) {
         throw new Error(`OAuth PAR response did not include DPoP-Nonce header`);
       }
+      parDpopNonce = response.headers.get("dpop-nonce");
     },
-    { "content-type": "application/x-www-form-urlencoded" },
+    {
+      "content-type": "application/x-www-form-urlencoded",
+      dpop: dpopProof("POST", "/oauth/par"),
+    },
   );
   await expectStatus(
     "OAuth duplicate PAR state",
@@ -238,7 +252,10 @@ async function expectOAuthParEndpoint() {
     "/oauth/par",
     parBody,
     400,
-    { "content-type": "application/x-www-form-urlencoded" },
+    {
+      "content-type": "application/x-www-form-urlencoded",
+      dpop: dpopProof("POST", "/oauth/par"),
+    },
   );
   if (!par.request_uri) {
     throw new Error(`OAuth PAR response did not include request_uri`);
@@ -256,6 +273,7 @@ async function expectOAuthParEndpoint() {
     requestUri: par.request_uri,
     state,
     codeVerifier,
+    dpopNonce: parDpopNonce,
   };
 }
 
@@ -318,8 +336,12 @@ async function expectOAuthTokenExchange(par) {
       if (!response.headers.get("dpop-nonce")) {
         throw new Error(`OAuth token response did not include DPoP-Nonce header`);
       }
+      body.dpopNonce = response.headers.get("dpop-nonce");
     },
-    { "content-type": "application/x-www-form-urlencoded" },
+    {
+      "content-type": "application/x-www-form-urlencoded",
+      dpop: dpopProof("POST", "/oauth/token", { nonce: par.dpopNonce }),
+    },
   );
   await expectStatus(
     "OAuth authorization code replay",
@@ -327,12 +349,15 @@ async function expectOAuthTokenExchange(par) {
     "/oauth/token",
     body,
     400,
-    { "content-type": "application/x-www-form-urlencoded" },
+    {
+      "content-type": "application/x-www-form-urlencoded",
+      dpop: dpopProof("POST", "/oauth/token", { nonce: par.dpopNonce }),
+    },
   );
   return token;
 }
 
-async function expectOAuthRefresh(clientId, refreshToken) {
+async function expectOAuthRefresh(clientId, refreshToken, dpopNonce) {
   const refreshed = await expectJson(
     "OAuth refresh token",
     "POST",
@@ -349,8 +374,12 @@ async function expectOAuthRefresh(clientId, refreshToken) {
       if (!response.headers.get("dpop-nonce")) {
         throw new Error(`OAuth refresh response did not include DPoP-Nonce header`);
       }
+      body.dpopNonce = response.headers.get("dpop-nonce");
     },
-    { "content-type": "application/x-www-form-urlencoded" },
+    {
+      "content-type": "application/x-www-form-urlencoded",
+      dpop: dpopProof("POST", "/oauth/token", { nonce: dpopNonce }),
+    },
   );
   await expectStatus(
     "OAuth refresh token replay",
@@ -362,7 +391,10 @@ async function expectOAuthRefresh(clientId, refreshToken) {
       refresh_token: refreshToken,
     }).toString(),
     400,
-    { "content-type": "application/x-www-form-urlencoded" },
+    {
+      "content-type": "application/x-www-form-urlencoded",
+      dpop: dpopProof("POST", "/oauth/token", { nonce: dpopNonce }),
+    },
   );
   return refreshed;
 }
@@ -430,6 +462,42 @@ function encodeQuery(value) {
 
 function pkceS256Challenge(verifier) {
   return base64Url(createHash("sha256").update(verifier).digest());
+}
+
+function dpopProof(method, path, { accessToken = undefined, nonce = undefined } = {}) {
+  const htu = `${baseOrigin}${new URL(path, baseOrigin).pathname}`;
+  const header = {
+    typ: "dpop+jwt",
+    alg: "ES256",
+    jwk: {
+      kty: dpopPublicJwk.kty,
+      crv: dpopPublicJwk.crv,
+      x: dpopPublicJwk.x,
+      y: dpopPublicJwk.y,
+    },
+  };
+  const payload = {
+    jti: randomUUID(),
+    htm: method,
+    htu,
+    iat: Math.floor(Date.now() / 1000),
+  };
+  if (nonce) {
+    payload.nonce = nonce;
+  }
+  if (accessToken) {
+    payload.ath = base64Url(createHash("sha256").update(accessToken).digest());
+  }
+  const signingInput = `${base64UrlJson(header)}.${base64UrlJson(payload)}`;
+  const signature = cryptoSign("sha256", Buffer.from(signingInput), {
+    key: dpopKey.privateKey,
+    dsaEncoding: "ieee-p1363",
+  });
+  return `${signingInput}.${base64Url(signature)}`;
+}
+
+function base64UrlJson(value) {
+  return base64Url(Buffer.from(JSON.stringify(value)));
 }
 
 function base64Url(bytes) {

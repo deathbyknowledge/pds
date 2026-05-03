@@ -99,6 +99,7 @@ pub struct DirectoryOauthParRequestInput {
     pub code_challenge: String,
     pub code_challenge_method: String,
     pub login_hint: Option<String>,
+    pub dpop_jkt: String,
     pub dpop_nonce: String,
     pub params_json: String,
     pub expires_at: i64,
@@ -114,6 +115,7 @@ pub struct DirectoryOauthParRequestRow {
     pub code_challenge: String,
     pub code_challenge_method: String,
     pub login_hint: Option<String>,
+    pub dpop_jkt: String,
     pub dpop_nonce: String,
     pub params_json: String,
     pub expires_at: i64,
@@ -131,6 +133,7 @@ pub struct DirectoryOauthAuthorizationCodeInput {
     pub code_challenge_method: String,
     pub did: Did,
     pub handle: String,
+    pub dpop_jkt: String,
     pub dpop_nonce: String,
     pub expires_at: i64,
 }
@@ -147,6 +150,7 @@ pub struct DirectoryOauthAuthorizationCodeRow {
     pub code_challenge_method: String,
     pub did: Did,
     pub handle: String,
+    pub dpop_jkt: String,
     pub dpop_nonce: String,
     pub expires_at: i64,
 }
@@ -601,6 +605,8 @@ impl SqlDirectoryStore {
             "ALTER TABLE directory_accounts ADD COLUMN public_key_multibase TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE directory_accounts ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE directory_accounts ADD COLUMN status TEXT",
+            "ALTER TABLE directory_oauth_par_requests ADD COLUMN dpop_jkt TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE directory_oauth_authorization_codes ADD COLUMN dpop_jkt TEXT NOT NULL DEFAULT ''",
         ] {
             exec_ignore_duplicate_column(&self.sql, statement)?;
         }
@@ -751,9 +757,9 @@ impl SqlDirectoryStore {
         self.sql.exec(
             "INSERT INTO directory_oauth_par_requests (
                 request_uri, client_id, redirect_uri, scope, state, code_challenge,
-                code_challenge_method, login_hint, dpop_nonce, params_json, expires_at
+                code_challenge_method, login_hint, dpop_jkt, dpop_nonce, params_json, expires_at
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(row.request_uri.clone()),
                 SqlStorageValue::from(row.client_id.clone()),
@@ -763,6 +769,7 @@ impl SqlDirectoryStore {
                 SqlStorageValue::from(row.code_challenge.clone()),
                 SqlStorageValue::from(row.code_challenge_method.clone()),
                 optional_text(row.login_hint.clone()),
+                SqlStorageValue::from(row.dpop_jkt.clone()),
                 SqlStorageValue::from(row.dpop_nonce.clone()),
                 SqlStorageValue::from(row.params_json.clone()),
                 SqlStorageValue::from(row.expires_at),
@@ -781,7 +788,7 @@ impl SqlDirectoryStore {
             .exec(
                 "SELECT
                     request_uri, client_id, redirect_uri, scope, state, code_challenge,
-                    code_challenge_method, login_hint, dpop_nonce, params_json, expires_at
+                    code_challenge_method, login_hint, dpop_jkt, dpop_nonce, params_json, expires_at
                  FROM directory_oauth_par_requests
                  WHERE request_uri = ? AND expires_at > ?
                  LIMIT 1",
@@ -842,9 +849,9 @@ impl SqlDirectoryStore {
         self.sql.exec(
             "INSERT INTO directory_oauth_authorization_codes (
                 code, request_uri, client_id, redirect_uri, scope, state, code_challenge,
-                code_challenge_method, did, handle, dpop_nonce, expires_at
+                code_challenge_method, did, handle, dpop_jkt, dpop_nonce, expires_at
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(row.code.clone()),
                 SqlStorageValue::from(row.request_uri.clone()),
@@ -856,6 +863,7 @@ impl SqlDirectoryStore {
                 SqlStorageValue::from(row.code_challenge_method.clone()),
                 SqlStorageValue::from(row.did.to_string()),
                 SqlStorageValue::from(row.handle.clone()),
+                SqlStorageValue::from(row.dpop_jkt.clone()),
                 SqlStorageValue::from(row.dpop_nonce.clone()),
                 SqlStorageValue::from(row.expires_at),
             ],
@@ -873,7 +881,7 @@ impl SqlDirectoryStore {
             .exec(
                 "SELECT
                     code, request_uri, client_id, redirect_uri, scope, state, code_challenge,
-                    code_challenge_method, did, handle, dpop_nonce, expires_at
+                    code_challenge_method, did, handle, dpop_jkt, dpop_nonce, expires_at
                  FROM directory_oauth_authorization_codes
                  WHERE code = ? AND expires_at > ? AND consumed_at IS NULL
                  LIMIT 1",
@@ -906,6 +914,43 @@ impl SqlDirectoryStore {
     pub fn purge_expired_oauth_authorization_codes(&self, now: i64) -> worker::Result<()> {
         self.sql.exec(
             "DELETE FROM directory_oauth_authorization_codes WHERE expires_at <= ?",
+            vec![SqlStorageValue::from(now)],
+        )?;
+        Ok(())
+    }
+
+    pub fn has_dpop_jti(&self, jkt: &str, jti: &str) -> worker::Result<bool> {
+        let rows: Vec<CountRow> = self
+            .sql
+            .exec(
+                "SELECT COUNT(*) AS n
+                 FROM directory_dpop_jtis
+                 WHERE jkt = ? AND jti = ?",
+                vec![
+                    SqlStorageValue::from(jkt.to_string()),
+                    SqlStorageValue::from(jti.to_string()),
+                ],
+            )?
+            .to_array()?;
+        Ok(rows.first().is_some_and(|row| row.n > 0))
+    }
+
+    pub fn insert_dpop_jti(&self, jkt: &str, jti: &str, expires_at: i64) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO directory_dpop_jtis (jkt, jti, expires_at)
+             VALUES (?, ?, ?)",
+            vec![
+                SqlStorageValue::from(jkt.to_string()),
+                SqlStorageValue::from(jti.to_string()),
+                SqlStorageValue::from(expires_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn purge_expired_dpop_jtis(&self, now: i64) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM directory_dpop_jtis WHERE expires_at <= ?",
             vec![SqlStorageValue::from(now)],
         )?;
         Ok(())
@@ -1342,6 +1387,7 @@ fn directory_oauth_par_request_from_row(
         code_challenge: row.code_challenge,
         code_challenge_method: row.code_challenge_method,
         login_hint: row.login_hint,
+        dpop_jkt: row.dpop_jkt,
         dpop_nonce: row.dpop_nonce,
         params_json: row.params_json,
         expires_at: row.expires_at,
@@ -1362,6 +1408,7 @@ fn directory_oauth_authorization_code_from_row(
         code_challenge_method: row.code_challenge_method,
         did: Did::new(row.did).map_err(worker_error)?,
         handle: row.handle,
+        dpop_jkt: row.dpop_jkt,
         dpop_nonce: row.dpop_nonce,
         expires_at: row.expires_at,
     })
@@ -1424,6 +1471,7 @@ struct DirectoryOauthParRequestStorageRow {
     code_challenge: String,
     code_challenge_method: String,
     login_hint: Option<String>,
+    dpop_jkt: String,
     dpop_nonce: String,
     params_json: String,
     expires_at: i64,
@@ -1441,6 +1489,7 @@ struct DirectoryOauthAuthorizationCodeStorageRow {
     code_challenge_method: String,
     did: String,
     handle: String,
+    dpop_jkt: String,
     dpop_nonce: String,
     expires_at: i64,
 }

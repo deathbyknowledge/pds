@@ -13,9 +13,9 @@ use serde_json::{from_str, json, to_string, Value};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::{JsCast, JsValue};
 use worker::{
-    durable_object, event, Context, DurableObject, Env, FixedLengthStream, Headers, HttpMetadata,
-    Method, Request, RequestInit, Response, ResponseBody, SqlStorage, State, WebSocket,
-    WebSocketIncomingMessage, WebSocketPair,
+    durable_object, event, Context, DurableObject, Env, Fetch, FixedLengthStream, Headers,
+    HttpMetadata, Method, Request, RequestInit, Response, ResponseBody, SqlStorage, State,
+    WebSocket, WebSocketIncomingMessage, WebSocketPair,
 };
 
 use crate::auth::{
@@ -33,13 +33,14 @@ use crate::do_store::{
     DirectorySessionRow, RepoBlobRow, RepoCommitEventInput, RepoIdentityRow, RepoStateRow,
     SqlDirectoryStore, SqlRepoStore,
 };
+use crate::dpop::{dpop_htu, verify_dpop_proof, DpopError, VerifiedDpopProof};
 use crate::identity::{IdentityError, RepoSigningKey};
 use crate::oauth::{
-    authorization_server_metadata, is_oauth_well_known_path, parse_authorization_request,
-    parse_pushed_authorization_request, parse_token_request, protected_resource_metadata,
-    OAuthRequestError, TokenRequest, OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH,
-    OAUTH_PAR_EXPIRES_IN_SECONDS, OAUTH_PAR_PATH, OAUTH_PROTECTED_RESOURCE_PATH,
-    OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
+    authorization_server_metadata, is_localhost_client_id, is_oauth_well_known_path,
+    parse_authorization_request, parse_pushed_authorization_request, parse_token_request,
+    protected_resource_metadata, validate_client_metadata, OAuthRequestError, TokenRequest,
+    OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_PAR_EXPIRES_IN_SECONDS,
+    OAUTH_PAR_PATH, OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
 };
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
@@ -704,6 +705,7 @@ impl PdsDirectoryObject {
                 code_challenge_method: par.code_challenge_method.clone(),
                 did: account.did,
                 handle: account.handle,
+                dpop_jkt: par.dpop_jkt.clone(),
                 dpop_nonce: par.dpop_nonce,
                 expires_at: now.saturating_add(OAUTH_AUTHORIZATION_CODE_TTL_SECONDS),
             })
@@ -728,9 +730,15 @@ impl PdsDirectoryObject {
             Ok(request) => request,
             Err(error) => return oauth_request_error_response(error).map_err(HttpError::worker),
         };
+        self.validate_oauth_client_metadata(&request).await?;
+        let dpop_proof = match verify_request_dpop(req, None, None, None) {
+            Ok(proof) => proof,
+            Err(error) => return oauth_dpop_error_response(error, None).map_err(HttpError::worker),
+        };
 
         let now = current_unix_time();
         let store = self.store();
+        self.remember_dpop_proof(&store, &dpop_proof, now)?;
         store
             .purge_expired_oauth_par_requests(now)
             .map_err(HttpError::worker)?;
@@ -763,6 +771,7 @@ impl PdsDirectoryObject {
                 code_challenge: request.code_challenge,
                 code_challenge_method: request.code_challenge_method,
                 login_hint: request.login_hint,
+                dpop_jkt: dpop_proof.jkt,
                 dpop_nonce: dpop_nonce.clone(),
                 params_json,
                 expires_at,
@@ -790,6 +799,7 @@ impl PdsDirectoryObject {
                 redirect_uri,
                 code_verifier,
             } => self.oauth_authorization_code_token(
+                req,
                 &client_id,
                 &code,
                 &redirect_uri,
@@ -798,12 +808,13 @@ impl PdsDirectoryObject {
             TokenRequest::RefreshToken {
                 client_id,
                 refresh_token,
-            } => self.oauth_refresh_token(&client_id, &refresh_token),
+            } => self.oauth_refresh_token(req, &client_id, &refresh_token),
         }
     }
 
     fn oauth_authorization_code_token(
         &self,
+        req: &Request,
         client_id: &str,
         code: &str,
         redirect_uri: &str,
@@ -839,6 +850,19 @@ impl PdsDirectoryObject {
             return oauth_error_response(400, "invalid_grant", "PKCE verification failed")
                 .map_err(HttpError::worker);
         }
+        let dpop_proof = match verify_request_dpop(
+            req,
+            Some(&authorization_code.dpop_jkt),
+            Some(&authorization_code.dpop_nonce),
+            None,
+        ) {
+            Ok(proof) => proof,
+            Err(error) => {
+                return oauth_dpop_error_response(error, Some(&authorization_code.dpop_nonce))
+                    .map_err(HttpError::worker);
+            }
+        };
+        self.remember_dpop_proof(&store, &dpop_proof, now)?;
 
         let Some(account) = store
             .get_account_by_did(&authorization_code.did)
@@ -859,6 +883,7 @@ impl PdsDirectoryObject {
             &account,
             client_id,
             &authorization_code.scope,
+            &authorization_code.dpop_jkt,
             None,
         )?;
         store
@@ -875,6 +900,7 @@ impl PdsDirectoryObject {
 
     fn oauth_refresh_token(
         &self,
+        req: &Request,
         client_id: &str,
         refresh_token: &str,
     ) -> Result<Response, HttpError> {
@@ -907,7 +933,20 @@ impl PdsDirectoryObject {
             )
             .map_err(HttpError::worker);
         };
+        let Some(dpop_jkt) = claims.dpop_jkt.as_deref() else {
+            return oauth_error_response(400, "invalid_grant", "refresh token is not DPoP-bound")
+                .map_err(HttpError::worker);
+        };
+        let dpop_proof =
+            match verify_request_dpop(req, Some(dpop_jkt), claims.dpop_nonce.as_deref(), None) {
+                Ok(proof) => proof,
+                Err(error) => {
+                    return oauth_dpop_error_response(error, claims.dpop_nonce.as_deref())
+                        .map_err(HttpError::worker);
+                }
+            };
         let store = self.store();
+        self.remember_dpop_proof(&store, &dpop_proof, now)?;
         let Some(session) = store
             .get_session_by_refresh_jti(&claims.jti)
             .map_err(HttpError::worker)?
@@ -935,6 +974,7 @@ impl PdsDirectoryObject {
             &account,
             client_id,
             scope,
+            dpop_jkt,
             Some(session.session_id),
         )?;
         store
@@ -1184,6 +1224,7 @@ impl PdsDirectoryObject {
         account: &DirectoryAccountRow,
         client_id: &str,
         oauth_scope: &str,
+        dpop_jkt: &str,
         session_id: Option<String>,
     ) -> Result<CreatedOAuthSession, HttpError> {
         let now = current_unix_time();
@@ -1193,6 +1234,7 @@ impl PdsDirectoryObject {
         };
         let access_jti = random_token_id()?;
         let refresh_jti = random_token_id()?;
+        let dpop_nonce = random_urlsafe_token::<OAUTH_DPOP_NONCE_BYTES>()?;
         let secret = token_secret_from_env(&self.env)?;
         let access_jwt = sign_token(
             &secret,
@@ -1205,6 +1247,8 @@ impl PdsDirectoryObject {
                 ACCESS_TOKEN_TTL_SECONDS,
                 client_id,
                 oauth_scope,
+                dpop_jkt,
+                &dpop_nonce,
             ),
         )
         .map_err(HttpError::auth)?;
@@ -1219,6 +1263,8 @@ impl PdsDirectoryObject {
                 REFRESH_TOKEN_TTL_SECONDS,
                 client_id,
                 oauth_scope,
+                dpop_jkt,
+                &dpop_nonce,
             ),
         )
         .map_err(HttpError::auth)?;
@@ -1233,7 +1279,7 @@ impl PdsDirectoryObject {
                 access_jwt,
                 refresh_jwt,
             },
-            dpop_nonce: random_urlsafe_token::<OAUTH_DPOP_NONCE_BYTES>()?,
+            dpop_nonce,
         })
     }
 
@@ -1242,14 +1288,34 @@ impl PdsDirectoryObject {
         req: &Request,
         scope: &str,
     ) -> Result<crate::auth::TokenClaims, HttpError> {
-        let token = bearer_token(req)?;
+        let presented = authorization_token(req)?;
         verify_token(
             &token_secret_from_env(&self.env)?,
-            &token,
+            &presented.token,
             scope,
             current_unix_time(),
         )
         .map_err(HttpError::auth)
+        .and_then(|claims| {
+            if let Some(jkt) = claims.dpop_jkt.as_deref() {
+                if presented.scheme != AuthScheme::Dpop {
+                    return Err(HttpError::new(
+                        401,
+                        "DPoP-bound token requires DPoP authorization",
+                    ));
+                }
+                let proof = verify_request_dpop(
+                    req,
+                    Some(jkt),
+                    claims.dpop_nonce.as_deref(),
+                    Some(&presented.token),
+                )
+                .map_err(|error| HttpError::new(401, error.to_string()))?;
+                let store = self.store();
+                self.remember_dpop_proof(&store, &proof, current_unix_time())?;
+            }
+            Ok(claims)
+        })
     }
 
     fn account_for_claims(
@@ -1268,6 +1334,45 @@ impl PdsDirectoryObject {
             return Err(HttpError::new(403, "AccountTakedown"));
         }
         Ok(account)
+    }
+
+    async fn validate_oauth_client_metadata(
+        &self,
+        request: &crate::oauth::PushedAuthorizationRequest,
+    ) -> Result<(), HttpError> {
+        let metadata = if is_localhost_client_id(&request.client_id) {
+            None
+        } else {
+            Some(fetch_oauth_client_metadata(&request.client_id).await?)
+        };
+        validate_client_metadata(
+            &request.client_id,
+            metadata.as_ref(),
+            &request.redirect_uri,
+            &request.scope,
+        )
+        .map_err(HttpError::bad_request)
+    }
+
+    fn remember_dpop_proof(
+        &self,
+        store: &SqlDirectoryStore,
+        proof: &VerifiedDpopProof,
+        now: i64,
+    ) -> Result<(), HttpError> {
+        store
+            .purge_expired_dpop_jtis(now)
+            .map_err(HttpError::worker)?;
+        if store
+            .has_dpop_jti(&proof.jkt, &proof.jti)
+            .map_err(HttpError::worker)?
+        {
+            return Err(HttpError::new(400, "DPoP proof replay"));
+        }
+        store
+            .insert_dpop_jti(&proof.jkt, &proof.jti, now.saturating_add(600))
+            .map_err(HttpError::worker)?;
+        Ok(())
     }
 }
 
@@ -2524,14 +2629,29 @@ impl RepoObject {
         if is_admin_authorized(&self.env, req)? {
             return Ok(());
         }
-        let token = bearer_token(req)?;
+        let presented = authorization_token(req)?;
         let claims = verify_token(
             &token_secret_from_env(&self.env)?,
-            &token,
+            &presented.token,
             ACCESS_SCOPE,
             current_unix_time(),
         )
         .map_err(HttpError::auth)?;
+        if let Some(jkt) = claims.dpop_jkt.as_deref() {
+            if presented.scheme != AuthScheme::Dpop {
+                return Err(HttpError::new(
+                    401,
+                    "DPoP-bound token requires DPoP authorization",
+                ));
+            }
+            verify_request_dpop(
+                req,
+                Some(jkt),
+                claims.dpop_nonce.as_deref(),
+                Some(&presented.token),
+            )
+            .map_err(|error| HttpError::new(401, error.to_string()))?;
+        }
         if claims.sub == did.as_str() {
             Ok(())
         } else {
@@ -3465,18 +3585,81 @@ fn token_secret_from_env(env: &Env) -> Result<String, HttpError> {
     }
 }
 
-fn bearer_token(req: &Request) -> Result<String, HttpError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AuthScheme {
+    Bearer,
+    Dpop,
+}
+
+struct PresentedToken {
+    scheme: AuthScheme,
+    token: String,
+}
+
+fn authorization_token(req: &Request) -> Result<PresentedToken, HttpError> {
     let authorization = req
         .headers()
         .get("authorization")
         .map_err(HttpError::worker)?
         .ok_or_else(|| HttpError::new(401, "authorization bearer token required"))?;
-    authorization
+    if let Some(token) = authorization
         .strip_prefix("Bearer ")
-        .or_else(|| authorization.strip_prefix("DPoP "))
         .filter(|token| !token.is_empty())
-        .map(|token| token.to_string())
-        .ok_or_else(|| HttpError::new(401, "authorization bearer token required"))
+    {
+        Ok(PresentedToken {
+            scheme: AuthScheme::Bearer,
+            token: token.to_string(),
+        })
+    } else if let Some(token) = authorization
+        .strip_prefix("DPoP ")
+        .filter(|token| !token.is_empty())
+    {
+        Ok(PresentedToken {
+            scheme: AuthScheme::Dpop,
+            token: token.to_string(),
+        })
+    } else {
+        Err(HttpError::new(401, "authorization bearer token required"))
+    }
+}
+
+fn verify_request_dpop(
+    req: &Request,
+    expected_jkt: Option<&str>,
+    expected_nonce: Option<&str>,
+    access_token: Option<&str>,
+) -> Result<VerifiedDpopProof, DpopError> {
+    let proof = req
+        .headers()
+        .get("dpop")
+        .map_err(|_| DpopError::MissingProof)?
+        .filter(|value| !value.is_empty())
+        .ok_or(DpopError::MissingProof)?;
+    let url = req.url().map_err(|_| DpopError::UriMismatch)?;
+    verify_dpop_proof(
+        &proof,
+        http_method_name(&req.method()),
+        &dpop_htu(&url),
+        current_unix_time(),
+        expected_nonce,
+        expected_jkt,
+        access_token,
+    )
+}
+
+fn http_method_name(method: &Method) -> &'static str {
+    match method {
+        Method::Get => "GET",
+        Method::Head => "HEAD",
+        Method::Post => "POST",
+        Method::Put => "PUT",
+        Method::Delete => "DELETE",
+        Method::Options => "OPTIONS",
+        Method::Connect => "CONNECT",
+        Method::Patch => "PATCH",
+        Method::Trace => "TRACE",
+        Method::Report => "REPORT",
+    }
 }
 
 fn ensure_supported_account_handle(handle: &str, request_host: &str) -> Result<(), HttpError> {
@@ -3895,6 +4078,34 @@ async fn fetch_directory_json(
         .map_err(HttpError::worker)
 }
 
+async fn fetch_oauth_client_metadata(client_id: &str) -> Result<Value, HttpError> {
+    let url = ::url::Url::parse(client_id)
+        .map_err(|error| HttpError::new(400, format!("invalid client_id: {error}")))?;
+    let mut response = Fetch::Url(url).send().await.map_err(HttpError::worker)?;
+    if response.status_code() != 200 {
+        return Err(HttpError::new(
+            400,
+            format!(
+                "client metadata fetch failed with status {}",
+                response.status_code()
+            ),
+        ));
+    }
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .map_err(HttpError::worker)?
+        .and_then(|value| value.split(';').next().map(|part| part.trim().to_string()))
+        .unwrap_or_default();
+    if !content_type.eq_ignore_ascii_case("application/json") {
+        return Err(HttpError::new(
+            400,
+            "client metadata response must have content-type application/json",
+        ));
+    }
+    response.json().await.map_err(HttpError::worker)
+}
+
 fn directory_repo_json(row: DirectoryRepoRow) -> Value {
     json!({
         "did": row.did.to_string(),
@@ -4026,6 +4237,19 @@ fn oauth_error_response(
 
 fn oauth_request_error_response(error: OAuthRequestError) -> worker::Result<Response> {
     oauth_error_response(400, error.error_code(), &error.to_string())
+}
+
+fn oauth_dpop_error_response(error: DpopError, nonce: Option<&str>) -> worker::Result<Response> {
+    let error_code = if matches!(error, DpopError::NonceMismatch) {
+        "use_dpop_nonce"
+    } else {
+        "invalid_dpop_proof"
+    };
+    let mut response = oauth_error_response(400, error_code, &error.to_string())?;
+    if let Some(nonce) = nonce {
+        response.headers_mut().set("dpop-nonce", nonce)?;
+    }
+    Ok(response)
 }
 
 fn oauth_authorization_redirect(
