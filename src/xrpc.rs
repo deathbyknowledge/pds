@@ -13,6 +13,7 @@ pub const SERVER_UPDATE_EMAIL: &str = "com.atproto.server.updateEmail";
 pub const SERVER_DEACTIVATE_ACCOUNT: &str = "com.atproto.server.deactivateAccount";
 pub const SERVER_ACTIVATE_ACCOUNT: &str = "com.atproto.server.activateAccount";
 pub const IDENTITY_RESOLVE_HANDLE: &str = "com.atproto.identity.resolveHandle";
+pub const IDENTITY_RESOLVE_DID: &str = "com.atproto.identity.resolveDid";
 pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
 pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
@@ -119,7 +120,8 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | SYNC_GET_BLOCKS
         | SYNC_GET_RECORD
         | SYNC_GET_CHECKOUT
-        | SYNC_GET_REPO => {
+        | SYNC_GET_REPO
+        | IDENTITY_RESOLVE_DID => {
             let did = required_param(query, "did")?;
             Ok(XrpcRoute::RepoObject {
                 name: repo_object_name_from_identifier(&did),
@@ -261,6 +263,16 @@ mod tests {
             )
             .unwrap(),
             XrpcRoute::Worker
+        );
+    }
+
+    #[test]
+    fn routes_identity_resolve_did_to_repo_object_by_did() {
+        assert_eq!(
+            route_xrpc_method(IDENTITY_RESOLVE_DID, &query(&[("did", "did:gsv:alice")])).unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
         );
     }
 

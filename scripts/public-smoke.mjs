@@ -49,6 +49,35 @@ await expectJson(
   },
 );
 
+await expectJson(
+  "resolve DID",
+  "GET",
+  `/xrpc/com.atproto.identity.resolveDid?did=${encodeQuery(did)}`,
+  null,
+  (body) => {
+    if (body.didDoc?.id !== did) {
+      throw new Error(`resolveDid returned ${JSON.stringify(body)}, expected DID document id ${did}`);
+    }
+    const serviceEndpoint = atprotoServiceEndpoint(body.didDoc);
+    if (serviceEndpoint !== baseOrigin) {
+      throw new Error(`resolveDid service endpoint ${serviceEndpoint}, expected ${baseOrigin}`);
+    }
+  },
+);
+
+await expectJsonStatus(
+  "unknown DID",
+  "GET",
+  `/xrpc/com.atproto.identity.resolveDid?did=${encodeQuery(`did:web:unknown-${handle}`)}`,
+  null,
+  404,
+  (body) => {
+    if (body.error !== "DidNotFound") {
+      throw new Error(`unexpected unknown DID response ${JSON.stringify(body)}`);
+    }
+  },
+);
+
 await expectJsonStatus(
   "unknown handle",
   "GET",

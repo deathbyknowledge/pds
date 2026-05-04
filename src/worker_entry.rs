@@ -53,8 +53,8 @@ use crate::repo_import::{
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 use crate::xrpc::{
     at_uri, optional_param, parse_get_blocks_params, parse_list_records_params, required_param,
-    route_xrpc_method, IDENTITY_RESOLVE_HANDLE, REPO_APPLY_WRITES, REPO_CREATE_RECORD,
-    REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
+    route_xrpc_method, IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE, REPO_APPLY_WRITES,
+    REPO_CREATE_RECORD, REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
     REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
     SERVER_ACTIVATE_ACCOUNT, SERVER_CHANGE_PASSWORD, SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION,
     SERVER_DEACTIVATE_ACCOUNT, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION,
@@ -220,6 +220,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "oauthToken": "POST /oauth/token",
                 "xrpcDescribeServer": "GET /xrpc/com.atproto.server.describeServer",
                 "xrpcResolveHandle": "GET /xrpc/com.atproto.identity.resolveHandle?handle=:handle",
+                "xrpcResolveDid": "GET /xrpc/com.atproto.identity.resolveDid?did=:did",
                 "xrpcCreateAccount": "POST /xrpc/com.atproto.server.createAccount",
                 "xrpcCreateSession": "POST /xrpc/com.atproto.server.createSession",
                 "xrpcGetSession": "GET /xrpc/com.atproto.server.getSession",
@@ -1718,6 +1719,7 @@ impl RepoObject {
             (Method::Get, SYNC_GET_RECORD) => self.xrpc_get_sync_record(url).await,
             (Method::Get, SYNC_GET_CHECKOUT) => self.xrpc_get_checkout(url).await,
             (Method::Get, SYNC_GET_REPO) => self.xrpc_get_repo(url).await,
+            (Method::Get, IDENTITY_RESOLVE_DID) => self.xrpc_resolve_did(url),
             (Method::Get, REPO_LIST_MISSING_BLOBS) => self.xrpc_list_missing_blobs(req, url).await,
             (Method::Get, SERVER_DESCRIBE_SERVER) => {
                 describe_server(url).map_err(HttpError::worker)
@@ -1742,6 +1744,7 @@ impl RepoObject {
                 | SYNC_GET_RECORD
                 | SYNC_GET_CHECKOUT
                 | SYNC_GET_REPO
+                | IDENTITY_RESOLVE_DID
                 | SERVER_DESCRIBE_SERVER
                 | REPO_CREATE_RECORD
                 | REPO_PUT_RECORD
@@ -1803,6 +1806,31 @@ impl RepoObject {
                 ),
                 "collections": collections,
                 "handleIsCorrect": handle_is_correct(&repo_param, &identity.handle, state.did.as_str()),
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn xrpc_resolve_did(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
+        let store = self.store();
+        let Some(state) = store.get_repo_state().map_err(HttpError::worker)? else {
+            return Err(HttpError::new(404, "DidNotFound"));
+        };
+        if state.did.as_str() != did {
+            return Err(HttpError::new(404, "DidNotFound"));
+        }
+        let identity = self.repo_identity_from(&store)?;
+        json_response(
+            200,
+            &json!({
+                "didDoc": did_document(
+                    state.did.as_str(),
+                    &identity.handle,
+                    &identity.public_key_multibase,
+                    &request_origin(url),
+                ),
             }),
         )
         .map_err(HttpError::worker)
