@@ -42,6 +42,8 @@ await expectJson(
   { authorization: `Bearer ${session.accessJwt}` },
 );
 
+await expectAccountLifecycle(session);
+
 await expectOAuthAuthorize(oauthPar);
 const oauthToken = await expectOAuthTokenExchange(oauthPar);
 await expectJson(
@@ -211,6 +213,213 @@ async function maybeCreateAccount() {
     return false;
   }
   throw new Error(`createAccount failed status=${response.status}: ${JSON.stringify(body)}`);
+}
+
+async function expectAccountLifecycle(session) {
+  const email = `pds-smoke+${Date.now().toString(36)}@example.com`;
+  await expectJson(
+    "update email",
+    "POST",
+    "/xrpc/com.atproto.server.updateEmail",
+    { email },
+    (body) => {
+      if (body.did !== session.did || body.email !== email || body.emailConfirmed !== false) {
+        throw new Error(`unexpected updateEmail response ${JSON.stringify(body)}`);
+      }
+    },
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
+
+  await expectPasswordChangeRoundTrip(session);
+  await expectDeactivateActivate(session);
+}
+
+async function expectPasswordChangeRoundTrip(session) {
+  const temporaryPassword = `${config.password}-rotated-${Date.now().toString(36)}`;
+  let passwordChanged = false;
+  try {
+    await expectStatus(
+      "change password",
+      "POST",
+      "/xrpc/com.atproto.server.changePassword",
+      {
+        oldPassword: config.password,
+        newPassword: temporaryPassword,
+      },
+      200,
+      { authorization: `Bearer ${session.accessJwt}` },
+    );
+    passwordChanged = true;
+
+    await expectStatus(
+      "old password rejected",
+      "POST",
+      "/xrpc/com.atproto.server.createSession",
+      {
+        identifier: handle,
+        password: config.password,
+      },
+      401,
+    );
+
+    const temporarySession = await expectJson(
+      "temporary password create session",
+      "POST",
+      "/xrpc/com.atproto.server.createSession",
+      {
+        identifier: handle,
+        password: temporaryPassword,
+      },
+    );
+
+    await expectStatus(
+      "restore password",
+      "POST",
+      "/xrpc/com.atproto.server.changePassword",
+      {
+        oldPassword: temporaryPassword,
+        newPassword: config.password,
+      },
+      200,
+      { authorization: `Bearer ${temporarySession.accessJwt}` },
+    );
+    passwordChanged = false;
+
+    await expectJson(
+      "restored password create session",
+      "POST",
+      "/xrpc/com.atproto.server.createSession",
+      {
+        identifier: handle,
+        password: config.password,
+      },
+    );
+  } catch (error) {
+    if (passwordChanged) {
+      try {
+        const temporarySession = await expectJson(
+          "temporary password restore session",
+          "POST",
+          "/xrpc/com.atproto.server.createSession",
+          {
+            identifier: handle,
+            password: temporaryPassword,
+          },
+        );
+        await expectStatus(
+          "restore password after failure",
+          "POST",
+          "/xrpc/com.atproto.server.changePassword",
+          {
+            oldPassword: temporaryPassword,
+            newPassword: config.password,
+          },
+          200,
+          { authorization: `Bearer ${temporarySession.accessJwt}` },
+        );
+      } catch (restoreError) {
+        throw new Error(`password smoke failed and password restore failed: ${restoreError.message}`, {
+          cause: error,
+        });
+      }
+    }
+    throw error;
+  }
+}
+
+async function expectDeactivateActivate(session) {
+  let deactivated = false;
+  try {
+    await expectStatus(
+      "deactivate account",
+      "POST",
+      "/xrpc/com.atproto.server.deactivateAccount",
+      null,
+      200,
+      { authorization: `Bearer ${session.accessJwt}` },
+    );
+    deactivated = true;
+
+    await expectStatus(
+      "inactive create session",
+      "POST",
+      "/xrpc/com.atproto.server.createSession",
+      {
+        identifier: handle,
+        password: config.password,
+      },
+      403,
+    );
+
+    await expectStatus(
+      "inactive get session",
+      "GET",
+      "/xrpc/com.atproto.server.getSession",
+      null,
+      403,
+      { authorization: `Bearer ${session.accessJwt}` },
+    );
+
+    await expectStatus(
+      "inactive write rejected",
+      "POST",
+      "/xrpc/com.atproto.repo.createRecord",
+      {
+        repo: session.did,
+        collection,
+        rkey: `inactive-${Date.now().toString(36)}`,
+        record: {
+          $type: collection,
+          text: "this should not commit while inactive",
+          createdAt: new Date().toISOString(),
+        },
+      },
+      403,
+      { authorization: `Bearer ${session.accessJwt}` },
+    );
+
+    await expectJson(
+      "activate account",
+      "POST",
+      "/xrpc/com.atproto.server.activateAccount",
+      null,
+      (body) => {
+        if (body.did !== session.did || body.active !== true) {
+          throw new Error(`unexpected activateAccount response ${JSON.stringify(body)}`);
+        }
+      },
+      { authorization: `Bearer ${session.accessJwt}` },
+    );
+    deactivated = false;
+
+    await expectJson(
+      "active create session",
+      "POST",
+      "/xrpc/com.atproto.server.createSession",
+      {
+        identifier: handle,
+        password: config.password,
+      },
+    );
+  } catch (error) {
+    if (deactivated) {
+      try {
+        await expectJson(
+          "activate account after failure",
+          "POST",
+          "/xrpc/com.atproto.server.activateAccount",
+          null,
+          undefined,
+          { authorization: `Bearer ${session.accessJwt}` },
+        );
+      } catch (activateError) {
+        throw new Error(`account lifecycle smoke failed and reactivation failed: ${activateError.message}`, {
+          cause: error,
+        });
+      }
+    }
+    throw error;
+  }
 }
 
 async function expectOAuthDiscovery() {

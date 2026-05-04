@@ -661,6 +661,64 @@ impl SqlDirectoryStore {
         self.get_account_by_identifier(did.as_str())
     }
 
+    pub fn update_account_password(&self, did: &Did, password_hash: &str) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_accounts
+             SET password_hash = ?, updated_at = unixepoch()
+             WHERE did = ?",
+            vec![
+                SqlStorageValue::from(password_hash.to_string()),
+                SqlStorageValue::from(did.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_account_email(&self, did: &Did, email: Option<&str>) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_accounts
+             SET email = ?, updated_at = unixepoch()
+             WHERE did = ?",
+            vec![
+                optional_text(email.map(|value| value.to_string())),
+                SqlStorageValue::from(did.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_account_active(
+        &self,
+        did: &Did,
+        active: bool,
+        status: Option<&str>,
+    ) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_accounts
+             SET active = ?, status = ?, updated_at = unixepoch()
+             WHERE did = ?",
+            vec![
+                SqlStorageValue::from(if active { 1_i64 } else { 0_i64 }),
+                optional_text(status.map(|value| value.to_string())),
+                SqlStorageValue::from(did.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_repo_active(&self, did: &Did, active: bool) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_repos
+             SET active = ?, updated_at = unixepoch()
+             WHERE did = ?",
+            vec![
+                SqlStorageValue::from(if active { 1_i64 } else { 0_i64 }),
+                SqlStorageValue::from(did.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn append_account_event(
         &self,
         did: &Did,

@@ -8,6 +8,10 @@ pub const SERVER_CREATE_SESSION: &str = "com.atproto.server.createSession";
 pub const SERVER_GET_SESSION: &str = "com.atproto.server.getSession";
 pub const SERVER_REFRESH_SESSION: &str = "com.atproto.server.refreshSession";
 pub const SERVER_DELETE_SESSION: &str = "com.atproto.server.deleteSession";
+pub const SERVER_CHANGE_PASSWORD: &str = "com.atproto.server.changePassword";
+pub const SERVER_UPDATE_EMAIL: &str = "com.atproto.server.updateEmail";
+pub const SERVER_DEACTIVATE_ACCOUNT: &str = "com.atproto.server.deactivateAccount";
+pub const SERVER_ACTIVATE_ACCOUNT: &str = "com.atproto.server.activateAccount";
 pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
 pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
@@ -85,6 +89,10 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | SERVER_GET_SESSION
         | SERVER_REFRESH_SESSION
         | SERVER_DELETE_SESSION
+        | SERVER_CHANGE_PASSWORD
+        | SERVER_UPDATE_EMAIL
+        | SERVER_DEACTIVATE_ACCOUNT
+        | SERVER_ACTIVATE_ACCOUNT
         | SYNC_LIST_REPOS
         | SYNC_LIST_REPOS_BY_COLLECTION
         | SYNC_GET_HOST_STATUS
@@ -251,6 +259,10 @@ mod tests {
             SERVER_GET_SESSION,
             SERVER_REFRESH_SESSION,
             SERVER_DELETE_SESSION,
+            SERVER_CHANGE_PASSWORD,
+            SERVER_UPDATE_EMAIL,
+            SERVER_DEACTIVATE_ACCOUNT,
+            SERVER_ACTIVATE_ACCOUNT,
             SYNC_LIST_REPOS,
             SYNC_LIST_REPOS_BY_COLLECTION,
             SYNC_GET_HOST_STATUS,
