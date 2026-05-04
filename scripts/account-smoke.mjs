@@ -360,6 +360,18 @@ async function expectDeactivateActivate(session) {
       { authorization: `Bearer ${session.accessJwt}` },
     );
 
+    await expectJson(
+      "inactive repo status",
+      "GET",
+      `/xrpc/com.atproto.sync.getRepoStatus?did=${encodeQuery(session.did)}`,
+      null,
+      (body) => {
+        if (body.did !== session.did || body.active !== false || body.status !== "deactivated" || body.rev) {
+          throw new Error(`unexpected inactive repo status ${JSON.stringify(body)}`);
+        }
+      },
+    );
+
     await expectStatus(
       "inactive write rejected",
       "POST",

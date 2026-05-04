@@ -283,9 +283,7 @@ impl DurableObject for RepoObject {
             Ok(response) => Ok(response),
             Err(error) => json_response(
                 error.status,
-                &json!({
-                    "error": error.message,
-                }),
+                &xrpc_error_body(&error.message, Some(error.message.as_str())),
             ),
         }
     }
@@ -314,9 +312,7 @@ impl DurableObject for PdsDirectoryObject {
             Ok(response) => Ok(response),
             Err(error) => json_response(
                 error.status,
-                &json!({
-                    "error": error.message,
-                }),
+                &xrpc_error_body(&error.message, Some(error.message.as_str())),
             ),
         }
     }
@@ -1712,7 +1708,7 @@ impl RepoObject {
             (Method::Get, REPO_LIST_RECORDS) => self.xrpc_list_records(url).await,
             (Method::Get, SYNC_GET_LATEST_COMMIT) => self.xrpc_get_latest_commit(url),
             (Method::Get, SYNC_GET_HEAD) => self.xrpc_get_head(url),
-            (Method::Get, SYNC_GET_REPO_STATUS) => self.xrpc_get_repo_status(url),
+            (Method::Get, SYNC_GET_REPO_STATUS) => self.xrpc_get_repo_status(url).await,
             (Method::Get, SYNC_LIST_BLOBS) => self.xrpc_list_blobs(url),
             (Method::Get, SYNC_GET_BLOB) => self.xrpc_get_blob(url).await,
             (Method::Get, SYNC_GET_BLOCKS) => self.xrpc_get_blocks(url),
@@ -1976,21 +1972,62 @@ impl RepoObject {
         .map_err(HttpError::worker)
     }
 
-    fn xrpc_get_repo_status(&self, url: &worker::Url) -> Result<Response, HttpError> {
+    async fn xrpc_get_repo_status(&self, url: &worker::Url) -> Result<Response, HttpError> {
         let params = query_pairs(url);
         let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
-        let state = self.repo_state()?;
-        ensure_repo_did(&state, &did)?;
+        let Some(state) = self.store().get_repo_state().map_err(HttpError::worker)? else {
+            return Err(HttpError::new(404, "RepoNotFound"));
+        };
+        if state.did.as_str() != did {
+            return Err(HttpError::new(404, "RepoNotFound"));
+        }
 
-        json_response(
-            200,
-            &json!({
-                "did": state.did.to_string(),
-                "active": true,
-                "rev": state.latest_rev.to_string(),
-            }),
-        )
-        .map_err(HttpError::worker)
+        let account_status = self
+            .directory_account_status_for_repo(url, state.did.as_str())
+            .await?;
+        let active = account_status.as_ref().is_none_or(|status| status.active);
+        let mut body = json!({
+            "did": state.did.to_string(),
+            "active": active,
+        });
+        if active {
+            body["rev"] = json!(state.latest_rev.to_string());
+        } else if let Some(status) = account_status.and_then(|status| status.status) {
+            body["status"] = json!(status);
+        }
+
+        json_response(200, &body).map_err(HttpError::worker)
+    }
+
+    async fn directory_account_status_for_repo(
+        &self,
+        url: &worker::Url,
+        did: &str,
+    ) -> Result<Option<InternalAccountStatusResponse>, HttpError> {
+        let Some(host) = url.host_str() else {
+            return Ok(None);
+        };
+        let path = format!(
+            "/directory/accounts/status?did={}",
+            encode_query_component(did)
+        );
+        let mut response =
+            fetch_directory_request(&self.env, host, Method::Get, &path, None).await?;
+        let status = response.status_code();
+        if status == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&status) {
+            let message = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "failed to read directory response".to_string());
+            return Err(HttpError::new(
+                500,
+                format!("account status lookup failed with status {status}: {message}"),
+            ));
+        }
+        response.json().await.map(Some).map_err(HttpError::worker)
     }
 
     fn xrpc_list_blobs(&self, url: &worker::Url) -> Result<Response, HttpError> {
@@ -3374,6 +3411,7 @@ struct InternalRepoStatusResponse {
 #[derive(Debug, Deserialize)]
 struct InternalAccountStatusResponse {
     active: bool,
+    status: Option<String>,
 }
 
 struct CreatedSession {
@@ -4423,6 +4461,14 @@ fn health_response() -> worker::Result<Response> {
     )
 }
 
+fn xrpc_error_body(error: &str, message: Option<&str>) -> Value {
+    let mut body = json!({ "error": error });
+    if let Some(message) = message.filter(|message| !message.is_empty()) {
+        body["message"] = json!(message);
+    }
+    body
+}
+
 fn handle_worker_xrpc(
     http_method: Method,
     xrpc_method: &str,
@@ -4434,14 +4480,13 @@ fn handle_worker_xrpc(
             Ok(response) => Ok(response),
             Err(error) => json_response(
                 error.status,
-                &json!({
-                    "error": error.message,
-                }),
+                &xrpc_error_body(&error.message, Some(error.message.as_str())),
             ),
         },
-        (_, SERVER_DESCRIBE_SERVER | IDENTITY_RESOLVE_HANDLE) => {
-            json_response(405, &json!({ "error": "method not allowed" }))
-        }
+        (_, SERVER_DESCRIBE_SERVER | IDENTITY_RESOLVE_HANDLE) => json_response(
+            405,
+            &xrpc_error_body("MethodNotAllowed", Some("method not allowed")),
+        ),
         _ => json_response(
             404,
             &json!({
@@ -4453,15 +4498,17 @@ fn handle_worker_xrpc(
 }
 
 fn describe_server(url: &worker::Url) -> worker::Result<Response> {
-    let domains = url
-        .host_str()
-        .map(|host| vec![host.to_string()])
-        .unwrap_or_default();
+    let Some(host) = url.host_str() else {
+        return json_response(
+            400,
+            &xrpc_error_body("InvalidRequest", Some("request host is required")),
+        );
+    };
     json_response(
         200,
         &json!({
-            "did": "did:gsv:pds",
-            "availableUserDomains": domains,
+            "did": format!("did:web:{host}"),
+            "availableUserDomains": [host],
             "inviteCodeRequired": true,
             "phoneVerificationRequired": false,
             "links": {},

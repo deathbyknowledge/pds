@@ -72,7 +72,7 @@ await expectJsonStatus(
   null,
   404,
   (body) => {
-    if (body.error !== "DidNotFound") {
+    if (body.error !== "DidNotFound" || typeof body.message !== "string") {
       throw new Error(`unexpected unknown DID response ${JSON.stringify(body)}`);
     }
   },
@@ -85,7 +85,7 @@ await expectJsonStatus(
   null,
   404,
   (body) => {
-    if (body.error !== "HandleNotFound") {
+    if (body.error !== "HandleNotFound" || typeof body.message !== "string") {
       throw new Error(`unexpected unknown handle response ${JSON.stringify(body)}`);
     }
   },
@@ -97,6 +97,9 @@ await expectJson(
   "/xrpc/com.atproto.server.describeServer",
   null,
   (body) => {
+    if (body.did !== did) {
+      throw new Error(`describeServer DID ${body.did}, expected ${did}`);
+    }
     if (!body.availableUserDomains?.includes(base.hostname)) {
       throw new Error(`describeServer did not advertise ${base.hostname}: ${JSON.stringify(body)}`);
     }
