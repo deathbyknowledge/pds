@@ -38,6 +38,31 @@ await expectText("handle DID", "GET", "/.well-known/atproto-did", null, (body) =
 });
 
 await expectJson(
+  "resolve handle",
+  "GET",
+  `/xrpc/com.atproto.identity.resolveHandle?handle=${encodeQuery(handle)}`,
+  null,
+  (body) => {
+    if (body.did !== did) {
+      throw new Error(`resolveHandle returned ${JSON.stringify(body)}, expected DID ${did}`);
+    }
+  },
+);
+
+await expectJsonStatus(
+  "unknown handle",
+  "GET",
+  `/xrpc/com.atproto.identity.resolveHandle?handle=${encodeQuery(`unknown-${handle}`)}`,
+  null,
+  404,
+  (body) => {
+    if (body.error !== "HandleNotFound") {
+      throw new Error(`unexpected unknown handle response ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+await expectJson(
   "describe server",
   "GET",
   "/xrpc/com.atproto.server.describeServer",
@@ -281,6 +306,32 @@ async function expectText(label, method, path, body = null, validate = undefined
   }
   validate?.(text, response);
   return text;
+}
+
+async function expectJsonStatus(
+  label,
+  method,
+  path,
+  body = null,
+  expectedStatus,
+  validate = undefined,
+  extraHeaders = {},
+) {
+  const response = await request(method, path, body, extraHeaders);
+  const text = await response.text();
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`${label} returned non-JSON status=${response.status}: ${text}`, {
+      cause: error,
+    });
+  }
+  if (response.status !== expectedStatus) {
+    throw new Error(`${label} returned status=${response.status}, expected ${expectedStatus}: ${JSON.stringify(parsed)}`);
+  }
+  validate?.(parsed, response);
+  return parsed;
 }
 
 async function expectBytes(label, method, path, body = null, validate = undefined, extraHeaders = {}) {

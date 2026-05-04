@@ -12,6 +12,7 @@ pub const SERVER_CHANGE_PASSWORD: &str = "com.atproto.server.changePassword";
 pub const SERVER_UPDATE_EMAIL: &str = "com.atproto.server.updateEmail";
 pub const SERVER_DEACTIVATE_ACCOUNT: &str = "com.atproto.server.deactivateAccount";
 pub const SERVER_ACTIVATE_ACCOUNT: &str = "com.atproto.server.activateAccount";
+pub const IDENTITY_RESOLVE_HANDLE: &str = "com.atproto.identity.resolveHandle";
 pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
 pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
@@ -83,7 +84,7 @@ pub enum XrpcError {
 
 pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<XrpcRoute, XrpcError> {
     match method {
-        SERVER_DESCRIBE_SERVER => Ok(XrpcRoute::Worker),
+        SERVER_DESCRIBE_SERVER | IDENTITY_RESOLVE_HANDLE => Ok(XrpcRoute::Worker),
         SERVER_CREATE_ACCOUNT
         | SERVER_CREATE_SESSION
         | SERVER_GET_SESSION
@@ -247,6 +248,18 @@ mod tests {
     fn routes_server_describe_to_worker() {
         assert_eq!(
             route_xrpc_method(SERVER_DESCRIBE_SERVER, &[]).unwrap(),
+            XrpcRoute::Worker
+        );
+    }
+
+    #[test]
+    fn routes_identity_resolve_handle_to_worker() {
+        assert_eq!(
+            route_xrpc_method(
+                IDENTITY_RESOLVE_HANDLE,
+                &query(&[("handle", "pds.example.com")])
+            )
+            .unwrap(),
             XrpcRoute::Worker
         );
     }

@@ -53,10 +53,10 @@ use crate::repo_import::{
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 use crate::xrpc::{
     at_uri, optional_param, parse_get_blocks_params, parse_list_records_params, required_param,
-    route_xrpc_method, REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD,
-    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO, REPO_LIST_MISSING_BLOBS,
-    REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_ACTIVATE_ACCOUNT,
-    SERVER_CHANGE_PASSWORD, SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION,
+    route_xrpc_method, IDENTITY_RESOLVE_HANDLE, REPO_APPLY_WRITES, REPO_CREATE_RECORD,
+    REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
+    REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
+    SERVER_ACTIVATE_ACCOUNT, SERVER_CHANGE_PASSWORD, SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION,
     SERVER_DEACTIVATE_ACCOUNT, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION,
     SERVER_REFRESH_SESSION, SERVER_UPDATE_EMAIL, SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT,
     SYNC_GET_HEAD, SYNC_GET_HOST_STATUS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
@@ -137,7 +137,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
     if parts.len() >= 2 && parts[0] == "xrpc" && !parts[1].is_empty() {
         let query = query_pairs(&url);
         return match route_xrpc_method(parts[1], &query) {
-            Ok(XrpcRoute::Worker) => describe_server(&url),
+            Ok(XrpcRoute::Worker) => handle_worker_xrpc(req.method(), parts[1], &url),
             Ok(XrpcRoute::DirectoryObject) => {
                 let Some(host) = url.host_str() else {
                     return json_response(
@@ -219,6 +219,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "oauthAuthorize": "GET /oauth/authorize",
                 "oauthToken": "POST /oauth/token",
                 "xrpcDescribeServer": "GET /xrpc/com.atproto.server.describeServer",
+                "xrpcResolveHandle": "GET /xrpc/com.atproto.identity.resolveHandle?handle=:handle",
                 "xrpcCreateAccount": "POST /xrpc/com.atproto.server.createAccount",
                 "xrpcCreateSession": "POST /xrpc/com.atproto.server.createSession",
                 "xrpcGetSession": "GET /xrpc/com.atproto.server.getSession",
@@ -4394,6 +4395,35 @@ fn health_response() -> worker::Result<Response> {
     )
 }
 
+fn handle_worker_xrpc(
+    http_method: Method,
+    xrpc_method: &str,
+    url: &worker::Url,
+) -> worker::Result<Response> {
+    match (http_method, xrpc_method) {
+        (Method::Get, SERVER_DESCRIBE_SERVER) => describe_server(url),
+        (Method::Get, IDENTITY_RESOLVE_HANDLE) => match xrpc_resolve_handle(url) {
+            Ok(response) => Ok(response),
+            Err(error) => json_response(
+                error.status,
+                &json!({
+                    "error": error.message,
+                }),
+            ),
+        },
+        (_, SERVER_DESCRIBE_SERVER | IDENTITY_RESOLVE_HANDLE) => {
+            json_response(405, &json!({ "error": "method not allowed" }))
+        }
+        _ => json_response(
+            404,
+            &json!({
+                "error": "MethodNotFound",
+                "message": format!("unsupported XRPC method `{xrpc_method}`"),
+            }),
+        ),
+    }
+}
+
 fn describe_server(url: &worker::Url) -> worker::Result<Response> {
     let domains = url
         .host_str()
@@ -4410,6 +4440,24 @@ fn describe_server(url: &worker::Url) -> worker::Result<Response> {
             "contact": {},
         }),
     )
+}
+
+fn xrpc_resolve_handle(url: &worker::Url) -> Result<Response, HttpError> {
+    let params = query_pairs(url);
+    let handle = required_param(&params, "handle").map_err(HttpError::xrpc)?;
+    let Some(host) = url.host_str() else {
+        return Err(HttpError::new(400, "request host is required"));
+    };
+    if handle != host {
+        return Err(HttpError::new(404, "HandleNotFound"));
+    }
+    json_response(
+        200,
+        &json!({
+            "did": format!("did:web:{handle}"),
+        }),
+    )
+    .map_err(HttpError::worker)
 }
 
 fn oauth_metadata_response(url: &worker::Url) -> worker::Result<Response> {
