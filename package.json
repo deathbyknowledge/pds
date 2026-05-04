@@ -8,6 +8,7 @@
     "deploy:test": "scripts/deploy-test.sh",
     "seed:test-repo": "node scripts/seed-test-repo.mjs",
     "smoke:account": "node scripts/account-smoke.mjs",
+    "smoke:public": "node scripts/public-smoke.mjs",
     "build:worker": "worker-build --release .",
     "test:rust": "cargo test",
     "test": "cargo test"
