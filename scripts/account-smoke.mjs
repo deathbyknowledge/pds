@@ -64,6 +64,28 @@ await expectJson(
 );
 await expectOAuthRefresh(oauthPar.clientId, oauthToken.refresh_token, oauthToken.dpopNonce);
 
+const blobText = `hello from account smoke blob ${rkey}`;
+const blobBytes = new TextEncoder().encode(blobText);
+const uploadBlob = await expectJson(
+  "account uploadBlob",
+  "POST",
+  "/xrpc/com.atproto.repo.uploadBlob",
+  blobBytes,
+  (body) => {
+    if (body.blob?.mimeType !== "text/plain" || body.blob?.size !== blobBytes.byteLength) {
+      throw new Error(`unexpected uploadBlob response ${JSON.stringify(body)}`);
+    }
+  },
+  {
+    authorization: `Bearer ${session.accessJwt}`,
+    "content-type": "text/plain",
+  },
+);
+const blobCid = uploadBlob.blob.ref?.$link;
+if (!blobCid) {
+  throw new Error(`uploadBlob response did not include blob ref: ${JSON.stringify(uploadBlob)}`);
+}
+
 const createRecord = await expectJson(
   "account createRecord",
   "POST",
@@ -76,6 +98,7 @@ const createRecord = await expectJson(
       $type: collection,
       text: "created through account auth",
       createdAt: new Date().toISOString(),
+      attachment: blobRef(blobCid, "text/plain", blobBytes.byteLength),
     },
   },
   (body) => {
@@ -84,6 +107,32 @@ const createRecord = await expectJson(
     }
   },
   { authorization: `Bearer ${session.accessJwt}` },
+);
+
+await expectJson(
+  "list blobs",
+  "GET",
+  `/xrpc/com.atproto.sync.listBlobs?did=${encodeQuery(session.did)}`,
+  null,
+  (body) => {
+    if (!Array.isArray(body.cids) || !body.cids.includes(blobCid)) {
+      throw new Error(`expected blob ${blobCid}, got ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+await expectBytes(
+  "get blob",
+  "GET",
+  `/xrpc/com.atproto.sync.getBlob?did=${encodeQuery(session.did)}&cid=${encodeQuery(blobCid)}`,
+  null,
+  async (response, bytes) => {
+    const contentType = response.headers.get("content-type") ?? "";
+    const text = new TextDecoder().decode(bytes);
+    if (!contentType.includes("text/plain") || text !== blobText) {
+      throw new Error(`unexpected blob response content-type=${contentType} bytes=${text}`);
+    }
+  },
 );
 
 const refreshed = await expectJson(
@@ -127,6 +176,7 @@ console.log(
       did: session.did,
       createdRecord: createRecord.uri,
       latestCommit: createRecord.commit.cid,
+      blobCid,
       pdslsRepoUrl: `https://pdsls.dev/at://${session.did}`,
     },
     null,
@@ -465,6 +515,16 @@ async function expectStatus(label, method, path, body, status, extraHeaders = {}
   }
 }
 
+async function expectBytes(label, method, path, body, validate = undefined, extraHeaders = {}) {
+  const response = await request(method, path, body, extraHeaders);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (!response.ok) {
+    throw new Error(`${label} failed status=${response.status}: ${new TextDecoder().decode(bytes)}`);
+  }
+  await validate?.(response, bytes);
+  return bytes;
+}
+
 async function request(method, path, body = null, extraHeaders = {}) {
   const headers = {
     ...extraHeaders,
@@ -498,6 +558,15 @@ function optionalEnv(name, fallback = undefined) {
 
 function encodeQuery(value) {
   return encodeURIComponent(value);
+}
+
+function blobRef(cid, mimeType, size) {
+  return {
+    $type: "blob",
+    ref: { $link: cid },
+    mimeType,
+    size,
+  };
 }
 
 function pkceS256Challenge(verifier) {
