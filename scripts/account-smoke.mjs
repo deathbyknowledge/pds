@@ -157,6 +157,9 @@ async function maybeCreateAccount() {
   if (response.status === 400 && String(body.error ?? "").includes("HandleNotAvailable")) {
     return false;
   }
+  if (response.status === 409 && String(body.error ?? "").includes("repo already initialized")) {
+    return false;
+  }
   throw new Error(`createAccount failed status=${response.status}: ${JSON.stringify(body)}`);
 }
 
