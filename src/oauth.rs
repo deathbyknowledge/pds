@@ -37,6 +37,15 @@ pub struct AuthorizationRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizationForm {
+    pub client_id: String,
+    pub request_uri: String,
+    pub identifier: String,
+    pub password: String,
+    pub approved: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokenRequest {
     AuthorizationCode {
         client_id: String,
@@ -255,6 +264,35 @@ pub fn parse_authorization_request(
     Ok(AuthorizationRequest {
         client_id,
         request_uri,
+    })
+}
+
+pub fn parse_authorization_form(body: &str) -> Result<AuthorizationForm, OAuthRequestError> {
+    let fields = parse_form_urlencoded(body)?;
+    let client_id = required_single(&fields, "client_id")?;
+    validate_client_id(&client_id)?;
+    let request_uri = required_single(&fields, "request_uri")?;
+    validate_request_uri(&request_uri)?;
+    let approved = optional_single(&fields, "approve")?.as_deref() == Some("yes");
+    let (identifier, password) = if approved {
+        let identifier = required_single(&fields, "identifier")?;
+        validate_nonempty_length("identifier", &identifier, 2048)?;
+        let password = required_single(&fields, "password")?;
+        validate_nonempty_length("password", &password, 100_000)?;
+        (identifier, password)
+    } else {
+        (
+            optional_single(&fields, "identifier")?.unwrap_or_default(),
+            optional_single(&fields, "password")?.unwrap_or_default(),
+        )
+    };
+
+    Ok(AuthorizationForm {
+        client_id,
+        request_uri,
+        identifier,
+        password,
+        approved,
     })
 }
 
@@ -833,6 +871,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_authorization_login_form() {
+        let form = parse_authorization_form(&format!(
+            "client_id=http%3A%2F%2Flocalhost&request_uri={}abc123&identifier=alice.example&password=correct&approve=yes",
+            url_escape(OAUTH_REQUEST_URI_PREFIX),
+        ))
+        .unwrap();
+
+        assert_eq!(form.client_id, "http://localhost");
+        assert_eq!(
+            form.request_uri,
+            format!("{OAUTH_REQUEST_URI_PREFIX}abc123")
+        );
+        assert_eq!(form.identifier, "alice.example");
+        assert_eq!(form.password, "correct");
+        assert!(form.approved);
+    }
+
+    #[test]
     fn rejects_authorization_request_without_par_reference() {
         let error = parse_authorization_request(&[
             ("client_id".to_string(), "http://localhost".to_string()),
@@ -850,6 +906,10 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn url_escape(value: &str) -> String {
+        value.replace(':', "%3A")
     }
 
     #[test]

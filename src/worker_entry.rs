@@ -29,18 +29,19 @@ use crate::commit::{Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
     DirectoryAccountRow, DirectoryCommitEventInput, DirectoryEventRow,
-    DirectoryOauthAuthorizationCodeInput, DirectoryOauthParRequestInput, DirectoryRepoRow,
-    DirectorySessionRow, RepoBlobRow, RepoCommitEventInput, RepoIdentityRow, RepoStateRow,
-    SqlDirectoryStore, SqlRepoStore,
+    DirectoryOauthAuthorizationCodeInput, DirectoryOauthParRequestInput,
+    DirectoryOauthParRequestRow, DirectoryRepoRow, DirectorySessionRow, RepoBlobRow,
+    RepoCommitEventInput, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
 };
 use crate::dpop::{dpop_htu, verify_dpop_proof, DpopError, VerifiedDpopProof};
 use crate::identity::{IdentityError, RepoSigningKey};
 use crate::oauth::{
     authorization_server_metadata, is_localhost_client_id, is_oauth_well_known_path,
-    parse_authorization_request, parse_pushed_authorization_request, parse_token_request,
-    protected_resource_metadata, validate_client_metadata, OAuthRequestError, TokenRequest,
-    OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH, OAUTH_PAR_EXPIRES_IN_SECONDS,
-    OAUTH_PAR_PATH, OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
+    parse_authorization_form, parse_authorization_request, parse_pushed_authorization_request,
+    parse_token_request, protected_resource_metadata, validate_client_metadata, OAuthRequestError,
+    TokenRequest, OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH,
+    OAUTH_PAR_EXPIRES_IN_SECONDS, OAUTH_PAR_PATH, OAUTH_PROTECTED_RESOURCE_PATH,
+    OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
 };
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
@@ -380,6 +381,9 @@ impl PdsDirectoryObject {
         if parts.len() >= 2 && parts[0] == "oauth" {
             return match (req.method(), url.path()) {
                 (Method::Get, OAUTH_AUTHORIZE_PATH) => self.oauth_authorize(req, &url),
+                (Method::Post, OAUTH_AUTHORIZE_PATH) => {
+                    self.oauth_authorize_submit(req, &url).await
+                }
                 (Method::Post, OAUTH_PAR_PATH) => {
                     self.oauth_pushed_authorization_request(req).await
                 }
@@ -660,10 +664,98 @@ impl PdsDirectoryObject {
             Ok(request) => request,
             Err(error) => return oauth_request_error_response(error).map_err(HttpError::worker),
         };
+        if req
+            .headers()
+            .get("authorization")
+            .map_err(HttpError::worker)?
+            .is_some()
+        {
+            return self.oauth_authorize_with_bearer(req, url, request);
+        }
+
+        let now = current_unix_time();
+        let store = self.store();
+        let par = self.oauth_par_for_authorization(&store, &request, now)?;
+        oauth_authorization_form_response(200, &par, None).map_err(HttpError::worker)
+    }
+
+    fn oauth_authorize_with_bearer(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+        request: crate::oauth::AuthorizationRequest,
+    ) -> Result<Response, HttpError> {
         let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
         let account = self.account_for_claims(&claims)?;
         let now = current_unix_time();
         let store = self.store();
+        let par = self.oauth_par_for_authorization(&store, &request, now)?;
+        self.ensure_oauth_login_hint_matches(&par, &account)?;
+        self.issue_oauth_authorization_code(url, &store, par, account, now)
+    }
+
+    async fn oauth_authorize_submit(
+        &self,
+        req: &mut Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        if let Err(error) = ensure_form_urlencoded(req) {
+            return oauth_error_response(415, "invalid_request", &error.message)
+                .map_err(HttpError::worker);
+        }
+        let body = req.text().await.map_err(HttpError::worker)?;
+        let form = match parse_authorization_form(&body) {
+            Ok(form) => form,
+            Err(error) => return oauth_request_error_response(error).map_err(HttpError::worker),
+        };
+        let request = crate::oauth::AuthorizationRequest {
+            client_id: form.client_id.clone(),
+            request_uri: form.request_uri.clone(),
+        };
+        let now = current_unix_time();
+        let store = self.store();
+        let par = self.oauth_par_for_authorization(&store, &request, now)?;
+        if !form.approved {
+            return oauth_authorization_error_redirect(
+                &par.redirect_uri,
+                "access_denied",
+                "authorization was denied",
+                &par.state,
+                &request_origin(url),
+            );
+        }
+
+        let Some(account) = store
+            .get_account_by_identifier(&form.identifier)
+            .map_err(HttpError::worker)?
+        else {
+            return oauth_authorization_form_response(
+                401,
+                &par,
+                Some("Invalid identifier or password"),
+            )
+            .map_err(HttpError::worker);
+        };
+        if !verify_password(&form.password, &account.password_hash).map_err(HttpError::auth)?
+            || !account.active
+        {
+            return oauth_authorization_form_response(
+                401,
+                &par,
+                Some("Invalid identifier or password"),
+            )
+            .map_err(HttpError::worker);
+        }
+        self.ensure_oauth_login_hint_matches(&par, &account)?;
+        self.issue_oauth_authorization_code(url, &store, par, account, now)
+    }
+
+    fn oauth_par_for_authorization(
+        &self,
+        store: &SqlDirectoryStore,
+        request: &crate::oauth::AuthorizationRequest,
+        now: i64,
+    ) -> Result<DirectoryOauthParRequestRow, HttpError> {
         store
             .purge_expired_oauth_par_requests(now)
             .map_err(HttpError::worker)?;
@@ -674,24 +766,35 @@ impl PdsDirectoryObject {
             .get_oauth_par_request(&request.request_uri, now)
             .map_err(HttpError::worker)?
         else {
-            return oauth_error_response(400, "invalid_request", "unknown or expired request_uri")
-                .map_err(HttpError::worker);
+            return Err(HttpError::new(400, "unknown or expired request_uri"));
         };
         if par.client_id != request.client_id {
-            return oauth_error_response(
-                400,
-                "invalid_request",
-                "client_id did not match request_uri",
-            )
-            .map_err(HttpError::worker);
+            return Err(HttpError::new(400, "client_id did not match request_uri"));
         }
+        Ok(par)
+    }
+
+    fn ensure_oauth_login_hint_matches(
+        &self,
+        par: &DirectoryOauthParRequestRow,
+        account: &DirectoryAccountRow,
+    ) -> Result<(), HttpError> {
         if par.login_hint.as_deref().is_some_and(|login_hint| {
             login_hint != account.handle.as_str() && login_hint != account.did.as_str()
         }) {
-            return oauth_error_response(403, "access_denied", "login_hint did not match account")
-                .map_err(HttpError::worker);
+            return Err(HttpError::new(403, "login_hint did not match account"));
         }
+        Ok(())
+    }
 
+    fn issue_oauth_authorization_code(
+        &self,
+        url: &worker::Url,
+        store: &SqlDirectoryStore,
+        par: DirectoryOauthParRequestRow,
+        account: DirectoryAccountRow,
+        now: i64,
+    ) -> Result<Response, HttpError> {
         let code = random_urlsafe_token::<OAUTH_AUTHORIZATION_CODE_BYTES>()?;
         store
             .insert_oauth_authorization_code(&DirectoryOauthAuthorizationCodeInput {
@@ -4282,6 +4385,115 @@ fn oauth_authorization_redirect(
     Ok(response)
 }
 
+fn oauth_authorization_error_redirect(
+    redirect_uri: &str,
+    error: &str,
+    error_description: &str,
+    state: &str,
+    issuer: &str,
+) -> Result<Response, HttpError> {
+    let mut redirect = ::url::Url::parse(redirect_uri).map_err(|parse_error| {
+        HttpError::new(400, format!("invalid redirect_uri: {parse_error}"))
+    })?;
+    {
+        let mut query = redirect.query_pairs_mut();
+        query.append_pair("error", error);
+        query.append_pair("error_description", error_description);
+        query.append_pair("state", state);
+        query.append_pair("iss", issuer);
+    }
+
+    let mut response = Response::empty()
+        .map_err(HttpError::worker)?
+        .with_status(302);
+    response
+        .headers_mut()
+        .set("location", redirect.as_str())
+        .map_err(HttpError::worker)?;
+    response
+        .headers_mut()
+        .set("cache-control", "no-store")
+        .map_err(HttpError::worker)?;
+    set_cors(&mut response).map_err(HttpError::worker)?;
+    Ok(response)
+}
+
+fn oauth_authorization_form_response(
+    status: u16,
+    par: &DirectoryOauthParRequestRow,
+    error: Option<&str>,
+) -> worker::Result<Response> {
+    let login_hint = par.login_hint.as_deref().unwrap_or_default();
+    let error_html = error
+        .map(|message| {
+            format!(
+                r#"<div class="error" role="alert">{}</div>"#,
+                html_escape(message)
+            )
+        })
+        .unwrap_or_default();
+    let scopes = par
+        .scope
+        .split_whitespace()
+        .map(|scope| format!("<li>{}</li>", html_escape(scope)))
+        .collect::<String>();
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authorize client</title>
+<style>
+:root {{ color-scheme: light dark; }}
+body {{ font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 0; min-height: 100vh; display: grid; place-items: center; background: #f6f7f9; color: #15171a; }}
+main {{ width: min(92vw, 440px); background: #fff; border: 1px solid #d9dde3; border-radius: 8px; padding: 24px; box-shadow: 0 16px 48px rgb(20 28 40 / 12%); }}
+h1 {{ font-size: 1.35rem; margin: 0 0 12px; }}
+p {{ line-height: 1.45; margin: 0 0 16px; }}
+code {{ overflow-wrap: anywhere; }}
+label {{ display: block; font-weight: 600; margin: 14px 0 6px; }}
+input[type="text"], input[type="password"] {{ box-sizing: border-box; width: 100%; padding: 10px 12px; border: 1px solid #b8c0cc; border-radius: 6px; font: inherit; }}
+.consent {{ display: flex; gap: 10px; align-items: flex-start; margin: 16px 0; font-weight: 500; }}
+.consent input {{ margin-top: 3px; }}
+.actions {{ display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }}
+button {{ border: 0; border-radius: 6px; padding: 10px 14px; font: inherit; cursor: pointer; }}
+button.primary {{ background: #175bcc; color: #fff; }}
+button.secondary {{ background: #e8ebf0; color: #1f252d; }}
+.error {{ border: 1px solid #d83b3b; background: #fff0f0; color: #9b1c1c; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }}
+@media (prefers-color-scheme: dark) {{ body {{ background: #111418; color: #f0f3f6; }} main {{ background: #191e24; border-color: #303842; }} input[type="text"], input[type="password"] {{ background: #111418; border-color: #4a5563; color: #f0f3f6; }} button.secondary {{ background: #2b333d; color: #f0f3f6; }} }}
+</style>
+</head>
+<body>
+<main>
+<h1>Authorize client</h1>
+{error_html}
+<p><code>{client_id}</code> is requesting access to this account.</p>
+<p>Requested scopes:</p>
+<ul>{scopes}</ul>
+<form method="post" action="/oauth/authorize">
+<input type="hidden" name="client_id" value="{client_id_attr}">
+<input type="hidden" name="request_uri" value="{request_uri_attr}">
+<label for="identifier">Account</label>
+<input id="identifier" name="identifier" type="text" autocomplete="username" value="{identifier_attr}" required>
+<label for="password">Password</label>
+<input id="password" name="password" type="password" autocomplete="current-password" required>
+<label class="consent"><input name="consent" type="checkbox" value="yes" required><span>Approve this client for the requested scopes.</span></label>
+<div class="actions">
+<button class="secondary" type="submit" name="approve" value="no" formnovalidate>Cancel</button>
+<button class="primary" type="submit" name="approve" value="yes">Authorize</button>
+</div>
+</form>
+</main>
+</body>
+</html>"#,
+        client_id = html_escape(&par.client_id),
+        client_id_attr = html_attr_escape(&par.client_id),
+        request_uri_attr = html_attr_escape(&par.request_uri),
+        identifier_attr = html_attr_escape(login_hint),
+    );
+    html_response(status, &html)
+}
+
 fn oauth_par_response(
     request_uri: &str,
     expires_in: i64,
@@ -4326,6 +4538,16 @@ fn text_response(status: u16, value: &str) -> worker::Result<Response> {
     Ok(response)
 }
 
+fn html_response(status: u16, value: &str) -> worker::Result<Response> {
+    let mut response = Response::from_bytes(value.as_bytes().to_vec())?.with_status(status);
+    response
+        .headers_mut()
+        .set("content-type", "text/html; charset=utf-8")?;
+    response.headers_mut().set("cache-control", "no-store")?;
+    set_cors(&mut response)?;
+    Ok(response)
+}
+
 fn empty_response(status: u16) -> worker::Result<Response> {
     let mut response = Response::empty()?.with_status(status);
     set_cors(&mut response)?;
@@ -4345,6 +4567,17 @@ fn set_cors(response: &mut Response) -> worker::Result<()> {
     )?;
     headers.set("Access-Control-Expose-Headers", "dpop-nonce")?;
     Ok(())
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn html_attr_escape(value: &str) -> String {
+    html_escape(value).replace('"', "&quot;")
 }
 
 #[cfg(test)]

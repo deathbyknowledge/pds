@@ -42,7 +42,7 @@ await expectJson(
   { authorization: `Bearer ${session.accessJwt}` },
 );
 
-await expectOAuthAuthorize(oauthPar, session.accessJwt);
+await expectOAuthAuthorize(oauthPar);
 const oauthToken = await expectOAuthTokenExchange(oauthPar);
 await expectJson(
   "OAuth access token getSession",
@@ -260,12 +260,16 @@ async function expectOAuthParEndpoint() {
   if (!par.request_uri) {
     throw new Error(`OAuth PAR response did not include request_uri`);
   }
-  await expectStatus(
-    "OAuth authorize requires account session",
+  await expectHtml(
+    "OAuth authorize form",
     "GET",
     `/oauth/authorize?client_id=${encodeQuery(clientId)}&request_uri=${encodeQuery(par.request_uri)}`,
     null,
-    401,
+    (text, response) => {
+      if (response.status !== 200 || !text.includes("Authorize client") || !text.includes("name=\"password\"")) {
+        throw new Error(`unexpected OAuth authorize form status=${response.status}: ${text}`);
+      }
+    },
   );
   return {
     clientId,
@@ -277,12 +281,34 @@ async function expectOAuthParEndpoint() {
   };
 }
 
-async function expectOAuthAuthorize(par, accessJwt) {
+async function expectOAuthAuthorize(par) {
+  const formBody = new URLSearchParams({
+    client_id: par.clientId,
+    request_uri: par.requestUri,
+    identifier: handle,
+    password: config.password,
+    approve: "yes",
+  }).toString();
+  await expectStatus(
+    "OAuth authorize rejects bad password",
+    "POST",
+    "/oauth/authorize",
+    new URLSearchParams({
+      client_id: par.clientId,
+      request_uri: par.requestUri,
+      identifier: handle,
+      password: "wrong-password",
+      approve: "yes",
+    }).toString(),
+    401,
+    { "content-type": "application/x-www-form-urlencoded" },
+  );
   const response = await fetch(
-    `${config.baseUrl}/oauth/authorize?client_id=${encodeQuery(par.clientId)}&request_uri=${encodeQuery(par.requestUri)}`,
+    `${config.baseUrl}/oauth/authorize`,
     {
-      method: "GET",
-      headers: { authorization: `Bearer ${accessJwt}` },
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: formBody,
       redirect: "manual",
     },
   );
@@ -415,6 +441,17 @@ async function expectJson(label, method, path, body, validate = undefined, extra
   }
   validate?.(parsed, response);
   return parsed;
+}
+
+async function expectHtml(label, method, path, body, validate = undefined, extraHeaders = {}) {
+  const response = await request(method, path, body, extraHeaders);
+  const text = await response.text();
+  const contentType = response.headers.get("content-type") ?? "";
+  if (!contentType.includes("text/html")) {
+    throw new Error(`${label} returned content-type=${contentType} status=${response.status}: ${text}`);
+  }
+  validate?.(text, response);
+  return text;
 }
 
 async function expectStatus(label, method, path, body, status, extraHeaders = {}) {
