@@ -475,7 +475,7 @@ impl PdsDirectoryObject {
         let did = Did::new(format!("did:web:{}", body.handle)).map_err(HttpError::bad_request)?;
         let repo_name = body.handle.clone();
         let signing_key_hex = generate_repo_signing_key_hex()?;
-        let init = self
+        let init = match self
             .initialize_account_repo(
                 url,
                 &repo_name,
@@ -483,7 +483,15 @@ impl PdsDirectoryObject {
                 &body.handle,
                 &signing_key_hex,
             )
-            .await?;
+            .await
+        {
+            Ok(init) => init,
+            Err(error) if is_repo_already_initialized_error(&error) => {
+                self.recover_initialized_account_repo(url, &repo_name, did.as_str(), &body.handle)
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
 
         let salt = random_bytes::<PASSWORD_SALT_BYTES>()?;
         let account = DirectoryAccountRow {
@@ -1271,6 +1279,55 @@ impl PdsDirectoryObject {
             return Err(HttpError::new(
                 response.status_code(),
                 format!("failed to initialize repo: {text}"),
+            ));
+        }
+        response.json().await.map_err(HttpError::worker)
+    }
+
+    async fn recover_initialized_account_repo(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+        expected_did: &str,
+        expected_handle: &str,
+    ) -> Result<InternalInitRepoResponse, HttpError> {
+        let status = self.account_repo_status(url, repo_name).await?;
+        init_response_from_repo_status(status, expected_did, expected_handle)
+    }
+
+    async fn account_repo_status(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+    ) -> Result<InternalRepoStatusResponse, HttpError> {
+        let namespace = self
+            .env
+            .durable_object("REPO_OBJECTS")
+            .map_err(HttpError::worker)?;
+        let id = namespace
+            .id_from_name(repo_name)
+            .map_err(HttpError::worker)?;
+        let stub = id.get_stub().map_err(HttpError::worker)?;
+        let headers = Headers::new();
+        headers
+            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
+            .map_err(HttpError::worker)?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get).with_headers(headers);
+        let request = Request::new_with_init(
+            &format!("{}/repos/{}/status", request_origin(url), repo_name),
+            &init,
+        )
+        .map_err(HttpError::worker)?;
+        let mut response = stub
+            .fetch_with_request(request)
+            .await
+            .map_err(HttpError::worker)?;
+        if !(200..=299).contains(&response.status_code()) {
+            let text = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(HttpError::new(
+                response.status_code(),
+                format!("failed to read initialized repo status: {text}"),
             ));
         }
         response.json().await.map_err(HttpError::worker)
@@ -3096,6 +3153,19 @@ struct InternalInitRepoResponse {
     latest_rev: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct InternalRepoStatusResponse {
+    initialized: bool,
+    did: Option<String>,
+    handle: Option<String>,
+    #[serde(rename = "publicKeyMultibase")]
+    public_key_multibase: Option<String>,
+    #[serde(rename = "latestCommit")]
+    latest_commit: Option<String>,
+    #[serde(rename = "latestRev")]
+    latest_rev: Option<String>,
+}
+
 struct CreatedSession {
     row: DirectorySessionRow,
     tokens: SessionTokens,
@@ -3312,6 +3382,55 @@ impl HttpError {
             _ => Self::worker(error),
         }
     }
+}
+
+fn is_repo_already_initialized_error(error: &HttpError) -> bool {
+    error.status == 409 && error.message.contains("repo already initialized")
+}
+
+fn init_response_from_repo_status(
+    status: InternalRepoStatusResponse,
+    expected_did: &str,
+    expected_handle: &str,
+) -> Result<InternalInitRepoResponse, HttpError> {
+    if !status.initialized {
+        return Err(HttpError::new(
+            409,
+            "repo initialization conflict, but repo status is uninitialized",
+        ));
+    }
+
+    let did = status
+        .did
+        .ok_or_else(|| HttpError::new(409, "initialized repo status is missing DID"))?;
+    if did != expected_did {
+        return Err(HttpError::new(
+            409,
+            "repo already initialized for a different DID",
+        ));
+    }
+
+    let handle = status
+        .handle
+        .ok_or_else(|| HttpError::new(409, "initialized repo status is missing handle"))?;
+    if handle != expected_handle {
+        return Err(HttpError::new(
+            409,
+            "repo already initialized for a different handle",
+        ));
+    }
+
+    Ok(InternalInitRepoResponse {
+        public_key_multibase: status
+            .public_key_multibase
+            .ok_or_else(|| HttpError::new(409, "initialized repo status is missing public key"))?,
+        latest_commit: status.latest_commit.ok_or_else(|| {
+            HttpError::new(409, "initialized repo status is missing latest commit")
+        })?,
+        latest_rev: status
+            .latest_rev
+            .ok_or_else(|| HttpError::new(409, "initialized repo status is missing latest rev"))?,
+    })
 }
 
 fn mutation_response(path: &RepoPath, mutation: &RepoMutation) -> Value {
@@ -4590,5 +4709,94 @@ mod tests {
         assert!(is_host_identity_path("/.well-known/atproto-did"));
         assert!(!is_host_identity_path("/.well-known"));
         assert!(!is_host_identity_path("/.well-known/other"));
+    }
+
+    #[test]
+    fn detects_repo_already_initialized_error() {
+        let error = HttpError::new(
+            409,
+            "failed to initialize repo: {\"error\":\"repo already initialized\"}",
+        );
+        assert!(is_repo_already_initialized_error(&error));
+        assert!(!is_repo_already_initialized_error(&HttpError::new(
+            409,
+            "different conflict",
+        )));
+    }
+
+    #[test]
+    fn converts_matching_repo_status_to_init_response() {
+        let response = init_response_from_repo_status(
+            matching_repo_status(),
+            "did:web:gsv-pds.example.com",
+            "gsv-pds.example.com",
+        )
+        .unwrap();
+
+        assert_eq!(response.public_key_multibase, "zPublicKey");
+        assert_eq!(response.latest_commit, "bafyreiatestcommit");
+        assert_eq!(response.latest_rev, "3lzpfxn2f6h2c");
+    }
+
+    #[test]
+    fn rejects_recovery_status_for_different_identity() {
+        let error = init_response_from_repo_status(
+            matching_repo_status(),
+            "did:web:other.example.com",
+            "gsv-pds.example.com",
+        )
+        .unwrap_err();
+        assert_eq!(error.status, 409);
+        assert!(error.message.contains("different DID"));
+
+        let error = init_response_from_repo_status(
+            matching_repo_status(),
+            "did:web:gsv-pds.example.com",
+            "other.example.com",
+        )
+        .unwrap_err();
+        assert_eq!(error.status, 409);
+        assert!(error.message.contains("different handle"));
+    }
+
+    #[test]
+    fn rejects_incomplete_recovery_status() {
+        let error = init_response_from_repo_status(
+            InternalRepoStatusResponse {
+                initialized: false,
+                did: None,
+                handle: None,
+                public_key_multibase: None,
+                latest_commit: None,
+                latest_rev: None,
+            },
+            "did:web:gsv-pds.example.com",
+            "gsv-pds.example.com",
+        )
+        .unwrap_err();
+        assert_eq!(error.status, 409);
+        assert!(error.message.contains("uninitialized"));
+
+        let mut status = matching_repo_status();
+        status.latest_commit = None;
+        let error = init_response_from_repo_status(
+            status,
+            "did:web:gsv-pds.example.com",
+            "gsv-pds.example.com",
+        )
+        .unwrap_err();
+        assert_eq!(error.status, 409);
+        assert!(error.message.contains("latest commit"));
+    }
+
+    fn matching_repo_status() -> InternalRepoStatusResponse {
+        InternalRepoStatusResponse {
+            initialized: true,
+            did: Some("did:web:gsv-pds.example.com".to_string()),
+            handle: Some("gsv-pds.example.com".to_string()),
+            public_key_multibase: Some("zPublicKey".to_string()),
+            latest_commit: Some("bafyreiatestcommit".to_string()),
+            latest_rev: Some("3lzpfxn2f6h2c".to_string()),
+        }
     }
 }
