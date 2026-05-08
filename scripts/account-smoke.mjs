@@ -76,7 +76,51 @@ await expectJson(
   { authorization: `Bearer ${session.accessJwt}` },
 );
 
+await expectJson(
+  "check account status",
+  "GET",
+  "/xrpc/com.atproto.server.checkAccountStatus",
+  null,
+  (body) => {
+    if (
+      body.activated !== true ||
+      body.validDid !== true ||
+      !body.repoCommit ||
+      !body.repoRev ||
+      typeof body.repoBlocks !== "number" ||
+      typeof body.indexedRecords !== "number" ||
+      typeof body.expectedBlobs !== "number" ||
+      typeof body.importedBlobs !== "number"
+    ) {
+      throw new Error(`unexpected checkAccountStatus response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${session.accessJwt}` },
+);
+
+await expectStatus(
+  "update handle no-op",
+  "POST",
+  "/xrpc/com.atproto.identity.updateHandle",
+  { handle },
+  200,
+  { authorization: `Bearer ${session.accessJwt}` },
+);
+
+await expectJson(
+  "refresh identity",
+  "POST",
+  "/xrpc/com.atproto.identity.refreshIdentity",
+  { identifier: handle },
+  (body) => {
+    if (body.did !== session.did || body.handle !== handle || body.didDoc?.id !== session.did) {
+      throw new Error(`unexpected refreshIdentity response ${JSON.stringify(body)}`);
+    }
+  },
+);
+
 await expectAccountLifecycle(session);
+await expectAppPasswords(session);
 
 await expectOAuthAuthorize(oauthPar);
 const oauthToken = await expectOAuthTokenExchange(oauthPar);
@@ -272,6 +316,86 @@ async function expectAccountLifecycle(session) {
 
   await expectPasswordChangeRoundTrip(session);
   await expectDeactivateActivate(session);
+}
+
+async function expectAppPasswords(session) {
+  const name = `app-${Date.now().toString(36)}`;
+  const created = await expectJson(
+    "create app password",
+    "POST",
+    "/xrpc/com.atproto.server.createAppPassword",
+    { name, privileged: false },
+    (body) => {
+      if (
+        body.name !== name ||
+        typeof body.password !== "string" ||
+        body.password.length < 16 ||
+        typeof body.createdAt !== "string" ||
+        body.privileged !== false
+      ) {
+        throw new Error(`unexpected createAppPassword response ${JSON.stringify(body)}`);
+      }
+    },
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
+
+  await expectJson(
+    "list app passwords",
+    "GET",
+    "/xrpc/com.atproto.server.listAppPasswords",
+    null,
+    (body) => {
+      const match = body.passwords?.find((password) => password.name === name);
+      if (!match || match.password || match.privileged !== false) {
+        throw new Error(`listAppPasswords did not include sanitized app password ${JSON.stringify(body)}`);
+      }
+    },
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
+
+  const appSession = await expectJson(
+    "create session with app password",
+    "POST",
+    "/xrpc/com.atproto.server.createSession",
+    {
+      identifier: handle,
+      password: created.password,
+    },
+    (body) => {
+      if (body.did !== session.did || body.handle !== handle || !body.accessJwt || !body.refreshJwt) {
+        throw new Error(`unexpected app password createSession response ${JSON.stringify(body)}`);
+      }
+    },
+  );
+
+  await expectStatus(
+    "delete app password session",
+    "POST",
+    "/xrpc/com.atproto.server.deleteSession",
+    null,
+    200,
+    { authorization: `Bearer ${appSession.refreshJwt}` },
+  );
+
+  await expectStatus(
+    "revoke app password",
+    "POST",
+    "/xrpc/com.atproto.server.revokeAppPassword",
+    { name },
+    200,
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
+
+  await expectStatus(
+    "revoked app password rejected",
+    "POST",
+    "/xrpc/com.atproto.server.createSession",
+    {
+      identifier: handle,
+      password: created.password,
+    },
+    401,
+  );
 }
 
 async function expectPasswordChangeRoundTrip(session) {

@@ -60,14 +60,16 @@ use crate::repo_import::{
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 use crate::xrpc::{
     at_uri, optional_param, parse_get_blocks_params, parse_list_records_params, required_param,
-    route_xrpc_method, strong_ref, IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE,
-    IDENTITY_RESOLVE_IDENTITY, REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD,
-    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO, REPO_LIST_MISSING_BLOBS,
-    REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_ACTIVATE_ACCOUNT,
-    SERVER_CHANGE_PASSWORD, SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION,
+    route_xrpc_method, strong_ref, IDENTITY_REFRESH_IDENTITY, IDENTITY_RESOLVE_DID,
+    IDENTITY_RESOLVE_HANDLE, IDENTITY_RESOLVE_IDENTITY, IDENTITY_UPDATE_HANDLE, REPO_APPLY_WRITES,
+    REPO_CREATE_RECORD, REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
+    REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
+    SERVER_ACTIVATE_ACCOUNT, SERVER_CHANGE_PASSWORD, SERVER_CHECK_ACCOUNT_STATUS,
+    SERVER_CREATE_ACCOUNT, SERVER_CREATE_APP_PASSWORD, SERVER_CREATE_SESSION,
     SERVER_DEACTIVATE_ACCOUNT, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION,
-    SERVER_REFRESH_SESSION, SERVER_UPDATE_EMAIL, SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT,
-    SYNC_GET_HEAD, SYNC_GET_HOST_STATUS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
+    SERVER_LIST_APP_PASSWORDS, SERVER_REFRESH_SESSION, SERVER_REVOKE_APP_PASSWORD,
+    SERVER_UPDATE_EMAIL, SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT, SYNC_GET_HEAD,
+    SYNC_GET_HOST_STATUS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
     SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS, SYNC_LIST_REPOS_BY_COLLECTION,
     SYNC_SUBSCRIBE_REPOS,
 };
@@ -85,6 +87,7 @@ const MAX_APPLY_WRITES: usize = 200;
 const MAX_DYNAMIC_LEXICON_FETCHES: usize = 32;
 const PASSWORD_SALT_BYTES: usize = 16;
 const SESSION_ID_BYTES: usize = 24;
+const APP_PASSWORD_BYTES: usize = 18;
 const REPO_SIGNING_KEY_BYTES: usize = 32;
 const OAUTH_REQUEST_URI_BYTES: usize = 32;
 const OAUTH_DPOP_NONCE_BYTES: usize = 32;
@@ -427,8 +430,22 @@ impl PdsDirectoryObject {
                     self.xrpc_deactivate_account(req).await
                 }
                 (Method::Post, SERVER_ACTIVATE_ACCOUNT) => self.xrpc_activate_account(req, &url),
+                (Method::Get, SERVER_CHECK_ACCOUNT_STATUS) => {
+                    self.xrpc_check_account_status(req, &url).await
+                }
+                (Method::Post, SERVER_CREATE_APP_PASSWORD) => {
+                    self.xrpc_create_app_password(req).await
+                }
+                (Method::Get, SERVER_LIST_APP_PASSWORDS) => self.xrpc_list_app_passwords(req),
+                (Method::Post, SERVER_REVOKE_APP_PASSWORD) => {
+                    self.xrpc_revoke_app_password(req).await
+                }
                 (Method::Get, IDENTITY_RESOLVE_HANDLE) => self.xrpc_resolve_handle(&url),
                 (Method::Get, IDENTITY_RESOLVE_IDENTITY) => self.xrpc_resolve_identity(&url),
+                (Method::Post, IDENTITY_UPDATE_HANDLE) => self.xrpc_update_handle(req, &url).await,
+                (Method::Post, IDENTITY_REFRESH_IDENTITY) => {
+                    self.xrpc_refresh_identity(req, &url).await
+                }
                 (
                     _,
                     SERVER_CREATE_ACCOUNT
@@ -440,8 +457,14 @@ impl PdsDirectoryObject {
                     | SERVER_UPDATE_EMAIL
                     | SERVER_DEACTIVATE_ACCOUNT
                     | SERVER_ACTIVATE_ACCOUNT
+                    | SERVER_CHECK_ACCOUNT_STATUS
+                    | SERVER_CREATE_APP_PASSWORD
+                    | SERVER_LIST_APP_PASSWORDS
+                    | SERVER_REVOKE_APP_PASSWORD
                     | IDENTITY_RESOLVE_HANDLE
                     | IDENTITY_RESOLVE_IDENTITY
+                    | IDENTITY_UPDATE_HANDLE
+                    | IDENTITY_REFRESH_IDENTITY
                     | SYNC_LIST_REPOS
                     | SYNC_LIST_REPOS_BY_COLLECTION
                     | SYNC_GET_HOST_STATUS
@@ -675,7 +698,7 @@ impl PdsDirectoryObject {
         else {
             return Err(HttpError::new(401, "invalid identifier or password"));
         };
-        if !verify_password(&body.password, &account.password_hash).map_err(HttpError::auth)? {
+        if !self.verify_account_or_app_password(&account, &body.password)? {
             return Err(HttpError::new(401, "invalid identifier or password"));
         }
         if !account.active {
@@ -783,6 +806,205 @@ impl PdsDirectoryObject {
             .map_err(HttpError::worker)?
             .ok_or_else(|| HttpError::new(401, "InvalidToken"))?;
         json_response(200, &session_response(url, &account, None)).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_check_account_status(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims_allow_inactive(&claims)?;
+        let status = self.account_repo_status(url, &account.repo_name).await?;
+        json_response(
+            200,
+            &json!({
+                "activated": account.active,
+                "validDid": status.did.as_deref() == Some(account.did.as_str()),
+                "repoCommit": status.latest_commit.unwrap_or_default(),
+                "repoRev": status.latest_rev.unwrap_or_default(),
+                "repoBlocks": status.blocks,
+                "indexedRecords": status.records,
+                "privateStateValues": 0,
+                "expectedBlobs": status.expected_blobs,
+                "importedBlobs": status.imported_blobs,
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    async fn xrpc_create_app_password(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        let body: XrpcCreateAppPasswordRequest = req.json().await.map_err(HttpError::worker)?;
+        ensure_app_password_name(&body.name)?;
+        let password = generate_app_password()?;
+        let salt = random_bytes::<PASSWORD_SALT_BYTES>()?;
+        let created_at = self
+            .store()
+            .put_app_password(
+                &account.did,
+                &body.name,
+                &hash_password(&password, &salt),
+                body.privileged.unwrap_or(false),
+            )
+            .map_err(HttpError::worker)?;
+        json_response(
+            200,
+            &json!({
+                "name": body.name,
+                "password": password,
+                "createdAt": created_at,
+                "privileged": body.privileged.unwrap_or(false),
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn xrpc_list_app_passwords(&self, req: &Request) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        let passwords = self
+            .store()
+            .list_app_passwords(&account.did)
+            .map_err(HttpError::worker)?
+            .into_iter()
+            .map(|row| {
+                json!({
+                    "name": row.name,
+                    "createdAt": row.created_at,
+                    "privileged": row.privileged,
+                })
+            })
+            .collect::<Vec<_>>();
+        json_response(200, &json!({ "passwords": passwords })).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_revoke_app_password(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        let body: XrpcRevokeAppPasswordRequest = req.json().await.map_err(HttpError::worker)?;
+        self.store()
+            .delete_app_password(&account.did, &body.name)
+            .map_err(HttpError::worker)?;
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_update_handle(
+        &self,
+        req: &mut Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let mut account = self.account_for_claims(&claims)?;
+        let mut body: XrpcUpdateHandleRequest = req.json().await.map_err(HttpError::worker)?;
+        body.handle = body.handle.to_ascii_lowercase();
+        self.ensure_handle_update_allowed(req, &account, &body.handle)
+            .await?;
+        if account.handle != body.handle {
+            let store = self.store();
+            if let Some(existing) = store
+                .get_account_by_identifier(&body.handle)
+                .map_err(HttpError::worker)?
+            {
+                if existing.did != account.did {
+                    return Err(HttpError::new(400, "HandleNotAvailable"));
+                }
+            }
+            store
+                .update_account_handle(&account.did, &body.handle)
+                .map_err(HttpError::worker)?;
+            store
+                .update_repo_handle(&account.did, &body.handle)
+                .map_err(HttpError::worker)?;
+            self.update_account_repo_identity(url, &account.repo_name, &body.handle)
+                .await?;
+            let event = store
+                .append_identity_event(&account.did, &body.handle)
+                .map_err(HttpError::worker)?;
+            self.broadcast_repo_event(&event)?;
+            account.handle = body.handle;
+        }
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_refresh_identity(
+        &self,
+        req: &mut Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let body: XrpcRefreshIdentityRequest = req.json().await.map_err(HttpError::worker)?;
+        let identifier = normalize_at_identifier(&body.identifier);
+        let account = if identifier.starts_with("did:") {
+            let did = Did::new(identifier.clone()).map_err(HttpError::bad_request)?;
+            self.store()
+                .get_account_by_did(&did)
+                .map_err(HttpError::worker)?
+                .ok_or_else(|| HttpError::new(404, "DidNotFound"))?
+        } else {
+            match self
+                .store()
+                .get_account_by_identifier(&identifier)
+                .map_err(HttpError::worker)?
+            {
+                Some(account) => account,
+                None => {
+                    let Some(did) = resolve_handle_did(&identifier).await? else {
+                        return Err(HttpError::new(404, "HandleNotFound"));
+                    };
+                    let did = Did::new(did).map_err(HttpError::bad_request)?;
+                    self.store()
+                        .get_account_by_did(&did)
+                        .map_err(HttpError::worker)?
+                        .ok_or_else(|| HttpError::new(404, "DidNotFound"))?
+                }
+            }
+        };
+        if !account.active {
+            return Err(HttpError::new(400, "DidDeactivated"));
+        }
+        json_response(
+            200,
+            &identity_info_response_body(&request_origin(url), &account),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    async fn ensure_handle_update_allowed(
+        &self,
+        req: &Request,
+        account: &DirectoryAccountRow,
+        handle: &str,
+    ) -> Result<(), HttpError> {
+        validate_handle_syntax(handle).map_err(HttpError::bad_request)?;
+        if handle == account.handle {
+            return Ok(());
+        }
+        let request_host = request_host(req)?;
+        if handle != request_host && !configured_account_handle_allowed(&self.env, handle) {
+            return Err(HttpError::new(
+                400,
+                format!(
+                    "UnsupportedDomain: `{handle}` is not the request host `{request_host}` and is not allowed by PDS_ALLOWED_ACCOUNT_HANDLES or PDS_ALLOWED_ACCOUNT_HANDLE_SUFFIXES"
+                ),
+            ));
+        }
+        let Some(resolved_did) = resolve_handle_did(handle).await? else {
+            return Err(HttpError::new(
+                400,
+                format!("HandleNotResolvable: `{handle}` did not resolve to a DID"),
+            ));
+        };
+        if resolved_did != account.did.as_str() {
+            return Err(HttpError::new(
+                400,
+                format!(
+                    "HandleMismatch: `{handle}` resolves to `{resolved_did}`, expected `{}`",
+                    account.did
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn xrpc_list_repos(&self, url: &worker::Url) -> Result<Response, HttpError> {
@@ -1548,6 +1770,51 @@ impl PdsDirectoryObject {
         init_response_from_repo_status(status, expected_did, expected_handle)
     }
 
+    async fn update_account_repo_identity(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+        handle: &str,
+    ) -> Result<(), HttpError> {
+        let namespace = self
+            .env
+            .durable_object("REPO_OBJECTS")
+            .map_err(HttpError::worker)?;
+        let id = namespace
+            .id_from_name(repo_name)
+            .map_err(HttpError::worker)?;
+        let stub = id.get_stub().map_err(HttpError::worker)?;
+        let headers = Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(HttpError::worker)?;
+        headers
+            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
+            .map_err(HttpError::worker)?;
+        let mut init = RequestInit::new();
+        let body = to_string(&json!({ "handle": handle })).map_err(HttpError::worker)?;
+        init.with_method(Method::Put)
+            .with_headers(headers)
+            .with_body(Some(JsValue::from_str(&body)));
+        let request = Request::new_with_init(
+            &format!("{}/repos/{}/identity", request_origin(url), repo_name),
+            &init,
+        )
+        .map_err(HttpError::worker)?;
+        let mut response = stub
+            .fetch_with_request(request)
+            .await
+            .map_err(HttpError::worker)?;
+        if !(200..=299).contains(&response.status_code()) {
+            let text = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(HttpError::new(
+                response.status_code(),
+                format!("failed to update repo identity: {text}"),
+            ));
+        }
+        Ok(())
+    }
+
     async fn account_repo_status(
         &self,
         url: &worker::Url,
@@ -1766,6 +2033,26 @@ impl PdsDirectoryObject {
         Ok(account)
     }
 
+    fn verify_account_or_app_password(
+        &self,
+        account: &DirectoryAccountRow,
+        password: &str,
+    ) -> Result<bool, HttpError> {
+        if verify_password(password, &account.password_hash).map_err(HttpError::auth)? {
+            return Ok(true);
+        }
+        for app_password in self
+            .store()
+            .list_app_passwords(&account.did)
+            .map_err(HttpError::worker)?
+        {
+            if verify_password(password, &app_password.password_hash).map_err(HttpError::auth)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn validate_oauth_par_client(
         &self,
         request: &crate::oauth::PushedAuthorizationRequest,
@@ -1934,6 +2221,7 @@ impl RepoObject {
         match (req.method(), action) {
             (Method::Get, "status") => self.status(),
             (Method::Post, "init") => self.init(req, &repo_name).await,
+            (Method::Put, "identity") => self.update_identity(req).await,
             (Method::Post, "directory-sync") => self.sync_directory(req, &repo_name).await,
             (Method::Post, "lexicons") => self.put_lexicon(req, &repo_name).await,
             (Method::Get, "lexicons") => self.list_lexicons(req).await,
@@ -2129,6 +2417,8 @@ impl RepoObject {
         let records = store.record_count().map_err(HttpError::worker)?;
         let blobs = store.blob_count().map_err(HttpError::worker)?;
         let blob_bytes = store.total_blob_bytes().map_err(HttpError::worker)?;
+        let expected_blobs = store.expected_blob_count().map_err(HttpError::worker)?;
+        let imported_blobs = store.imported_blob_count().map_err(HttpError::worker)?;
 
         json_response(
             200,
@@ -2143,6 +2433,8 @@ impl RepoObject {
                 "records": records,
                 "blobs": blobs,
                 "blobBytes": blob_bytes,
+                "expectedBlobs": expected_blobs,
+                "importedBlobs": imported_blobs,
             }),
         )
         .map_err(HttpError::worker)
@@ -2632,6 +2924,26 @@ impl RepoObject {
                 "latestCommit": state.latest_commit.to_string(),
                 "latestRev": state.latest_rev.to_string(),
                 "mstRoot": repo.mst_root().to_string(),
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    async fn update_identity(&self, req: &mut Request) -> Result<Response, HttpError> {
+        self.require_admin(req)?;
+        let body: UpdateRepoIdentityRequest = req.json().await.map_err(HttpError::worker)?;
+        let store = self.store();
+        let mut identity = self.repo_identity_from(&store)?;
+        identity.handle = body.handle.to_ascii_lowercase();
+        validate_handle_syntax(&identity.handle).map_err(HttpError::bad_request)?;
+        store
+            .put_repo_identity(&identity)
+            .map_err(HttpError::worker)?;
+        json_response(
+            200,
+            &json!({
+                "handle": identity.handle,
+                "publicKeyMultibase": identity.public_key_multibase,
             }),
         )
         .map_err(HttpError::worker)
@@ -4046,6 +4358,11 @@ struct InitRepoRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateRepoIdentityRequest {
+    handle: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct XrpcCreateAccountRequest {
     handle: String,
     #[serde(default)]
@@ -4079,6 +4396,28 @@ struct XrpcUpdateEmailRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct XrpcUpdateHandleRequest {
+    handle: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcRefreshIdentityRequest {
+    identifier: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcCreateAppPasswordRequest {
+    name: String,
+    #[serde(default)]
+    privileged: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcRevokeAppPasswordRequest {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct InternalInitRepoResponse {
     #[serde(rename = "publicKeyMultibase")]
     public_key_multibase: String,
@@ -4099,6 +4438,14 @@ struct InternalRepoStatusResponse {
     latest_commit: Option<String>,
     #[serde(rename = "latestRev")]
     latest_rev: Option<String>,
+    #[serde(default)]
+    blocks: i64,
+    #[serde(default)]
+    records: i64,
+    #[serde(default, rename = "expectedBlobs")]
+    expected_blobs: i64,
+    #[serde(default, rename = "importedBlobs")]
+    imported_blobs: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5428,6 +5775,14 @@ fn handle_matches_suffix(handle: &str, suffix: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
+fn normalize_at_identifier(identifier: &str) -> String {
+    if identifier.starts_with("did:") {
+        identifier.to_string()
+    } else {
+        identifier.to_ascii_lowercase()
+    }
+}
+
 fn env_list(env: &Env, name: &str) -> Vec<String> {
     env.var(name)
         .ok()
@@ -5449,6 +5804,21 @@ fn ensure_password_strength(password: &str) -> Result<(), HttpError> {
     } else {
         Ok(())
     }
+}
+
+fn ensure_app_password_name(name: &str) -> Result<(), HttpError> {
+    let len = name.chars().count();
+    if name.trim().is_empty() || len > 64 {
+        return Err(HttpError::new(
+            400,
+            "InvalidName: app password name must be 1-64 characters",
+        ));
+    }
+    Ok(())
+}
+
+fn generate_app_password() -> Result<String, HttpError> {
+    random_urlsafe_token::<APP_PASSWORD_BYTES>()
 }
 
 fn normalize_account_email(email: Option<String>) -> Option<String> {
@@ -6513,6 +6883,10 @@ mod tests {
                 public_key_multibase: None,
                 latest_commit: None,
                 latest_rev: None,
+                blocks: 0,
+                records: 0,
+                expected_blobs: 0,
+                imported_blobs: 0,
             },
             "did:web:gsv-pds.example.com",
             "gsv-pds.example.com",
@@ -6555,6 +6929,26 @@ mod tests {
             body["didDoc"]["service"][0]["serviceEndpoint"],
             "https://gsv-pds.example.com"
         );
+    }
+
+    #[test]
+    fn normalizes_at_identifiers() {
+        assert_eq!(
+            normalize_at_identifier("GSV-PDS.EXAMPLE.COM"),
+            "gsv-pds.example.com"
+        );
+        assert_eq!(
+            normalize_at_identifier("did:web:MiXeD.example.com"),
+            "did:web:MiXeD.example.com"
+        );
+    }
+
+    #[test]
+    fn validates_app_password_names() {
+        assert!(ensure_app_password_name("desktop client").is_ok());
+        assert!(ensure_app_password_name("").is_err());
+        assert!(ensure_app_password_name("   ").is_err());
+        assert!(ensure_app_password_name(&"x".repeat(65)).is_err());
     }
 
     #[test]
@@ -6670,6 +7064,10 @@ mod tests {
             public_key_multibase: Some("zPublicKey".to_string()),
             latest_commit: Some("bafyreiatestcommit".to_string()),
             latest_rev: Some("3lzpfxn2f6h2c".to_string()),
+            blocks: 42,
+            records: 7,
+            expected_blobs: 2,
+            imported_blobs: 1,
         }
     }
 

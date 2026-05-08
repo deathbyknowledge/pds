@@ -96,6 +96,14 @@ pub struct DirectorySessionRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryAppPasswordRow {
+    pub name: String,
+    pub password_hash: String,
+    pub privileged: bool,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryOauthParRequestInput {
     pub request_uri: String,
     pub client_id: String,
@@ -345,6 +353,22 @@ impl SqlRepoStore {
 
     pub fn blob_count(&self) -> worker::Result<i64> {
         count(&self.sql, "SELECT COUNT(*) AS n FROM repo_blobs")
+    }
+
+    pub fn expected_blob_count(&self) -> worker::Result<i64> {
+        count(
+            &self.sql,
+            "SELECT COUNT(DISTINCT cid) AS n FROM repo_blob_refs",
+        )
+    }
+
+    pub fn imported_blob_count(&self) -> worker::Result<i64> {
+        count(
+            &self.sql,
+            "SELECT COUNT(DISTINCT blobs.cid) AS n
+             FROM repo_blobs blobs
+             JOIN repo_blob_refs refs ON refs.cid = blobs.cid",
+        )
     }
 
     pub fn clear_all(&self) -> worker::Result<()> {
@@ -855,6 +879,82 @@ impl SqlDirectoryStore {
         self.get_account_by_identifier(did.as_str())
     }
 
+    pub fn put_app_password(
+        &self,
+        did: &Did,
+        name: &str,
+        password_hash: &str,
+        privileged: bool,
+    ) -> worker::Result<String> {
+        self.sql.exec(
+            "INSERT INTO directory_app_passwords (
+                did, name, password_hash, privileged
+             )
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(did, name) DO UPDATE SET
+                password_hash = excluded.password_hash,
+                privileged = excluded.privileged,
+                created_at = unixepoch()",
+            vec![
+                SqlStorageValue::from(did.to_string()),
+                SqlStorageValue::from(name.to_string()),
+                SqlStorageValue::from(password_hash.to_string()),
+                SqlStorageValue::from(if privileged { 1_i64 } else { 0_i64 }),
+            ],
+        )?;
+        self.app_password_created_at(did, name)
+    }
+
+    pub fn list_app_passwords(&self, did: &Did) -> worker::Result<Vec<DirectoryAppPasswordRow>> {
+        let rows = self.sql.exec(
+            "SELECT name, password_hash, privileged,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+             FROM directory_app_passwords
+             WHERE did = ?
+             ORDER BY created_at ASC, name ASC",
+            vec![SqlStorageValue::from(did.to_string())],
+        )?;
+        rows.raw()
+            .map(|row| app_password_from_values(row?))
+            .collect()
+    }
+
+    pub fn delete_app_password(&self, did: &Did, name: &str) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM directory_app_passwords
+             WHERE did = ? AND name = ?",
+            vec![
+                SqlStorageValue::from(did.to_string()),
+                SqlStorageValue::from(name.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn app_password_created_at(&self, did: &Did, name: &str) -> worker::Result<String> {
+        #[derive(Deserialize)]
+        struct Row {
+            created_at: String,
+        }
+
+        let rows: Vec<Row> = self
+            .sql
+            .exec(
+                "SELECT strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_app_passwords
+                 WHERE did = ? AND name = ?",
+                vec![
+                    SqlStorageValue::from(did.to_string()),
+                    SqlStorageValue::from(name.to_string()),
+                ],
+            )?
+            .to_array()?;
+        rows.into_iter()
+            .next()
+            .map(|row| row.created_at)
+            .ok_or_else(|| worker_error(std::io::Error::other("app password not found")))
+    }
+
     pub fn update_account_password(&self, did: &Did, password_hash: &str) -> worker::Result<()> {
         self.sql.exec(
             "UPDATE directory_accounts
@@ -875,6 +975,19 @@ impl SqlDirectoryStore {
              WHERE did = ?",
             vec![
                 optional_text(email.map(|value| value.to_string())),
+                SqlStorageValue::from(did.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_account_handle(&self, did: &Did, handle: &str) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_accounts
+             SET handle = ?, updated_at = unixepoch()
+             WHERE did = ?",
+            vec![
+                SqlStorageValue::from(handle.to_string()),
                 SqlStorageValue::from(did.to_string()),
             ],
         )?;
@@ -907,6 +1020,19 @@ impl SqlDirectoryStore {
              WHERE did = ?",
             vec![
                 SqlStorageValue::from(if active { 1_i64 } else { 0_i64 }),
+                SqlStorageValue::from(did.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_repo_handle(&self, did: &Did, handle: &str) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_repos
+             SET handle = ?, updated_at = unixepoch()
+             WHERE did = ?",
+            vec![
+                SqlStorageValue::from(handle.to_string()),
                 SqlStorageValue::from(did.to_string()),
             ],
         )?;
@@ -1975,6 +2101,22 @@ fn repo_blob_from_values(values: Vec<SqlStorageValue>) -> worker::Result<RepoBlo
         byte_len,
         storage_kind,
         storage_key,
+    })
+}
+
+fn app_password_from_values(
+    values: Vec<SqlStorageValue>,
+) -> worker::Result<DirectoryAppPasswordRow> {
+    let mut values = values.into_iter();
+    let name = next_string(&mut values, "name")?;
+    let password_hash = next_string(&mut values, "password_hash")?;
+    let privileged = next_i64(&mut values, "privileged")? != 0;
+    let created_at = next_string(&mut values, "created_at")?;
+    Ok(DirectoryAppPasswordRow {
+        name,
+        password_hash,
+        privileged,
+        created_at,
     })
 }
 

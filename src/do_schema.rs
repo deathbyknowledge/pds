@@ -176,6 +176,16 @@ pub const CREATE_DIRECTORY_SESSIONS_DID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_directory_sessions_did
      ON directory_sessions(did)";
 
+pub const CREATE_DIRECTORY_APP_PASSWORDS: &str =
+    "CREATE TABLE IF NOT EXISTS directory_app_passwords (
+    did           TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    privileged    INTEGER NOT NULL DEFAULT 0,
+    created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (did, name)
+)";
+
 pub const CREATE_DIRECTORY_OAUTH_PAR_REQUESTS: &str =
     "CREATE TABLE IF NOT EXISTS directory_oauth_par_requests (
     request_uri           TEXT PRIMARY KEY,
@@ -269,6 +279,7 @@ pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_ACCOUNTS_HANDLE_INDEX,
     CREATE_DIRECTORY_SESSIONS,
     CREATE_DIRECTORY_SESSIONS_DID_INDEX,
+    CREATE_DIRECTORY_APP_PASSWORDS,
     CREATE_DIRECTORY_OAUTH_PAR_REQUESTS,
     CREATE_DIRECTORY_OAUTH_PAR_EXPIRES_INDEX,
     CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES,

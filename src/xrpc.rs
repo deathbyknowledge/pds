@@ -13,9 +13,15 @@ pub const SERVER_CHANGE_PASSWORD: &str = "com.atproto.server.changePassword";
 pub const SERVER_UPDATE_EMAIL: &str = "com.atproto.server.updateEmail";
 pub const SERVER_DEACTIVATE_ACCOUNT: &str = "com.atproto.server.deactivateAccount";
 pub const SERVER_ACTIVATE_ACCOUNT: &str = "com.atproto.server.activateAccount";
+pub const SERVER_CHECK_ACCOUNT_STATUS: &str = "com.atproto.server.checkAccountStatus";
+pub const SERVER_CREATE_APP_PASSWORD: &str = "com.atproto.server.createAppPassword";
+pub const SERVER_LIST_APP_PASSWORDS: &str = "com.atproto.server.listAppPasswords";
+pub const SERVER_REVOKE_APP_PASSWORD: &str = "com.atproto.server.revokeAppPassword";
 pub const IDENTITY_RESOLVE_HANDLE: &str = "com.atproto.identity.resolveHandle";
 pub const IDENTITY_RESOLVE_DID: &str = "com.atproto.identity.resolveDid";
 pub const IDENTITY_RESOLVE_IDENTITY: &str = "com.atproto.identity.resolveIdentity";
+pub const IDENTITY_UPDATE_HANDLE: &str = "com.atproto.identity.updateHandle";
+pub const IDENTITY_REFRESH_IDENTITY: &str = "com.atproto.identity.refreshIdentity";
 pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
 pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
@@ -103,8 +109,14 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | SERVER_UPDATE_EMAIL
         | SERVER_DEACTIVATE_ACCOUNT
         | SERVER_ACTIVATE_ACCOUNT
+        | SERVER_CHECK_ACCOUNT_STATUS
+        | SERVER_CREATE_APP_PASSWORD
+        | SERVER_LIST_APP_PASSWORDS
+        | SERVER_REVOKE_APP_PASSWORD
         | IDENTITY_RESOLVE_HANDLE
         | IDENTITY_RESOLVE_IDENTITY
+        | IDENTITY_UPDATE_HANDLE
+        | IDENTITY_REFRESH_IDENTITY
         | SYNC_LIST_REPOS
         | SYNC_LIST_REPOS_BY_COLLECTION
         | SYNC_GET_HOST_STATUS
@@ -305,7 +317,13 @@ mod tests {
             SERVER_UPDATE_EMAIL,
             SERVER_DEACTIVATE_ACCOUNT,
             SERVER_ACTIVATE_ACCOUNT,
+            SERVER_CHECK_ACCOUNT_STATUS,
+            SERVER_CREATE_APP_PASSWORD,
+            SERVER_LIST_APP_PASSWORDS,
+            SERVER_REVOKE_APP_PASSWORD,
             IDENTITY_RESOLVE_IDENTITY,
+            IDENTITY_UPDATE_HANDLE,
+            IDENTITY_REFRESH_IDENTITY,
             SYNC_LIST_REPOS,
             SYNC_LIST_REPOS_BY_COLLECTION,
             SYNC_GET_HOST_STATUS,
