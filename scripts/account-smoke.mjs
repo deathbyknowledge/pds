@@ -20,7 +20,7 @@ await expectOAuthDiscovery();
 const oauthPar = await expectOAuthParEndpoint();
 
 const created = await maybeCreateAccount();
-const session = await expectJson("create session", "POST", "/xrpc/com.atproto.server.createSession", {
+let session = await expectJson("create session", "POST", "/xrpc/com.atproto.server.createSession", {
   identifier: handle,
   password: config.password,
 });
@@ -120,6 +120,10 @@ await expectJson(
 );
 
 await expectAccountLifecycle(session);
+session = await expectJson("post lifecycle create session", "POST", "/xrpc/com.atproto.server.createSession", {
+  identifier: handle,
+  password: config.password,
+});
 await expectAppPasswords(session);
 
 await expectOAuthAuthorize(oauthPar);
@@ -301,6 +305,14 @@ async function maybeCreateAccount() {
 
 async function expectAccountLifecycle(session) {
   const email = `pds-smoke+${Date.now().toString(36)}@example.com`;
+  const currentEmail = await expectEmailConfirmationAndUpdate(session, email);
+  await expectPasswordChangeRoundTrip(session);
+  await expectPasswordResetRoundTrip(currentEmail);
+  await expectAccountDeleteTokenFlow(session);
+  await expectDeactivateActivate(session);
+}
+
+async function expectEmailConfirmationAndUpdate(session, email) {
   await expectJson(
     "update email",
     "POST",
@@ -314,8 +326,107 @@ async function expectAccountLifecycle(session) {
     { authorization: `Bearer ${session.accessJwt}` },
   );
 
-  await expectPasswordChangeRoundTrip(session);
-  await expectDeactivateActivate(session);
+  const confirmation = await expectJson(
+    "request email confirmation",
+    "POST",
+    "/xrpc/com.atproto.server.requestEmailConfirmation",
+    null,
+    (body) => {
+      if (typeof body.token !== "string" || body.token.length < 16) {
+        throw new Error(`unexpected requestEmailConfirmation response ${JSON.stringify(body)}`);
+      }
+    },
+    {
+      authorization: `Bearer ${session.accessJwt}`,
+      "x-pds-admin-token": config.adminToken,
+    },
+  );
+
+  await expectStatus(
+    "confirm email rejects bad token",
+    "POST",
+    "/xrpc/com.atproto.server.confirmEmail",
+    { email, token: "bad-token" },
+    400,
+  );
+
+  await expectStatus(
+    "confirm email",
+    "POST",
+    "/xrpc/com.atproto.server.confirmEmail",
+    { email, token: confirmation.token },
+    200,
+  );
+
+  await expectJson(
+    "confirmed email get session",
+    "GET",
+    "/xrpc/com.atproto.server.getSession",
+    null,
+    (body) => {
+      if (body.did !== session.did || body.email !== email || body.emailConfirmed !== true) {
+        throw new Error(`unexpected confirmed getSession response ${JSON.stringify(body)}`);
+      }
+    },
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
+
+  const updateRequest = await expectJson(
+    "request email update",
+    "POST",
+    "/xrpc/com.atproto.server.requestEmailUpdate",
+    null,
+    (body) => {
+      if (body.tokenRequired !== true || typeof body.token !== "string") {
+        throw new Error(`unexpected requestEmailUpdate response ${JSON.stringify(body)}`);
+      }
+    },
+    {
+      authorization: `Bearer ${session.accessJwt}`,
+      "x-pds-admin-token": config.adminToken,
+    },
+  );
+
+  const nextEmail = `pds-smoke+reset-${Date.now().toString(36)}@example.com`;
+  await expectStatus(
+    "confirmed email update requires token",
+    "POST",
+    "/xrpc/com.atproto.server.updateEmail",
+    { email: nextEmail },
+    400,
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
+
+  await expectJson(
+    "confirmed email update with token",
+    "POST",
+    "/xrpc/com.atproto.server.updateEmail",
+    { email: nextEmail, token: updateRequest.token },
+    (body) => {
+      if (body.did !== session.did || body.email !== nextEmail || body.emailConfirmed !== false) {
+        throw new Error(`unexpected token updateEmail response ${JSON.stringify(body)}`);
+      }
+    },
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
+
+  await expectJson(
+    "request email update no token required",
+    "POST",
+    "/xrpc/com.atproto.server.requestEmailUpdate",
+    null,
+    (body) => {
+      if (body.tokenRequired !== false || body.token) {
+        throw new Error(`unexpected unconfirmed requestEmailUpdate response ${JSON.stringify(body)}`);
+      }
+    },
+    {
+      authorization: `Bearer ${session.accessJwt}`,
+      "x-pds-admin-token": config.adminToken,
+    },
+  );
+
+  return nextEmail;
 }
 
 async function expectAppPasswords(session) {
@@ -489,6 +600,172 @@ async function expectPasswordChangeRoundTrip(session) {
     }
     throw error;
   }
+}
+
+async function expectPasswordResetRoundTrip(email) {
+  const temporaryPassword = `${config.password}-reset-${Date.now().toString(36)}`;
+  let resetToTemporary = false;
+  try {
+    const reset = await expectJson(
+      "request password reset",
+      "POST",
+      "/xrpc/com.atproto.server.requestPasswordReset",
+      { email },
+      (body) => {
+        if (typeof body.token !== "string" || body.token.length < 16) {
+          throw new Error(`unexpected requestPasswordReset response ${JSON.stringify(body)}`);
+        }
+      },
+      { "x-pds-admin-token": config.adminToken },
+    );
+
+    await expectStatus(
+      "reset password rejects bad token",
+      "POST",
+      "/xrpc/com.atproto.server.resetPassword",
+      { token: "bad-token", password: temporaryPassword },
+      400,
+    );
+
+    await expectStatus(
+      "reset password",
+      "POST",
+      "/xrpc/com.atproto.server.resetPassword",
+      { token: reset.token, password: temporaryPassword },
+      200,
+    );
+    resetToTemporary = true;
+
+    await expectStatus(
+      "pre-reset password rejected",
+      "POST",
+      "/xrpc/com.atproto.server.createSession",
+      {
+        identifier: handle,
+        password: config.password,
+      },
+      401,
+    );
+
+    await expectJson(
+      "reset password create session",
+      "POST",
+      "/xrpc/com.atproto.server.createSession",
+      {
+        identifier: handle,
+        password: temporaryPassword,
+      },
+    );
+
+    await restorePasswordWithReset(email, temporaryPassword, config.password);
+    resetToTemporary = false;
+
+    await expectJson(
+      "restored reset password create session",
+      "POST",
+      "/xrpc/com.atproto.server.createSession",
+      {
+        identifier: handle,
+        password: config.password,
+      },
+    );
+  } catch (error) {
+    if (resetToTemporary) {
+      try {
+        await restorePasswordWithReset(email, temporaryPassword, config.password);
+      } catch (restoreError) {
+        throw new Error(`password reset smoke failed and password restore failed: ${restoreError.message}`, {
+          cause: error,
+        });
+      }
+    }
+    throw error;
+  }
+}
+
+async function restorePasswordWithReset(email, fromPassword, toPassword) {
+  const reset = await expectJson(
+    "request restore password reset",
+    "POST",
+    "/xrpc/com.atproto.server.requestPasswordReset",
+    { email },
+    (body) => {
+      if (typeof body.token !== "string" || body.token.length < 16) {
+        throw new Error(`unexpected restore requestPasswordReset response ${JSON.stringify(body)}`);
+      }
+    },
+    { "x-pds-admin-token": config.adminToken },
+  );
+  await expectStatus(
+    "restore password by reset",
+    "POST",
+    "/xrpc/com.atproto.server.resetPassword",
+    { token: reset.token, password: toPassword },
+    200,
+  );
+  await expectJson(
+    "restore password create session",
+    "POST",
+    "/xrpc/com.atproto.server.createSession",
+    {
+      identifier: handle,
+      password: toPassword,
+    },
+  );
+  await expectStatus(
+    "temporary reset password rejected after restore",
+    "POST",
+    "/xrpc/com.atproto.server.createSession",
+    {
+      identifier: handle,
+      password: fromPassword,
+    },
+    401,
+  );
+}
+
+async function expectAccountDeleteTokenFlow(session) {
+  const requested = await expectJson(
+    "request account delete",
+    "POST",
+    "/xrpc/com.atproto.server.requestAccountDelete",
+    null,
+    (body) => {
+      if (typeof body.token !== "string" || body.token.length < 16) {
+        throw new Error(`unexpected requestAccountDelete response ${JSON.stringify(body)}`);
+      }
+    },
+    {
+      authorization: `Bearer ${session.accessJwt}`,
+      "x-pds-admin-token": config.adminToken,
+    },
+  );
+
+  await expectStatus(
+    "delete account rejects bad password",
+    "POST",
+    "/xrpc/com.atproto.server.deleteAccount",
+    {
+      did: session.did,
+      password: "wrong-password",
+      token: requested.token,
+    },
+    401,
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
+
+  await expectStatus(
+    "delete account rejects bad token",
+    "POST",
+    "/xrpc/com.atproto.server.deleteAccount",
+    {
+      did: session.did,
+      password: config.password,
+      token: "bad-token",
+    },
+    400,
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
 }
 
 async function expectDeactivateActivate(session) {

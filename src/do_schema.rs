@@ -146,6 +146,7 @@ pub const CREATE_DIRECTORY_ACCOUNTS: &str = "CREATE TABLE IF NOT EXISTS director
     did                  TEXT PRIMARY KEY,
     handle               TEXT NOT NULL UNIQUE,
     email                TEXT,
+    email_confirmed      INTEGER NOT NULL DEFAULT 0,
     password_hash        TEXT NOT NULL,
     repo_name            TEXT NOT NULL UNIQUE,
     public_key_multibase TEXT NOT NULL,
@@ -185,6 +186,25 @@ pub const CREATE_DIRECTORY_APP_PASSWORDS: &str =
     created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (did, name)
 )";
+
+pub const CREATE_DIRECTORY_ACTION_TOKENS: &str =
+    "CREATE TABLE IF NOT EXISTS directory_action_tokens (
+    token_digest TEXT PRIMARY KEY,
+    did          TEXT NOT NULL,
+    purpose      TEXT NOT NULL,
+    email        TEXT,
+    expires_at   INTEGER NOT NULL,
+    consumed_at  INTEGER,
+    created_at   INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_DIRECTORY_ACTION_TOKENS_DID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_action_tokens_did_purpose
+     ON directory_action_tokens(did, purpose, created_at)";
+
+pub const CREATE_DIRECTORY_ACTION_TOKENS_EXPIRES_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_action_tokens_expires_at
+     ON directory_action_tokens(expires_at)";
 
 pub const CREATE_DIRECTORY_OAUTH_PAR_REQUESTS: &str =
     "CREATE TABLE IF NOT EXISTS directory_oauth_par_requests (
@@ -280,6 +300,9 @@ pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_SESSIONS,
     CREATE_DIRECTORY_SESSIONS_DID_INDEX,
     CREATE_DIRECTORY_APP_PASSWORDS,
+    CREATE_DIRECTORY_ACTION_TOKENS,
+    CREATE_DIRECTORY_ACTION_TOKENS_DID_INDEX,
+    CREATE_DIRECTORY_ACTION_TOKENS_EXPIRES_INDEX,
     CREATE_DIRECTORY_OAUTH_PAR_REQUESTS,
     CREATE_DIRECTORY_OAUTH_PAR_EXPIRES_INDEX,
     CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES,
@@ -374,9 +397,13 @@ mod tests {
         assert!(joined.contains("idx_directory_events_did_seq"));
         assert!(joined.contains("directory_accounts"));
         assert!(joined.contains("password_hash        TEXT NOT NULL"));
+        assert!(joined.contains("email_confirmed      INTEGER NOT NULL DEFAULT 0"));
         assert!(joined.contains("directory_sessions"));
         assert!(joined.contains("refresh_jti        TEXT NOT NULL UNIQUE"));
         assert!(joined.contains("client_auth_method TEXT NOT NULL DEFAULT 'none'"));
+        assert!(joined.contains("directory_action_tokens"));
+        assert!(joined.contains("token_digest TEXT PRIMARY KEY"));
+        assert!(joined.contains("idx_directory_action_tokens_did_purpose"));
         assert!(joined.contains("directory_oauth_par_requests"));
         assert!(joined.contains("UNIQUE (client_id, state)"));
         assert!(joined.contains("directory_oauth_authorization_codes"));

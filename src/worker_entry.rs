@@ -33,10 +33,11 @@ use crate::cid::{parse_cid, raw_cid, raw_cid_from_sha256_digest};
 use crate::commit::{CommitBlock, Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
-    DirectoryAccountRow, DirectoryCommitEventInput, DirectoryEventRow,
-    DirectoryOauthAuthorizationCodeInput, DirectoryOauthParRequestInput,
-    DirectoryOauthParRequestRow, DirectoryRepoRow, DirectorySessionRow, RepoBlobRow,
-    RepoCommitEventInput, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
+    DirectoryAccountRow, DirectoryActionTokenInput, DirectoryActionTokenRow,
+    DirectoryCommitEventInput, DirectoryEventRow, DirectoryOauthAuthorizationCodeInput,
+    DirectoryOauthParRequestInput, DirectoryOauthParRequestRow, DirectoryRepoRow,
+    DirectorySessionRow, RepoBlobRow, RepoCommitEventInput, RepoIdentityRow, RepoStateRow,
+    SqlDirectoryStore, SqlRepoStore,
 };
 use crate::dpop::{dpop_htu, verify_dpop_proof, DpopError, VerifiedDpopProof};
 use crate::identity::{IdentityError, RepoSigningKey};
@@ -65,9 +66,11 @@ use crate::xrpc::{
     REPO_CREATE_RECORD, REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
     REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
     SERVER_ACTIVATE_ACCOUNT, SERVER_CHANGE_PASSWORD, SERVER_CHECK_ACCOUNT_STATUS,
-    SERVER_CREATE_ACCOUNT, SERVER_CREATE_APP_PASSWORD, SERVER_CREATE_SESSION,
-    SERVER_DEACTIVATE_ACCOUNT, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION,
-    SERVER_LIST_APP_PASSWORDS, SERVER_REFRESH_SESSION, SERVER_REVOKE_APP_PASSWORD,
+    SERVER_CONFIRM_EMAIL, SERVER_CREATE_ACCOUNT, SERVER_CREATE_APP_PASSWORD, SERVER_CREATE_SESSION,
+    SERVER_DEACTIVATE_ACCOUNT, SERVER_DELETE_ACCOUNT, SERVER_DELETE_SESSION,
+    SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION, SERVER_LIST_APP_PASSWORDS, SERVER_REFRESH_SESSION,
+    SERVER_REQUEST_ACCOUNT_DELETE, SERVER_REQUEST_EMAIL_CONFIRMATION, SERVER_REQUEST_EMAIL_UPDATE,
+    SERVER_REQUEST_PASSWORD_RESET, SERVER_RESET_PASSWORD, SERVER_REVOKE_APP_PASSWORD,
     SERVER_UPDATE_EMAIL, SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT, SYNC_GET_HEAD,
     SYNC_GET_HOST_STATUS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
     SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS, SYNC_LIST_REPOS_BY_COLLECTION,
@@ -88,13 +91,19 @@ const MAX_DYNAMIC_LEXICON_FETCHES: usize = 32;
 const PASSWORD_SALT_BYTES: usize = 16;
 const SESSION_ID_BYTES: usize = 24;
 const APP_PASSWORD_BYTES: usize = 18;
+const ACTION_TOKEN_BYTES: usize = 24;
 const REPO_SIGNING_KEY_BYTES: usize = 32;
 const OAUTH_REQUEST_URI_BYTES: usize = 32;
 const OAUTH_DPOP_NONCE_BYTES: usize = 32;
 const OAUTH_AUTHORIZATION_CODE_BYTES: usize = 32;
 const ACCESS_TOKEN_TTL_SECONDS: i64 = 15 * 60;
 const REFRESH_TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
+const ACTION_TOKEN_TTL_SECONDS: i64 = 60 * 60;
 const OAUTH_AUTHORIZATION_CODE_TTL_SECONDS: i64 = 5 * 60;
+const ACTION_ACCOUNT_DELETE: &str = "account_delete";
+const ACTION_PASSWORD_RESET: &str = "password_reset";
+const ACTION_EMAIL_CONFIRMATION: &str = "email_confirmation";
+const ACTION_EMAIL_UPDATE: &str = "email_update";
 
 #[event(fetch)]
 async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<Response> {
@@ -245,7 +254,14 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcRefreshSession": "POST /xrpc/com.atproto.server.refreshSession",
                 "xrpcDeleteSession": "POST /xrpc/com.atproto.server.deleteSession",
                 "xrpcChangePassword": "POST /xrpc/com.atproto.server.changePassword",
+                "xrpcRequestPasswordReset": "POST /xrpc/com.atproto.server.requestPasswordReset",
+                "xrpcResetPassword": "POST /xrpc/com.atproto.server.resetPassword",
+                "xrpcRequestEmailConfirmation": "POST /xrpc/com.atproto.server.requestEmailConfirmation",
+                "xrpcConfirmEmail": "POST /xrpc/com.atproto.server.confirmEmail",
+                "xrpcRequestEmailUpdate": "POST /xrpc/com.atproto.server.requestEmailUpdate",
                 "xrpcUpdateEmail": "POST /xrpc/com.atproto.server.updateEmail",
+                "xrpcRequestAccountDelete": "POST /xrpc/com.atproto.server.requestAccountDelete",
+                "xrpcDeleteAccount": "POST /xrpc/com.atproto.server.deleteAccount",
                 "xrpcDeactivateAccount": "POST /xrpc/com.atproto.server.deactivateAccount",
                 "xrpcActivateAccount": "POST /xrpc/com.atproto.server.activateAccount",
                 "xrpcDescribeRepo": "GET /xrpc/com.atproto.repo.describeRepo?repo=:repo",
@@ -425,7 +441,22 @@ impl PdsDirectoryObject {
                 }
                 (Method::Post, SERVER_DELETE_SESSION) => self.xrpc_delete_session(req),
                 (Method::Post, SERVER_CHANGE_PASSWORD) => self.xrpc_change_password(req).await,
+                (Method::Post, SERVER_REQUEST_PASSWORD_RESET) => {
+                    self.xrpc_request_password_reset(req).await
+                }
+                (Method::Post, SERVER_RESET_PASSWORD) => self.xrpc_reset_password(req).await,
+                (Method::Post, SERVER_REQUEST_EMAIL_CONFIRMATION) => {
+                    self.xrpc_request_email_confirmation(req).await
+                }
+                (Method::Post, SERVER_CONFIRM_EMAIL) => self.xrpc_confirm_email(req).await,
+                (Method::Post, SERVER_REQUEST_EMAIL_UPDATE) => {
+                    self.xrpc_request_email_update(req).await
+                }
                 (Method::Post, SERVER_UPDATE_EMAIL) => self.xrpc_update_email(req, &url).await,
+                (Method::Post, SERVER_REQUEST_ACCOUNT_DELETE) => {
+                    self.xrpc_request_account_delete(req).await
+                }
+                (Method::Post, SERVER_DELETE_ACCOUNT) => self.xrpc_delete_account(req).await,
                 (Method::Post, SERVER_DEACTIVATE_ACCOUNT) => {
                     self.xrpc_deactivate_account(req).await
                 }
@@ -454,7 +485,14 @@ impl PdsDirectoryObject {
                     | SERVER_REFRESH_SESSION
                     | SERVER_DELETE_SESSION
                     | SERVER_CHANGE_PASSWORD
+                    | SERVER_REQUEST_PASSWORD_RESET
+                    | SERVER_RESET_PASSWORD
+                    | SERVER_REQUEST_EMAIL_CONFIRMATION
+                    | SERVER_CONFIRM_EMAIL
+                    | SERVER_REQUEST_EMAIL_UPDATE
                     | SERVER_UPDATE_EMAIL
+                    | SERVER_REQUEST_ACCOUNT_DELETE
+                    | SERVER_DELETE_ACCOUNT
                     | SERVER_DEACTIVATE_ACCOUNT
                     | SERVER_ACTIVATE_ACCOUNT
                     | SERVER_CHECK_ACCOUNT_STATUS
@@ -599,6 +637,7 @@ impl PdsDirectoryObject {
         require_admin_with_env(&self.env, req)?;
         let mut body: XrpcCreateAccountRequest = req.json().await.map_err(HttpError::worker)?;
         body.handle = body.handle.to_ascii_lowercase();
+        body.email = normalize_account_email(body.email);
         let request_host = request_host(req)?;
         if body.did.is_some() || body.plc_op.is_some() {
             return Err(HttpError::new(
@@ -649,6 +688,7 @@ impl PdsDirectoryObject {
             did: did.clone(),
             handle: body.handle.clone(),
             email: body.email.clone(),
+            email_confirmed: false,
             password_hash: hash_password(password, &salt),
             repo_name: repo_name.clone(),
             public_key_multibase: init.public_key_multibase.clone(),
@@ -770,6 +810,102 @@ impl PdsDirectoryObject {
         empty_response(200).map_err(HttpError::worker)
     }
 
+    async fn xrpc_request_password_reset(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let body: XrpcRequestPasswordResetRequest = req.json().await.map_err(HttpError::worker)?;
+        let email = normalize_required_email(&body.email)?;
+        let account = self
+            .store()
+            .get_account_by_email(&email)
+            .map_err(HttpError::worker)?;
+        let token = if let Some(account) = account.filter(|account| account.active) {
+            Some(self.issue_action_token(&account.did, ACTION_PASSWORD_RESET, Some(&email))?)
+        } else {
+            None
+        };
+        action_token_response(&self.env, req, token.as_deref()).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_reset_password(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let body: XrpcResetPasswordRequest = req.json().await.map_err(HttpError::worker)?;
+        ensure_password_strength(&body.password)?;
+        let token = self.validate_action_token(ACTION_PASSWORD_RESET, &body.token)?;
+        let account = self
+            .store()
+            .get_account_by_did(&token.did)
+            .map_err(HttpError::worker)?
+            .ok_or_else(|| HttpError::new(400, "InvalidToken"))?;
+        if !account.active {
+            return Err(HttpError::new(403, "AccountTakedown"));
+        }
+        let salt = random_bytes::<PASSWORD_SALT_BYTES>()?;
+        let store = self.store();
+        store
+            .update_account_password(&account.did, &hash_password(&body.password, &salt))
+            .map_err(HttpError::worker)?;
+        store
+            .delete_sessions_for_did(&account.did)
+            .map_err(HttpError::worker)?;
+        store
+            .delete_app_passwords_for_did(&account.did)
+            .map_err(HttpError::worker)?;
+        self.consume_validated_action_token(&token)?;
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_request_email_confirmation(&self, req: &Request) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        let Some(email) = account.email.as_deref() else {
+            return Err(HttpError::new(400, "InvalidEmail"));
+        };
+        let token =
+            self.issue_action_token(&account.did, ACTION_EMAIL_CONFIRMATION, Some(email))?;
+        action_token_response(&self.env, req, Some(&token)).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_confirm_email(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let body: XrpcConfirmEmailRequest = req.json().await.map_err(HttpError::worker)?;
+        let email = normalize_required_email(&body.email)?;
+        let token = self.validate_action_token(ACTION_EMAIL_CONFIRMATION, &body.token)?;
+        if token.email.as_deref() != Some(email.as_str()) {
+            return Err(HttpError::new(400, "InvalidToken"));
+        }
+        let account = self
+            .store()
+            .get_account_by_did(&token.did)
+            .map_err(HttpError::worker)?
+            .ok_or_else(|| HttpError::new(400, "AccountNotFound"))?;
+        if account.email.as_deref() != Some(email.as_str()) {
+            return Err(HttpError::new(400, "InvalidEmail"));
+        }
+        self.store()
+            .set_account_email_confirmed(&account.did, &email, true)
+            .map_err(HttpError::worker)?;
+        self.consume_validated_action_token(&token)?;
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_request_email_update(&self, req: &Request) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        let token = if account.email_confirmed {
+            Some(self.issue_action_token(
+                &account.did,
+                ACTION_EMAIL_UPDATE,
+                account.email.as_deref(),
+            )?)
+        } else {
+            None
+        };
+        let mut body = json!({ "tokenRequired": account.email_confirmed });
+        if is_admin_authorized(&self.env, req)? {
+            if let Some(token) = token {
+                body["token"] = json!(token);
+            }
+        }
+        json_response(200, &body).map_err(HttpError::worker)
+    }
+
     async fn xrpc_update_email(
         &self,
         req: &mut Request,
@@ -778,11 +914,70 @@ impl PdsDirectoryObject {
         let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
         let mut account = self.account_for_claims(&claims)?;
         let body: XrpcUpdateEmailRequest = req.json().await.map_err(HttpError::worker)?;
-        account.email = normalize_account_email(body.email);
+        let email = normalize_required_email(&body.email)?;
+        let mut email_update_token = None;
+        if account.email_confirmed {
+            let Some(token) = body.token.as_deref() else {
+                return Err(HttpError::new(400, "TokenRequired"));
+            };
+            let token = self.validate_action_token(ACTION_EMAIL_UPDATE, token)?;
+            if token.did != account.did {
+                return Err(HttpError::new(400, "InvalidToken"));
+            }
+            email_update_token = Some(token);
+        }
+        account.email = Some(email);
+        account.email_confirmed = false;
         self.store()
-            .update_account_email(&account.did, account.email.as_deref())
+            .update_account_email(&account.did, account.email.as_deref(), false)
             .map_err(HttpError::worker)?;
+        if let Some(token) = email_update_token {
+            self.consume_validated_action_token(&token)?;
+        }
         json_response(200, &session_response(url, &account, None)).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_request_account_delete(&self, req: &Request) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        let token = self.issue_action_token(
+            &account.did,
+            ACTION_ACCOUNT_DELETE,
+            account.email.as_deref(),
+        )?;
+        action_token_response(&self.env, req, Some(&token)).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_delete_account(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let body: XrpcDeleteAccountRequest = req.json().await.map_err(HttpError::worker)?;
+        let did = Did::new(body.did).map_err(HttpError::bad_request)?;
+        if claims.sub != did.as_str() {
+            return Err(HttpError::new(401, "InvalidToken"));
+        }
+        let account = self.account_for_claims(&claims)?;
+        if account.did != did {
+            return Err(HttpError::new(401, "InvalidToken"));
+        }
+        if !verify_password(&body.password, &account.password_hash).map_err(HttpError::auth)? {
+            return Err(HttpError::new(401, "invalid password"));
+        }
+        let token = self.validate_action_token(ACTION_ACCOUNT_DELETE, &body.token)?;
+        if token.did != account.did {
+            return Err(HttpError::new(400, "InvalidToken"));
+        }
+        let store = self.store();
+        store
+            .delete_sessions_for_did(&account.did)
+            .map_err(HttpError::worker)?;
+        store
+            .delete_app_passwords_for_did(&account.did)
+            .map_err(HttpError::worker)?;
+        store
+            .delete_action_tokens_for_did(&account.did)
+            .map_err(HttpError::worker)?;
+        self.set_account_active(&account.did, false, Some("deleted"))?;
+        empty_response(200).map_err(HttpError::worker)
     }
 
     async fn xrpc_deactivate_account(&self, req: &Request) -> Result<Response, HttpError> {
@@ -799,6 +994,9 @@ impl PdsDirectoryObject {
     ) -> Result<Response, HttpError> {
         let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
         let account = self.account_for_claims_allow_inactive(&claims)?;
+        if account.status.as_deref() == Some("deleted") {
+            return Err(HttpError::new(403, "AccountDeleted"));
+        }
         self.set_account_active(&account.did, true, None)?;
         let account = self
             .store()
@@ -2051,6 +2249,61 @@ impl PdsDirectoryObject {
             }
         }
         Ok(false)
+    }
+
+    fn issue_action_token(
+        &self,
+        did: &Did,
+        purpose: &str,
+        email: Option<&str>,
+    ) -> Result<String, HttpError> {
+        let now = current_unix_time();
+        let token = random_urlsafe_token::<ACTION_TOKEN_BYTES>()?;
+        self.store()
+            .purge_expired_action_tokens(now)
+            .map_err(HttpError::worker)?;
+        self.store()
+            .insert_action_token(&DirectoryActionTokenInput {
+                token_digest: action_token_digest(&token),
+                did: did.clone(),
+                purpose: purpose.to_string(),
+                email: email.map(|value| value.to_string()),
+                expires_at: now.saturating_add(ACTION_TOKEN_TTL_SECONDS),
+            })
+            .map_err(HttpError::worker)?;
+        Ok(token)
+    }
+
+    fn validate_action_token(
+        &self,
+        purpose: &str,
+        token: &str,
+    ) -> Result<DirectoryActionTokenRow, HttpError> {
+        let now = current_unix_time();
+        let digest = action_token_digest(token);
+        let Some(row) = self
+            .store()
+            .get_action_token(purpose, &digest)
+            .map_err(HttpError::worker)?
+        else {
+            return Err(HttpError::new(400, "InvalidToken"));
+        };
+        if row.consumed_at.is_some() {
+            return Err(HttpError::new(400, "InvalidToken"));
+        }
+        if row.expires_at <= now {
+            return Err(HttpError::new(400, "ExpiredToken"));
+        }
+        Ok(row)
+    }
+
+    fn consume_validated_action_token(
+        &self,
+        token: &DirectoryActionTokenRow,
+    ) -> Result<(), HttpError> {
+        self.store()
+            .consume_action_token(&token.token_digest, current_unix_time())
+            .map_err(HttpError::worker)
     }
 
     async fn validate_oauth_par_client(
@@ -4390,9 +4643,34 @@ struct XrpcChangePasswordRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct XrpcRequestPasswordResetRequest {
+    email: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcResetPasswordRequest {
+    token: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcConfirmEmailRequest {
+    email: String,
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct XrpcUpdateEmailRequest {
+    email: String,
     #[serde(default)]
-    email: Option<String>,
+    token: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcDeleteAccountRequest {
+    did: String,
+    password: String,
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5821,10 +6099,48 @@ fn generate_app_password() -> Result<String, HttpError> {
     random_urlsafe_token::<APP_PASSWORD_BYTES>()
 }
 
+fn action_token_digest(token: &str) -> String {
+    BASE64_URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes()))
+}
+
+fn action_token_response(
+    env: &Env,
+    req: &Request,
+    token: Option<&str>,
+) -> worker::Result<Response> {
+    if is_admin_authorized(env, req).unwrap_or(false) {
+        let mut body = json!({});
+        if let Some(token) = token {
+            body["token"] = json!(token);
+        }
+        json_response(200, &body)
+    } else {
+        empty_response(200)
+    }
+}
+
+fn normalize_required_email(email: &str) -> Result<String, HttpError> {
+    let email = email.trim().to_ascii_lowercase();
+    let Some((local, domain)) = email.split_once('@') else {
+        return Err(HttpError::new(400, "InvalidEmail"));
+    };
+    if email.len() > 254
+        || local.is_empty()
+        || domain.is_empty()
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || !domain.contains('.')
+    {
+        return Err(HttpError::new(400, "InvalidEmail"));
+    }
+    Ok(email)
+}
+
 fn normalize_account_email(email: Option<String>) -> Option<String> {
     email
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
 }
 
 fn session_response(
@@ -5848,7 +6164,7 @@ fn session_response(
     }
     if let Some(email) = &account.email {
         body["email"] = json!(email);
-        body["emailConfirmed"] = json!(false);
+        body["emailConfirmed"] = json!(account.email_confirmed);
         body["emailAuthFactor"] = json!(false);
     }
     if let Some(tokens) = tokens {
@@ -6913,6 +7229,7 @@ mod tests {
             did: Did::new("did:web:gsv-pds.example.com").unwrap(),
             handle: "gsv-pds.example.com".to_string(),
             email: None,
+            email_confirmed: false,
             password_hash: "hash".to_string(),
             repo_name: "gsv-pds.example.com".to_string(),
             public_key_multibase: "zPublicKey".to_string(),

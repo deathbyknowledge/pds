@@ -76,6 +76,7 @@ pub struct DirectoryAccountRow {
     pub did: Did,
     pub handle: String,
     pub email: Option<String>,
+    pub email_confirmed: bool,
     pub password_hash: String,
     pub repo_name: String,
     pub public_key_multibase: String,
@@ -101,6 +102,25 @@ pub struct DirectoryAppPasswordRow {
     pub password_hash: String,
     pub privileged: bool,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryActionTokenInput {
+    pub token_digest: String,
+    pub did: Did,
+    pub purpose: String,
+    pub email: Option<String>,
+    pub expires_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryActionTokenRow {
+    pub token_digest: String,
+    pub did: Did,
+    pub purpose: String,
+    pub email: Option<String>,
+    pub expires_at: i64,
+    pub consumed_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -808,6 +828,7 @@ impl SqlDirectoryStore {
             "ALTER TABLE directory_events ADD COLUMN ops_json TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE directory_events ADD COLUMN blobs_json TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE directory_accounts ADD COLUMN email TEXT",
+            "ALTER TABLE directory_accounts ADD COLUMN email_confirmed INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE directory_accounts ADD COLUMN public_key_multibase TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE directory_accounts ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE directory_accounts ADD COLUMN status TEXT",
@@ -834,13 +855,15 @@ impl SqlDirectoryStore {
     pub fn insert_account(&self, row: &DirectoryAccountRow) -> worker::Result<()> {
         self.sql.exec(
             "INSERT INTO directory_accounts (
-                did, handle, email, password_hash, repo_name, public_key_multibase, active, status
+                did, handle, email, email_confirmed, password_hash,
+                repo_name, public_key_multibase, active, status
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(row.did.to_string()),
                 SqlStorageValue::from(row.handle.clone()),
                 optional_text(row.email.clone()),
+                SqlStorageValue::from(if row.email_confirmed { 1_i64 } else { 0_i64 }),
                 SqlStorageValue::from(row.password_hash.clone()),
                 SqlStorageValue::from(row.repo_name.clone()),
                 SqlStorageValue::from(row.public_key_multibase.clone()),
@@ -858,8 +881,8 @@ impl SqlDirectoryStore {
         let rows: Vec<DirectoryAccountStorageRow> = self
             .sql
             .exec(
-                "SELECT did, handle, email, password_hash, repo_name, public_key_multibase,
-                        active, status
+                "SELECT did, handle, email, email_confirmed, password_hash,
+                        repo_name, public_key_multibase, active, status
                  FROM directory_accounts
                  WHERE handle = ? OR did = ?
                  LIMIT 1",
@@ -877,6 +900,24 @@ impl SqlDirectoryStore {
 
     pub fn get_account_by_did(&self, did: &Did) -> worker::Result<Option<DirectoryAccountRow>> {
         self.get_account_by_identifier(did.as_str())
+    }
+
+    pub fn get_account_by_email(&self, email: &str) -> worker::Result<Option<DirectoryAccountRow>> {
+        let rows: Vec<DirectoryAccountStorageRow> = self
+            .sql
+            .exec(
+                "SELECT did, handle, email, email_confirmed, password_hash,
+                        repo_name, public_key_multibase, active, status
+                 FROM directory_accounts
+                 WHERE email = ?
+                 LIMIT 1",
+                vec![SqlStorageValue::from(email.to_string())],
+            )?
+            .to_array()?;
+        rows.into_iter()
+            .next()
+            .map(directory_account_from_row)
+            .transpose()
     }
 
     pub fn put_app_password(
@@ -931,6 +972,15 @@ impl SqlDirectoryStore {
         Ok(())
     }
 
+    pub fn delete_app_passwords_for_did(&self, did: &Did) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM directory_app_passwords
+             WHERE did = ?",
+            vec![SqlStorageValue::from(did.to_string())],
+        )?;
+        Ok(())
+    }
+
     fn app_password_created_at(&self, did: &Did, name: &str) -> worker::Result<String> {
         #[derive(Deserialize)]
         struct Row {
@@ -955,6 +1005,78 @@ impl SqlDirectoryStore {
             .ok_or_else(|| worker_error(std::io::Error::other("app password not found")))
     }
 
+    pub fn insert_action_token(&self, row: &DirectoryActionTokenInput) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO directory_action_tokens (
+                token_digest, did, purpose, email, expires_at
+             )
+             VALUES (?, ?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(row.token_digest.clone()),
+                SqlStorageValue::from(row.did.to_string()),
+                SqlStorageValue::from(row.purpose.clone()),
+                optional_text(row.email.clone()),
+                SqlStorageValue::from(row.expires_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_action_token(
+        &self,
+        purpose: &str,
+        token_digest: &str,
+    ) -> worker::Result<Option<DirectoryActionTokenRow>> {
+        let rows: Vec<DirectoryActionTokenStorageRow> = self
+            .sql
+            .exec(
+                "SELECT token_digest, did, purpose, email, expires_at, consumed_at
+                 FROM directory_action_tokens
+                 WHERE purpose = ? AND token_digest = ?
+                 LIMIT 1",
+                vec![
+                    SqlStorageValue::from(purpose.to_string()),
+                    SqlStorageValue::from(token_digest.to_string()),
+                ],
+            )?
+            .to_array()?;
+        rows.into_iter()
+            .next()
+            .map(directory_action_token_from_row)
+            .transpose()
+    }
+
+    pub fn consume_action_token(&self, token_digest: &str, now: i64) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_action_tokens
+             SET consumed_at = ?
+             WHERE token_digest = ? AND consumed_at IS NULL",
+            vec![
+                SqlStorageValue::from(now),
+                SqlStorageValue::from(token_digest.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_action_tokens_for_did(&self, did: &Did) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM directory_action_tokens
+             WHERE did = ?",
+            vec![SqlStorageValue::from(did.to_string())],
+        )?;
+        Ok(())
+    }
+
+    pub fn purge_expired_action_tokens(&self, now: i64) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM directory_action_tokens
+             WHERE expires_at <= ?",
+            vec![SqlStorageValue::from(now)],
+        )?;
+        Ok(())
+    }
+
     pub fn update_account_password(&self, did: &Did, password_hash: &str) -> worker::Result<()> {
         self.sql.exec(
             "UPDATE directory_accounts
@@ -968,14 +1090,39 @@ impl SqlDirectoryStore {
         Ok(())
     }
 
-    pub fn update_account_email(&self, did: &Did, email: Option<&str>) -> worker::Result<()> {
+    pub fn update_account_email(
+        &self,
+        did: &Did,
+        email: Option<&str>,
+        email_confirmed: bool,
+    ) -> worker::Result<()> {
         self.sql.exec(
             "UPDATE directory_accounts
-             SET email = ?, updated_at = unixepoch()
+             SET email = ?, email_confirmed = ?, updated_at = unixepoch()
              WHERE did = ?",
             vec![
                 optional_text(email.map(|value| value.to_string())),
+                SqlStorageValue::from(if email_confirmed { 1_i64 } else { 0_i64 }),
                 SqlStorageValue::from(did.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_account_email_confirmed(
+        &self,
+        did: &Did,
+        email: &str,
+        email_confirmed: bool,
+    ) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_accounts
+             SET email_confirmed = ?, updated_at = unixepoch()
+             WHERE did = ? AND email = ?",
+            vec![
+                SqlStorageValue::from(if email_confirmed { 1_i64 } else { 0_i64 }),
+                SqlStorageValue::from(did.to_string()),
+                SqlStorageValue::from(email.to_string()),
             ],
         )?;
         Ok(())
@@ -1184,6 +1331,16 @@ impl SqlDirectoryStore {
              SET active = 0, updated_at = unixepoch()
              WHERE refresh_jti = ?",
             vec![SqlStorageValue::from(refresh_jti.to_string())],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_sessions_for_did(&self, did: &Did) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_sessions
+             SET active = 0, updated_at = unixepoch()
+             WHERE did = ?",
+            vec![SqlStorageValue::from(did.to_string())],
         )?;
         Ok(())
     }
@@ -1853,6 +2010,7 @@ fn directory_account_from_row(
         did: Did::new(row.did).map_err(worker_error)?,
         handle: row.handle,
         email: row.email,
+        email_confirmed: row.email_confirmed != 0,
         password_hash: row.password_hash,
         repo_name: row.repo_name,
         public_key_multibase: row.public_key_multibase,
@@ -1923,6 +2081,19 @@ fn directory_oauth_authorization_code_from_row(
     })
 }
 
+fn directory_action_token_from_row(
+    row: DirectoryActionTokenStorageRow,
+) -> worker::Result<DirectoryActionTokenRow> {
+    Ok(DirectoryActionTokenRow {
+        token_digest: row.token_digest,
+        did: Did::new(row.did).map_err(worker_error)?,
+        purpose: row.purpose,
+        email: row.email,
+        expires_at: row.expires_at,
+        consumed_at: row.consumed_at,
+    })
+}
+
 trait IntoDirectoryRepoRow {
     fn into_directory_repo_row(self) -> worker::Result<DirectoryRepoRow>;
 }
@@ -1955,11 +2126,22 @@ struct DirectoryAccountStorageRow {
     did: String,
     handle: String,
     email: Option<String>,
+    email_confirmed: i64,
     password_hash: String,
     repo_name: String,
     public_key_multibase: String,
     active: i64,
     status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DirectoryActionTokenStorageRow {
+    token_digest: String,
+    did: String,
+    purpose: String,
+    email: Option<String>,
+    expires_at: i64,
+    consumed_at: Option<i64>,
 }
 
 #[derive(Deserialize)]

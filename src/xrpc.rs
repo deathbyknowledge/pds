@@ -10,7 +10,14 @@ pub const SERVER_GET_SESSION: &str = "com.atproto.server.getSession";
 pub const SERVER_REFRESH_SESSION: &str = "com.atproto.server.refreshSession";
 pub const SERVER_DELETE_SESSION: &str = "com.atproto.server.deleteSession";
 pub const SERVER_CHANGE_PASSWORD: &str = "com.atproto.server.changePassword";
+pub const SERVER_REQUEST_PASSWORD_RESET: &str = "com.atproto.server.requestPasswordReset";
+pub const SERVER_RESET_PASSWORD: &str = "com.atproto.server.resetPassword";
+pub const SERVER_REQUEST_EMAIL_CONFIRMATION: &str = "com.atproto.server.requestEmailConfirmation";
+pub const SERVER_CONFIRM_EMAIL: &str = "com.atproto.server.confirmEmail";
+pub const SERVER_REQUEST_EMAIL_UPDATE: &str = "com.atproto.server.requestEmailUpdate";
 pub const SERVER_UPDATE_EMAIL: &str = "com.atproto.server.updateEmail";
+pub const SERVER_REQUEST_ACCOUNT_DELETE: &str = "com.atproto.server.requestAccountDelete";
+pub const SERVER_DELETE_ACCOUNT: &str = "com.atproto.server.deleteAccount";
 pub const SERVER_DEACTIVATE_ACCOUNT: &str = "com.atproto.server.deactivateAccount";
 pub const SERVER_ACTIVATE_ACCOUNT: &str = "com.atproto.server.activateAccount";
 pub const SERVER_CHECK_ACCOUNT_STATUS: &str = "com.atproto.server.checkAccountStatus";
@@ -106,7 +113,14 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | SERVER_REFRESH_SESSION
         | SERVER_DELETE_SESSION
         | SERVER_CHANGE_PASSWORD
+        | SERVER_REQUEST_PASSWORD_RESET
+        | SERVER_RESET_PASSWORD
+        | SERVER_REQUEST_EMAIL_CONFIRMATION
+        | SERVER_CONFIRM_EMAIL
+        | SERVER_REQUEST_EMAIL_UPDATE
         | SERVER_UPDATE_EMAIL
+        | SERVER_REQUEST_ACCOUNT_DELETE
+        | SERVER_DELETE_ACCOUNT
         | SERVER_DEACTIVATE_ACCOUNT
         | SERVER_ACTIVATE_ACCOUNT
         | SERVER_CHECK_ACCOUNT_STATUS
@@ -314,7 +328,14 @@ mod tests {
             SERVER_REFRESH_SESSION,
             SERVER_DELETE_SESSION,
             SERVER_CHANGE_PASSWORD,
+            SERVER_REQUEST_PASSWORD_RESET,
+            SERVER_RESET_PASSWORD,
+            SERVER_REQUEST_EMAIL_CONFIRMATION,
+            SERVER_CONFIRM_EMAIL,
+            SERVER_REQUEST_EMAIL_UPDATE,
             SERVER_UPDATE_EMAIL,
+            SERVER_REQUEST_ACCOUNT_DELETE,
+            SERVER_DELETE_ACCOUNT,
             SERVER_DEACTIVATE_ACCOUNT,
             SERVER_ACTIVATE_ACCOUNT,
             SERVER_CHECK_ACCOUNT_STATUS,
