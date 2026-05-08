@@ -50,6 +50,7 @@ pub struct DirectoryCommitEventInput {
     pub commit_cid: Cid,
     pub rev: RepoRev,
     pub since: Option<RepoRev>,
+    pub prev_data: Option<Cid>,
     pub blocks: Vec<u8>,
     pub ops_json: String,
     pub blobs_json: String,
@@ -63,6 +64,7 @@ pub struct DirectoryEventRow {
     pub commit_cid: Option<Cid>,
     pub rev: Option<RepoRev>,
     pub since: Option<RepoRev>,
+    pub prev_data: Option<Cid>,
     pub blocks: Option<Vec<u8>>,
     pub ops_json: String,
     pub blobs_json: String,
@@ -87,6 +89,10 @@ pub struct DirectorySessionRow {
     pub did: Did,
     pub refresh_jti: String,
     pub active: bool,
+    pub client_auth_method: String,
+    pub client_auth_kid: Option<String>,
+    pub client_auth_alg: Option<String>,
+    pub client_auth_jkt: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +107,10 @@ pub struct DirectoryOauthParRequestInput {
     pub login_hint: Option<String>,
     pub dpop_jkt: String,
     pub dpop_nonce: String,
+    pub client_auth_method: String,
+    pub client_auth_kid: Option<String>,
+    pub client_auth_alg: Option<String>,
+    pub client_auth_jkt: Option<String>,
     pub params_json: String,
     pub expires_at: i64,
 }
@@ -117,6 +127,10 @@ pub struct DirectoryOauthParRequestRow {
     pub login_hint: Option<String>,
     pub dpop_jkt: String,
     pub dpop_nonce: String,
+    pub client_auth_method: String,
+    pub client_auth_kid: Option<String>,
+    pub client_auth_alg: Option<String>,
+    pub client_auth_jkt: Option<String>,
     pub params_json: String,
     pub expires_at: i64,
 }
@@ -135,6 +149,10 @@ pub struct DirectoryOauthAuthorizationCodeInput {
     pub handle: String,
     pub dpop_jkt: String,
     pub dpop_nonce: String,
+    pub client_auth_method: String,
+    pub client_auth_kid: Option<String>,
+    pub client_auth_alg: Option<String>,
+    pub client_auth_jkt: Option<String>,
     pub expires_at: i64,
 }
 
@@ -152,6 +170,10 @@ pub struct DirectoryOauthAuthorizationCodeRow {
     pub handle: String,
     pub dpop_jkt: String,
     pub dpop_nonce: String,
+    pub client_auth_method: String,
+    pub client_auth_kid: Option<String>,
+    pub client_auth_alg: Option<String>,
+    pub client_auth_jkt: Option<String>,
     pub expires_at: i64,
 }
 
@@ -173,9 +195,17 @@ pub struct RepoBlobRefRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RepoBlobGarbageRow {
+    pub cid: Cid,
+    pub storage_kind: String,
+    pub storage_key: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoCommitEventInput {
     pub rev: RepoRev,
     pub since: Option<RepoRev>,
+    pub prev_data: Option<Cid>,
     pub commit_cid: Cid,
     pub blocks: Vec<u8>,
     pub ops_json: String,
@@ -187,6 +217,7 @@ pub struct RepoCommitEventRow {
     pub seq: i64,
     pub rev: RepoRev,
     pub since: Option<RepoRev>,
+    pub prev_data: Option<Cid>,
     pub commit_cid: Cid,
     pub blocks: Vec<u8>,
     pub ops_json: String,
@@ -211,6 +242,7 @@ impl SqlRepoStore {
         for statement in [
             "ALTER TABLE repo_blobs ADD COLUMN storage_kind TEXT NOT NULL DEFAULT 'sqlite'",
             "ALTER TABLE repo_blobs ADD COLUMN storage_key TEXT",
+            "ALTER TABLE repo_commit_events ADD COLUMN prev_data TEXT",
         ] {
             exec_ignore_duplicate_column(&self.sql, statement)?;
         }
@@ -311,12 +343,17 @@ impl SqlRepoStore {
         count(&self.sql, "SELECT COUNT(*) AS n FROM record_index")
     }
 
+    pub fn blob_count(&self) -> worker::Result<i64> {
+        count(&self.sql, "SELECT COUNT(*) AS n FROM repo_blobs")
+    }
+
     pub fn clear_all(&self) -> worker::Result<()> {
         self.sql.exec("DELETE FROM record_index", None)?;
         self.sql.exec("DELETE FROM repo_blob_refs", None)?;
         self.sql.exec("DELETE FROM repo_commit_events", None)?;
         self.sql.exec("DELETE FROM repo_blobs", None)?;
         self.sql.exec("DELETE FROM repo_blocks", None)?;
+        self.sql.exec("DELETE FROM repo_lexicons", None)?;
         self.sql.exec("DELETE FROM repo_identity", None)?;
         self.sql.exec("DELETE FROM repo_state", None)?;
         Ok(())
@@ -354,6 +391,56 @@ impl SqlRepoStore {
             storage_kind: "sqlite".to_string(),
             storage_key: None,
         })
+    }
+
+    pub fn put_lexicon(&self, nsid: &str, lexicon_json: &str, source: &str) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO repo_lexicons (nsid, lexicon_json, source, updated_at)
+             VALUES (?, ?, ?, unixepoch())
+             ON CONFLICT(nsid) DO UPDATE SET
+                lexicon_json = excluded.lexicon_json,
+                source = excluded.source,
+                updated_at = excluded.updated_at",
+            vec![
+                SqlStorageValue::from(nsid.to_string()),
+                SqlStorageValue::from(lexicon_json.to_string()),
+                SqlStorageValue::from(source.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_lexicon_nsids(&self) -> worker::Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct Row {
+            nsid: String,
+        }
+
+        let rows: Vec<Row> = self
+            .sql
+            .exec("SELECT nsid FROM repo_lexicons ORDER BY nsid ASC", None)?
+            .to_array()?;
+        Ok(rows.into_iter().map(|row| row.nsid).collect())
+    }
+
+    pub fn list_lexicons(&self) -> worker::Result<Vec<(String, String)>> {
+        #[derive(Deserialize)]
+        struct Row {
+            nsid: String,
+            lexicon_json: String,
+        }
+
+        let rows: Vec<Row> = self
+            .sql
+            .exec(
+                "SELECT nsid, lexicon_json FROM repo_lexicons ORDER BY nsid ASC",
+                None,
+            )?
+            .to_array()?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.nsid, row.lexicon_json))
+            .collect())
     }
 
     pub fn put_blob_metadata(
@@ -421,9 +508,11 @@ impl SqlRepoStore {
         let rows: Vec<Row> = if let Some(cursor) = cursor {
             self.sql
                 .exec(
-                    "SELECT cid FROM repo_blobs
-                     WHERE cid > ?
-                     ORDER BY cid ASC
+                    "SELECT DISTINCT blobs.cid
+                     FROM repo_blobs blobs
+                     JOIN repo_blob_refs refs ON refs.cid = blobs.cid
+                     WHERE blobs.cid > ?
+                     ORDER BY blobs.cid ASC
                      LIMIT ?",
                     vec![
                         SqlStorageValue::from(cursor.to_string()),
@@ -434,8 +523,10 @@ impl SqlRepoStore {
         } else {
             self.sql
                 .exec(
-                    "SELECT cid FROM repo_blobs
-                     ORDER BY cid ASC
+                    "SELECT DISTINCT blobs.cid
+                     FROM repo_blobs blobs
+                     JOIN repo_blob_refs refs ON refs.cid = blobs.cid
+                     ORDER BY blobs.cid ASC
                      LIMIT ?",
                     vec![SqlStorageValue::from(query_limit as i64)],
                 )?
@@ -476,6 +567,94 @@ impl SqlRepoStore {
             )?;
         }
         Ok(())
+    }
+
+    pub fn blob_cids_for_path(&self, path: &RepoPath) -> worker::Result<Vec<Cid>> {
+        #[derive(Deserialize)]
+        struct Row {
+            cid: String,
+        }
+
+        let rows: Vec<Row> = self
+            .sql
+            .exec(
+                "SELECT cid FROM repo_blob_refs WHERE path = ? ORDER BY cid ASC",
+                vec![SqlStorageValue::from(path.as_mst_key())],
+            )?
+            .to_array()?;
+        rows.into_iter()
+            .map(|row| parse_cid(&row.cid).map_err(worker_error))
+            .collect()
+    }
+
+    pub fn list_referenced_blob_cids(&self) -> worker::Result<Vec<Cid>> {
+        #[derive(Deserialize)]
+        struct Row {
+            cid: String,
+        }
+
+        let rows: Vec<Row> = self
+            .sql
+            .exec(
+                "SELECT DISTINCT cid FROM repo_blob_refs ORDER BY cid ASC",
+                None,
+            )?
+            .to_array()?;
+        rows.into_iter()
+            .map(|row| parse_cid(&row.cid).map_err(worker_error))
+            .collect()
+    }
+
+    pub fn blob_ref_count(&self, cid: &Cid) -> worker::Result<i64> {
+        let rows: Vec<CountRow> = self
+            .sql
+            .exec(
+                "SELECT COUNT(*) AS n FROM repo_blob_refs WHERE cid = ?",
+                vec![SqlStorageValue::from(cid.to_string())],
+            )?
+            .to_array()?;
+        Ok(rows.first().map(|row| row.n).unwrap_or_default())
+    }
+
+    pub fn delete_unreferenced_blob_metadata(&self, cid: &Cid) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM repo_blobs
+             WHERE cid = ?
+             AND NOT EXISTS (
+                SELECT 1 FROM repo_blob_refs WHERE repo_blob_refs.cid = repo_blobs.cid
+             )",
+            vec![SqlStorageValue::from(cid.to_string())],
+        )?;
+        Ok(())
+    }
+
+    pub fn total_blob_bytes(&self) -> worker::Result<i64> {
+        count(
+            &self.sql,
+            "SELECT COALESCE(SUM(byte_len), 0) AS n FROM repo_blobs",
+        )
+    }
+
+    pub fn list_unreferenced_blobs_older_than(
+        &self,
+        cutoff_unix_seconds: i64,
+        limit: usize,
+    ) -> worker::Result<Vec<RepoBlobGarbageRow>> {
+        let rows = self.sql.exec(
+            "SELECT blobs.cid, blobs.storage_kind, blobs.storage_key
+             FROM repo_blobs AS blobs
+             LEFT JOIN repo_blob_refs AS refs ON refs.cid = blobs.cid
+             WHERE refs.cid IS NULL AND blobs.created_at <= ?
+             ORDER BY blobs.created_at ASC, blobs.cid ASC
+             LIMIT ?",
+            vec![
+                SqlStorageValue::from(cutoff_unix_seconds),
+                SqlStorageValue::from(limit as i64),
+            ],
+        )?;
+        rows.raw()
+            .map(|row| blob_garbage_from_values(row?))
+            .collect()
     }
 
     pub fn delete_blob_refs(&self, path: &RepoPath) -> worker::Result<()> {
@@ -535,11 +714,12 @@ impl SqlRepoStore {
     pub fn append_commit_event(&self, event: &RepoCommitEventInput) -> worker::Result<()> {
         self.sql.exec(
             "INSERT INTO repo_commit_events (
-                rev, since, commit_cid, blocks, ops_json, blobs_json
+                rev, since, prev_data, commit_cid, blocks, ops_json, blobs_json
              )
-             VALUES (?, ?, ?, ?, ?, ?)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(rev) DO UPDATE SET
                 since = excluded.since,
+                prev_data = excluded.prev_data,
                 commit_cid = excluded.commit_cid,
                 blocks = excluded.blocks,
                 ops_json = excluded.ops_json,
@@ -547,6 +727,7 @@ impl SqlRepoStore {
             vec![
                 SqlStorageValue::from(event.rev.to_string()),
                 optional_text(event.since.as_ref().map(|rev| rev.to_string())),
+                optional_text(event.prev_data.map(|cid| cid.to_string())),
                 SqlStorageValue::from(event.commit_cid.to_string()),
                 SqlStorageValue::Blob(event.blocks.clone()),
                 SqlStorageValue::from(event.ops_json.clone()),
@@ -561,7 +742,7 @@ impl SqlRepoStore {
         since: &RepoRev,
     ) -> worker::Result<Vec<RepoCommitEventRow>> {
         let rows = self.sql.exec(
-            "SELECT seq, rev, since, commit_cid, blocks, ops_json, blobs_json
+            "SELECT seq, rev, since, prev_data, commit_cid, blocks, ops_json, blobs_json
              FROM repo_commit_events
              WHERE seq > (
                 SELECT seq FROM repo_commit_events WHERE rev = ?
@@ -598,6 +779,7 @@ impl SqlDirectoryStore {
         }
         for statement in [
             "ALTER TABLE directory_events ADD COLUMN since TEXT",
+            "ALTER TABLE directory_events ADD COLUMN prev_data TEXT",
             "ALTER TABLE directory_events ADD COLUMN blocks BLOB",
             "ALTER TABLE directory_events ADD COLUMN ops_json TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE directory_events ADD COLUMN blobs_json TEXT NOT NULL DEFAULT '[]'",
@@ -607,6 +789,18 @@ impl SqlDirectoryStore {
             "ALTER TABLE directory_accounts ADD COLUMN status TEXT",
             "ALTER TABLE directory_oauth_par_requests ADD COLUMN dpop_jkt TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE directory_oauth_authorization_codes ADD COLUMN dpop_jkt TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE directory_sessions ADD COLUMN client_auth_method TEXT NOT NULL DEFAULT 'none'",
+            "ALTER TABLE directory_sessions ADD COLUMN client_auth_kid TEXT",
+            "ALTER TABLE directory_sessions ADD COLUMN client_auth_alg TEXT",
+            "ALTER TABLE directory_sessions ADD COLUMN client_auth_jkt TEXT",
+            "ALTER TABLE directory_oauth_par_requests ADD COLUMN client_auth_method TEXT NOT NULL DEFAULT 'none'",
+            "ALTER TABLE directory_oauth_par_requests ADD COLUMN client_auth_kid TEXT",
+            "ALTER TABLE directory_oauth_par_requests ADD COLUMN client_auth_alg TEXT",
+            "ALTER TABLE directory_oauth_par_requests ADD COLUMN client_auth_jkt TEXT",
+            "ALTER TABLE directory_oauth_authorization_codes ADD COLUMN client_auth_method TEXT NOT NULL DEFAULT 'none'",
+            "ALTER TABLE directory_oauth_authorization_codes ADD COLUMN client_auth_kid TEXT",
+            "ALTER TABLE directory_oauth_authorization_codes ADD COLUMN client_auth_alg TEXT",
+            "ALTER TABLE directory_oauth_authorization_codes ADD COLUMN client_auth_jkt TEXT",
         ] {
             exec_ignore_duplicate_column(&self.sql, statement)?;
         }
@@ -747,15 +941,74 @@ impl SqlDirectoryStore {
             .ok_or_else(|| worker_error(std::io::Error::other("inserted account event not found")))
     }
 
+    pub fn append_identity_event(
+        &self,
+        did: &Did,
+        handle: &str,
+    ) -> worker::Result<DirectoryEventRow> {
+        self.sql.exec(
+            "INSERT INTO directory_events (
+                did, event_type, commit_cid, rev, since, prev_data, blocks, ops_json, blobs_json
+             )
+             VALUES (?, 'identity', NULL, NULL, NULL, NULL, NULL, ?, ?)",
+            vec![
+                SqlStorageValue::from(did.to_string()),
+                SqlStorageValue::from("[]".to_string()),
+                SqlStorageValue::from(
+                    serde_json::to_string(&serde_json::json!({
+                        "handle": handle,
+                    }))
+                    .map_err(worker_error)?,
+                ),
+            ],
+        )?;
+        let seq = last_insert_rowid(&self.sql)?;
+        self.get_event(seq)?
+            .ok_or_else(|| worker_error(std::io::Error::other("inserted identity event not found")))
+    }
+
+    pub fn append_sync_event(
+        &self,
+        event: &DirectoryCommitEventInput,
+    ) -> worker::Result<DirectoryEventRow> {
+        self.sql.exec(
+            "INSERT INTO directory_events (
+                did, event_type, commit_cid, rev, since, prev_data, blocks, ops_json, blobs_json
+             )
+             VALUES (?, 'sync', ?, ?, ?, ?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(event.did.to_string()),
+                SqlStorageValue::from(event.commit_cid.to_string()),
+                SqlStorageValue::from(event.rev.to_string()),
+                optional_text(event.since.as_ref().map(|rev| rev.to_string())),
+                optional_text(event.prev_data.map(|cid| cid.to_string())),
+                SqlStorageValue::Blob(event.blocks.clone()),
+                SqlStorageValue::from(event.ops_json.clone()),
+                SqlStorageValue::from(event.blobs_json.clone()),
+            ],
+        )?;
+
+        let seq = last_insert_rowid(&self.sql)?;
+        self.get_event(seq)?
+            .ok_or_else(|| worker_error(std::io::Error::other("inserted sync event not found")))
+    }
+
     pub fn insert_session(&self, row: &DirectorySessionRow) -> worker::Result<()> {
         self.sql.exec(
-            "INSERT INTO directory_sessions (session_id, did, refresh_jti, active)
-             VALUES (?, ?, ?, ?)",
+            "INSERT INTO directory_sessions (
+                session_id, did, refresh_jti, active,
+                client_auth_method, client_auth_kid, client_auth_alg, client_auth_jkt
+             )
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(row.session_id.clone()),
                 SqlStorageValue::from(row.did.to_string()),
                 SqlStorageValue::from(row.refresh_jti.clone()),
                 SqlStorageValue::from(if row.active { 1_i64 } else { 0_i64 }),
+                SqlStorageValue::from(row.client_auth_method.clone()),
+                optional_text(row.client_auth_kid.clone()),
+                optional_text(row.client_auth_alg.clone()),
+                optional_text(row.client_auth_jkt.clone()),
             ],
         )?;
         Ok(())
@@ -768,7 +1021,8 @@ impl SqlDirectoryStore {
         let rows: Vec<DirectorySessionStorageRow> = self
             .sql
             .exec(
-                "SELECT session_id, did, refresh_jti, active
+                "SELECT session_id, did, refresh_jti, active,
+                        client_auth_method, client_auth_kid, client_auth_alg, client_auth_jkt
                  FROM directory_sessions
                  WHERE refresh_jti = ?
                  LIMIT 1",
@@ -815,9 +1069,11 @@ impl SqlDirectoryStore {
         self.sql.exec(
             "INSERT INTO directory_oauth_par_requests (
                 request_uri, client_id, redirect_uri, scope, state, code_challenge,
-                code_challenge_method, login_hint, dpop_jkt, dpop_nonce, params_json, expires_at
+                code_challenge_method, login_hint, dpop_jkt, dpop_nonce,
+                client_auth_method, client_auth_kid, client_auth_alg, client_auth_jkt,
+                params_json, expires_at
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(row.request_uri.clone()),
                 SqlStorageValue::from(row.client_id.clone()),
@@ -829,6 +1085,10 @@ impl SqlDirectoryStore {
                 optional_text(row.login_hint.clone()),
                 SqlStorageValue::from(row.dpop_jkt.clone()),
                 SqlStorageValue::from(row.dpop_nonce.clone()),
+                SqlStorageValue::from(row.client_auth_method.clone()),
+                optional_text(row.client_auth_kid.clone()),
+                optional_text(row.client_auth_alg.clone()),
+                optional_text(row.client_auth_jkt.clone()),
                 SqlStorageValue::from(row.params_json.clone()),
                 SqlStorageValue::from(row.expires_at),
             ],
@@ -846,7 +1106,9 @@ impl SqlDirectoryStore {
             .exec(
                 "SELECT
                     request_uri, client_id, redirect_uri, scope, state, code_challenge,
-                    code_challenge_method, login_hint, dpop_jkt, dpop_nonce, params_json, expires_at
+                    code_challenge_method, login_hint, dpop_jkt, dpop_nonce,
+                    client_auth_method, client_auth_kid, client_auth_alg, client_auth_jkt,
+                    params_json, expires_at
                  FROM directory_oauth_par_requests
                  WHERE request_uri = ? AND expires_at > ?
                  LIMIT 1",
@@ -907,9 +1169,11 @@ impl SqlDirectoryStore {
         self.sql.exec(
             "INSERT INTO directory_oauth_authorization_codes (
                 code, request_uri, client_id, redirect_uri, scope, state, code_challenge,
-                code_challenge_method, did, handle, dpop_jkt, dpop_nonce, expires_at
+                code_challenge_method, did, handle, dpop_jkt, dpop_nonce,
+                client_auth_method, client_auth_kid, client_auth_alg, client_auth_jkt,
+                expires_at
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(row.code.clone()),
                 SqlStorageValue::from(row.request_uri.clone()),
@@ -923,6 +1187,10 @@ impl SqlDirectoryStore {
                 SqlStorageValue::from(row.handle.clone()),
                 SqlStorageValue::from(row.dpop_jkt.clone()),
                 SqlStorageValue::from(row.dpop_nonce.clone()),
+                SqlStorageValue::from(row.client_auth_method.clone()),
+                optional_text(row.client_auth_kid.clone()),
+                optional_text(row.client_auth_alg.clone()),
+                optional_text(row.client_auth_jkt.clone()),
                 SqlStorageValue::from(row.expires_at),
             ],
         )?;
@@ -939,7 +1207,9 @@ impl SqlDirectoryStore {
             .exec(
                 "SELECT
                     code, request_uri, client_id, redirect_uri, scope, state, code_challenge,
-                    code_challenge_method, did, handle, dpop_jkt, dpop_nonce, expires_at
+                    code_challenge_method, did, handle, dpop_jkt, dpop_nonce,
+                    client_auth_method, client_auth_kid, client_auth_alg, client_auth_jkt,
+                    expires_at
                  FROM directory_oauth_authorization_codes
                  WHERE code = ? AND expires_at > ? AND consumed_at IS NULL
                  LIMIT 1",
@@ -1014,6 +1284,48 @@ impl SqlDirectoryStore {
         Ok(())
     }
 
+    pub fn has_oauth_client_jti(&self, client_id: &str, jti: &str) -> worker::Result<bool> {
+        let rows: Vec<CountRow> = self
+            .sql
+            .exec(
+                "SELECT COUNT(*) AS n
+                 FROM directory_oauth_client_jtis
+                 WHERE client_id = ? AND jti = ?",
+                vec![
+                    SqlStorageValue::from(client_id.to_string()),
+                    SqlStorageValue::from(jti.to_string()),
+                ],
+            )?
+            .to_array()?;
+        Ok(rows.first().is_some_and(|row| row.n > 0))
+    }
+
+    pub fn insert_oauth_client_jti(
+        &self,
+        client_id: &str,
+        jti: &str,
+        expires_at: i64,
+    ) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO directory_oauth_client_jtis (client_id, jti, expires_at)
+             VALUES (?, ?, ?)",
+            vec![
+                SqlStorageValue::from(client_id.to_string()),
+                SqlStorageValue::from(jti.to_string()),
+                SqlStorageValue::from(expires_at),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn purge_expired_oauth_client_jtis(&self, now: i64) -> worker::Result<()> {
+        self.sql.exec(
+            "DELETE FROM directory_oauth_client_jtis WHERE expires_at <= ?",
+            vec![SqlStorageValue::from(now)],
+        )?;
+        Ok(())
+    }
+
     pub fn upsert_repo(&self, row: &DirectoryRepoRow) -> worker::Result<()> {
         self.sql.exec(
             "INSERT INTO directory_repos (did, handle, repo_name, head, rev, active, updated_at)
@@ -1083,14 +1395,15 @@ impl SqlDirectoryStore {
     ) -> worker::Result<DirectoryEventRow> {
         self.sql.exec(
             "INSERT INTO directory_events (
-                did, event_type, commit_cid, rev, since, blocks, ops_json, blobs_json
+                did, event_type, commit_cid, rev, since, prev_data, blocks, ops_json, blobs_json
              )
-             VALUES (?, 'commit', ?, ?, ?, ?, ?, ?)",
+             VALUES (?, 'commit', ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(event.did.to_string()),
                 SqlStorageValue::from(event.commit_cid.to_string()),
                 SqlStorageValue::from(event.rev.to_string()),
                 optional_text(event.since.as_ref().map(|rev| rev.to_string())),
+                optional_text(event.prev_data.map(|cid| cid.to_string())),
                 SqlStorageValue::Blob(event.blocks.clone()),
                 SqlStorageValue::from(event.ops_json.clone()),
                 SqlStorageValue::from(event.blobs_json.clone()),
@@ -1116,7 +1429,7 @@ impl SqlDirectoryStore {
         limit: usize,
     ) -> worker::Result<Vec<DirectoryEventRow>> {
         let rows = self.sql.exec(
-            "SELECT seq, did, event_type, commit_cid, rev, since, blocks, ops_json, blobs_json,
+            "SELECT seq, did, event_type, commit_cid, rev, since, prev_data, blocks, ops_json, blobs_json,
                     strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
                  FROM directory_events
                  WHERE seq > ?
@@ -1135,7 +1448,7 @@ impl SqlDirectoryStore {
 
     fn get_event(&self, seq: i64) -> worker::Result<Option<DirectoryEventRow>> {
         let rows = self.sql.exec(
-            "SELECT seq, did, event_type, commit_cid, rev, since, blocks, ops_json, blobs_json,
+            "SELECT seq, did, event_type, commit_cid, rev, since, prev_data, blocks, ops_json, blobs_json,
                 strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
              FROM directory_events
              WHERE seq = ?",
@@ -1430,6 +1743,10 @@ fn directory_session_from_row(
         did: Did::new(row.did).map_err(worker_error)?,
         refresh_jti: row.refresh_jti,
         active: row.active != 0,
+        client_auth_method: row.client_auth_method,
+        client_auth_kid: row.client_auth_kid,
+        client_auth_alg: row.client_auth_alg,
+        client_auth_jkt: row.client_auth_jkt,
     })
 }
 
@@ -1447,6 +1764,10 @@ fn directory_oauth_par_request_from_row(
         login_hint: row.login_hint,
         dpop_jkt: row.dpop_jkt,
         dpop_nonce: row.dpop_nonce,
+        client_auth_method: row.client_auth_method,
+        client_auth_kid: row.client_auth_kid,
+        client_auth_alg: row.client_auth_alg,
+        client_auth_jkt: row.client_auth_jkt,
         params_json: row.params_json,
         expires_at: row.expires_at,
     }
@@ -1468,6 +1789,10 @@ fn directory_oauth_authorization_code_from_row(
         handle: row.handle,
         dpop_jkt: row.dpop_jkt,
         dpop_nonce: row.dpop_nonce,
+        client_auth_method: row.client_auth_method,
+        client_auth_kid: row.client_auth_kid,
+        client_auth_alg: row.client_auth_alg,
+        client_auth_jkt: row.client_auth_jkt,
         expires_at: row.expires_at,
     })
 }
@@ -1517,6 +1842,10 @@ struct DirectorySessionStorageRow {
     did: String,
     refresh_jti: String,
     active: i64,
+    client_auth_method: String,
+    client_auth_kid: Option<String>,
+    client_auth_alg: Option<String>,
+    client_auth_jkt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1531,6 +1860,10 @@ struct DirectoryOauthParRequestStorageRow {
     login_hint: Option<String>,
     dpop_jkt: String,
     dpop_nonce: String,
+    client_auth_method: String,
+    client_auth_kid: Option<String>,
+    client_auth_alg: Option<String>,
+    client_auth_jkt: Option<String>,
     params_json: String,
     expires_at: i64,
 }
@@ -1549,6 +1882,10 @@ struct DirectoryOauthAuthorizationCodeStorageRow {
     handle: String,
     dpop_jkt: String,
     dpop_nonce: String,
+    client_auth_method: String,
+    client_auth_kid: Option<String>,
+    client_auth_alg: Option<String>,
+    client_auth_jkt: Option<String>,
     expires_at: i64,
 }
 
@@ -1599,6 +1936,9 @@ fn directory_event_from_values(values: Vec<SqlStorageValue>) -> worker::Result<D
     let since = next_optional_string(&mut values, "since")?
         .map(|value| RepoRev::new(value).map_err(worker_error))
         .transpose()?;
+    let prev_data = next_optional_string(&mut values, "prev_data")?
+        .map(|value| parse_cid(&value).map_err(worker_error))
+        .transpose()?;
     let blocks = next_optional_blob(&mut values, "blocks")?;
     let ops_json = next_string(&mut values, "ops_json")?;
     let blobs_json = next_string(&mut values, "blobs_json")?;
@@ -1611,6 +1951,7 @@ fn directory_event_from_values(values: Vec<SqlStorageValue>) -> worker::Result<D
         commit_cid,
         rev,
         since,
+        prev_data,
         blocks,
         ops_json,
         blobs_json,
@@ -1650,6 +1991,19 @@ fn blob_ref_from_values(values: Vec<SqlStorageValue>) -> worker::Result<RepoBlob
     })
 }
 
+fn blob_garbage_from_values(values: Vec<SqlStorageValue>) -> worker::Result<RepoBlobGarbageRow> {
+    let mut values = values.into_iter();
+    let cid = parse_cid(&next_string(&mut values, "cid")?).map_err(worker_error)?;
+    let storage_kind = next_string(&mut values, "storage_kind")?;
+    let storage_key = next_optional_string(&mut values, "storage_key")?;
+
+    Ok(RepoBlobGarbageRow {
+        cid,
+        storage_kind,
+        storage_key,
+    })
+}
+
 fn repo_commit_event_from_values(
     values: Vec<SqlStorageValue>,
 ) -> worker::Result<RepoCommitEventRow> {
@@ -1658,6 +2012,9 @@ fn repo_commit_event_from_values(
     let rev = RepoRev::new(next_string(&mut values, "rev")?).map_err(worker_error)?;
     let since = next_optional_string(&mut values, "since")?
         .map(|value| RepoRev::new(value).map_err(worker_error))
+        .transpose()?;
+    let prev_data = next_optional_string(&mut values, "prev_data")?
+        .map(|value| parse_cid(&value).map_err(worker_error))
         .transpose()?;
     let commit_cid = parse_cid(&next_string(&mut values, "commit_cid")?).map_err(worker_error)?;
     let blocks = next_blob(&mut values, "blocks")?;
@@ -1668,6 +2025,7 @@ fn repo_commit_event_from_values(
         seq,
         rev,
         since,
+        prev_data,
         commit_cid,
         blocks,
         ops_json,

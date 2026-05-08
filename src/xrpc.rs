@@ -1,5 +1,6 @@
 //! XRPC routing and query parameter helpers.
 
+use serde::Serialize;
 use thiserror::Error;
 
 pub const SERVER_DESCRIBE_SERVER: &str = "com.atproto.server.describeServer";
@@ -14,6 +15,7 @@ pub const SERVER_DEACTIVATE_ACCOUNT: &str = "com.atproto.server.deactivateAccoun
 pub const SERVER_ACTIVATE_ACCOUNT: &str = "com.atproto.server.activateAccount";
 pub const IDENTITY_RESOLVE_HANDLE: &str = "com.atproto.identity.resolveHandle";
 pub const IDENTITY_RESOLVE_DID: &str = "com.atproto.identity.resolveDid";
+pub const IDENTITY_RESOLVE_IDENTITY: &str = "com.atproto.identity.resolveIdentity";
 pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
 pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
@@ -65,6 +67,12 @@ pub struct GetBlocksParams {
     pub cids: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StrongRef {
+    pub uri: String,
+    pub cid: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum XrpcError {
     #[error("missing required query parameter `{param}`")]
@@ -85,7 +93,7 @@ pub enum XrpcError {
 
 pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<XrpcRoute, XrpcError> {
     match method {
-        SERVER_DESCRIBE_SERVER | IDENTITY_RESOLVE_HANDLE => Ok(XrpcRoute::Worker),
+        SERVER_DESCRIBE_SERVER => Ok(XrpcRoute::Worker),
         SERVER_CREATE_ACCOUNT
         | SERVER_CREATE_SESSION
         | SERVER_GET_SESSION
@@ -95,6 +103,8 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | SERVER_UPDATE_EMAIL
         | SERVER_DEACTIVATE_ACCOUNT
         | SERVER_ACTIVATE_ACCOUNT
+        | IDENTITY_RESOLVE_HANDLE
+        | IDENTITY_RESOLVE_IDENTITY
         | SYNC_LIST_REPOS
         | SYNC_LIST_REPOS_BY_COLLECTION
         | SYNC_GET_HOST_STATUS
@@ -128,6 +138,13 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
             })
         }
         _ => Ok(XrpcRoute::Unsupported),
+    }
+}
+
+pub fn strong_ref(did: &str, collection: &str, rkey: &str, cid: &str) -> StrongRef {
+    StrongRef {
+        uri: at_uri(did, collection, rkey),
+        cid: cid.to_string(),
     }
 }
 
@@ -255,14 +272,14 @@ mod tests {
     }
 
     #[test]
-    fn routes_identity_resolve_handle_to_worker() {
+    fn routes_identity_resolve_handle_to_directory() {
         assert_eq!(
             route_xrpc_method(
                 IDENTITY_RESOLVE_HANDLE,
                 &query(&[("handle", "pds.example.com")])
             )
             .unwrap(),
-            XrpcRoute::Worker
+            XrpcRoute::DirectoryObject
         );
     }
 
@@ -288,6 +305,7 @@ mod tests {
             SERVER_UPDATE_EMAIL,
             SERVER_DEACTIVATE_ACCOUNT,
             SERVER_ACTIVATE_ACCOUNT,
+            IDENTITY_RESOLVE_IDENTITY,
             SYNC_LIST_REPOS,
             SYNC_LIST_REPOS_BY_COLLECTION,
             SYNC_GET_HOST_STATUS,
@@ -512,6 +530,17 @@ mod tests {
             XrpcError::TooManyValues {
                 param: "cids",
                 max: MAX_GET_BLOCKS_CIDS,
+            }
+        );
+    }
+
+    #[test]
+    fn builds_strong_refs() {
+        assert_eq!(
+            strong_ref("did:gsv:alice", "app.gsv.feed.post", "one", "bafyrecord"),
+            StrongRef {
+                uri: "at://did:gsv:alice/app.gsv.feed.post/one".to_string(),
+                cid: "bafyrecord".to_string(),
             }
         );
     }

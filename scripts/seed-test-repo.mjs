@@ -72,6 +72,39 @@ const handleDid = await expectText("handle DID", "GET", "/.well-known/atproto-di
   }
 });
 
+await expectJson(
+  "put Lexicon",
+  "POST",
+  `/repos/${encodePath(repo)}/lexicons`,
+  recordLexicon(collection),
+  (body) => {
+    if (
+      body.id !== collection ||
+      body.stored !== true ||
+      body.published !== true ||
+      body.uri !== `at://${did}/com.atproto.lexicon.schema/${collection}`
+    ) {
+      throw new Error(`unexpected put Lexicon response ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+await expectJson(
+  "published Lexicon record",
+  "GET",
+  `/xrpc/com.atproto.repo.getRecord?repo=${encodeQuery(did)}&collection=com.atproto.lexicon.schema&rkey=${encodeQuery(collection)}`,
+  null,
+  (body) => {
+    if (
+      body.uri !== `at://${did}/com.atproto.lexicon.schema/${collection}` ||
+      body.value?.$type !== "com.atproto.lexicon.schema" ||
+      body.value?.id !== collection
+    ) {
+      throw new Error(`unexpected published Lexicon record ${JSON.stringify(body)}`);
+    }
+  },
+);
+
 const mutation = await expectJson("seed record", "POST", `/repos/${encodePath(repo)}/records`, {
   path: config.recordPath,
   rev: config.recordRev,
@@ -87,6 +120,7 @@ const xrpcCreate = await expectJson(
     repo: did,
     collection,
     rkey: xrpcRkey,
+    validate: true,
     record: {
       $type: collection,
       text: "created through XRPC",
@@ -94,7 +128,12 @@ const xrpcCreate = await expectJson(
     },
   },
   (body) => {
-    if (body.uri !== `at://${did}/${collection}/${xrpcRkey}` || !body.cid || !body.commit?.cid) {
+    if (
+      body.uri !== `at://${did}/${collection}/${xrpcRkey}` ||
+      !body.cid ||
+      !body.commit?.cid ||
+      body.validationStatus !== "valid"
+    ) {
       throw new Error(`unexpected createRecord response ${JSON.stringify(body)}`);
     }
   },
@@ -108,6 +147,7 @@ const xrpcPut = await expectJson(
     repo: host,
     collection,
     rkey: xrpcRkey,
+    validate: true,
     record: {
       $type: collection,
       text: "updated through XRPC",
@@ -115,7 +155,12 @@ const xrpcPut = await expectJson(
     },
   },
   (body) => {
-    if (body.uri !== `at://${did}/${collection}/${xrpcRkey}` || !body.cid || !body.commit?.cid) {
+    if (
+      body.uri !== `at://${did}/${collection}/${xrpcRkey}` ||
+      !body.cid ||
+      !body.commit?.cid ||
+      body.validationStatus !== "valid"
+    ) {
       throw new Error(`unexpected putRecord response ${JSON.stringify(body)}`);
     }
   },
@@ -200,6 +245,7 @@ const applyWrites = await expectJson(
   {
     repo: did,
     swapCommit: latestCommit,
+    validate: true,
     writes: [
       {
         $type: "com.atproto.repo.applyWrites#create",
@@ -209,16 +255,6 @@ const applyWrites = await expectJson(
           $type: collection,
           text: "created through applyWrites",
           attachment: blobRef(blobCid, "text/plain", blobBytes.byteLength),
-        },
-      },
-      {
-        $type: "com.atproto.repo.applyWrites#create",
-        collection,
-        rkey: "missing-blob-ref",
-        value: {
-          $type: collection,
-          text: "references a missing blob",
-          attachment: blobRef(mutation.latestCommit, "application/octet-stream", 1),
         },
       },
       {
@@ -240,8 +276,11 @@ const applyWrites = await expectJson(
     ],
   },
   (body) => {
-    if (!body.commit?.cid || body.results?.length !== 4) {
+    if (!body.commit?.cid || body.results?.length !== 3) {
       throw new Error(`unexpected applyWrites response ${JSON.stringify(body)}`);
+    }
+    if (body.results.some((result) => result.validationStatus && result.validationStatus !== "valid")) {
+      throw new Error(`applyWrites did not validate known records ${JSON.stringify(body)}`);
     }
     const generatedUris = body.results.slice(2).map((result) => result.uri);
     if (
@@ -359,12 +398,8 @@ const missingBlobRefs = await expectJson(
   "/xrpc/com.atproto.repo.listMissingBlobs",
   null,
   (body) => {
-    const expectedUri = `at://${did}/${collection}/missing-blob-ref`;
-    const match = body.blobs?.find(
-      (blob) => blob.cid === mutation.latestCommit && blob.recordUri === expectedUri,
-    );
-    if (!match) {
-      throw new Error(`expected missing blob ref ${expectedUri}, got ${JSON.stringify(body)}`);
+    if (!Array.isArray(body.blobs)) {
+      throw new Error(`unexpected missing blob response ${JSON.stringify(body)}`);
     }
   },
 );
@@ -479,6 +514,37 @@ if (!repoDiffCar.ok || !diffContentType.includes("application/vnd.ipld.car") || 
 const importSourceCommit = latestCommit;
 const importSourceRev = latestRev;
 const importSourceBytes = new Uint8Array(carBytes);
+const importSourceStatus = await expectJson(
+  "status before import probe",
+  "GET",
+  `/repos/${encodePath(repo)}/status`,
+  null,
+  (body) => {
+    if (body.latestCommit !== importSourceCommit || body.latestRev !== importSourceRev) {
+      throw new Error(`unexpected status before import probe ${JSON.stringify(body)}`);
+    }
+    if (typeof body.blobs !== "number" || typeof body.blobBytes !== "number") {
+      throw new Error(`repo status did not include blob counters ${JSON.stringify(body)}`);
+    }
+  },
+);
+const importProbeBlobBytes = new TextEncoder().encode(`temporary import blob ${Date.now()}`);
+const importProbeBlob = await expectJson(
+  "import probe upload blob",
+  "POST",
+  "/xrpc/com.atproto.repo.uploadBlob",
+  importProbeBlobBytes,
+  (body) => {
+    if (body.blob?.mimeType !== "text/plain" || body.blob?.size !== importProbeBlobBytes.byteLength) {
+      throw new Error(`unexpected import probe uploadBlob response ${JSON.stringify(body)}`);
+    }
+  },
+  { "content-type": "text/plain" },
+);
+const importProbeBlobCid = importProbeBlob.blob.ref?.$link;
+if (!importProbeBlobCid) {
+  throw new Error(`import probe uploadBlob response did not include blob ref: ${JSON.stringify(importProbeBlob)}`);
+}
 const importProbeRkey = `import-probe-${Date.now().toString(36)}`;
 const importProbe = await expectJson(
   "import probe createRecord",
@@ -488,20 +554,38 @@ const importProbe = await expectJson(
     repo: did,
     collection,
     rkey: importProbeRkey,
+    validate: true,
     record: {
       $type: collection,
       text: "temporary record that importRepo should remove",
+      attachment: blobRef(importProbeBlobCid, "text/plain", importProbeBlobBytes.byteLength),
       createdAt: new Date().toISOString(),
     },
   },
   (body) => {
-    if (!body.commit?.cid || !body.commit?.rev) {
+    if (!body.commit?.cid || !body.commit?.rev || body.validationStatus !== "valid") {
       throw new Error(`unexpected import probe createRecord response ${JSON.stringify(body)}`);
     }
   },
 );
 latestCommit = importProbe.commit.cid;
 latestRev = importProbe.commit.rev;
+
+if (config.reset) {
+  await expectJson(
+    "status with import probe blob",
+    "GET",
+    `/repos/${encodePath(repo)}/status`,
+    null,
+    (body) => {
+      if (body.blobs !== importSourceStatus.blobs + 1) {
+        throw new Error(
+          `import probe blob was not tracked as a new blob: before=${JSON.stringify(importSourceStatus)} after=${JSON.stringify(body)}`,
+        );
+      }
+    },
+  );
+}
 
 await expectJson(
   "import probe exists",
@@ -545,6 +629,30 @@ await expectJsonStatus(
   null,
   404,
 );
+
+await expectJsonStatus(
+  "import removed probe blob",
+  "GET",
+  `/xrpc/com.atproto.sync.getBlob?did=${encodeQuery(did)}&cid=${encodeQuery(importProbeBlobCid)}`,
+  null,
+  404,
+);
+
+if (config.reset) {
+  await expectJson(
+    "status after import blob GC",
+    "GET",
+    `/repos/${encodePath(repo)}/status`,
+    null,
+    (body) => {
+      if (body.blobs !== importSourceStatus.blobs || body.blobBytes !== importSourceStatus.blobBytes) {
+        throw new Error(
+          `importRepo did not GC the probe blob: before=${JSON.stringify(importSourceStatus)} after=${JSON.stringify(body)}`,
+        );
+      }
+    },
+  );
+}
 
 const listReposAfterImport = await expectJson(
   "list repos after import",
@@ -795,6 +903,34 @@ function repoNameFromDidOrHandle(did, handle) {
 function atprotoServiceEndpoint(didDocument) {
   return didDocument.service?.find((service) => service.id === "#atproto_pds")
     ?.serviceEndpoint;
+}
+
+function recordLexicon(id) {
+  return {
+    lexicon: 1,
+    id,
+    defs: {
+      main: {
+        type: "record",
+        key: "any",
+        record: {
+          type: "object",
+          required: ["$type", "text"],
+          properties: {
+            $type: { type: "string", const: id },
+            text: { type: "string", maxLength: 4096 },
+            createdAt: { type: "string", format: "datetime" },
+            updatedAt: { type: "string", format: "datetime" },
+            attachment: {
+              type: "blob",
+              accept: ["*/*"],
+              maxSize: 10485760,
+            },
+          },
+        },
+      },
+    },
+  };
 }
 
 function blobRef(cid, mimeType, size) {

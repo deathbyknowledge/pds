@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+pub mod atproto_resolver;
 pub mod auth;
 pub mod car;
 pub mod cbor;
@@ -10,6 +11,7 @@ pub mod diagnostics;
 pub mod do_schema;
 pub mod dpop;
 pub mod identity;
+pub mod lexicon;
 pub mod model;
 pub mod mst;
 pub mod oauth;

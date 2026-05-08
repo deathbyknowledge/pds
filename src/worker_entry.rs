@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::Rc;
 
 use base64::engine::general_purpose::{
@@ -18,6 +18,11 @@ use worker::{
     WebSocket, WebSocketIncomingMessage, WebSocketPair,
 };
 
+use crate::atproto_resolver::{
+    did_document_claims_handle, did_document_pds_endpoint, did_web_document_url,
+    ensure_did_document_id, handle_did_txt_name, lexicon_authority_did_override,
+    lexicon_authority_domain, lexicon_txt_name, prefixed_txt_values, validate_handle_syntax,
+};
 use crate::auth::{
     hash_password, oauth_session_claims, session_claims, sign_token, verify_password, verify_token,
     ACCESS_SCOPE, REFRESH_SCOPE,
@@ -25,7 +30,7 @@ use crate::auth::{
 use crate::car::{decode_car, encode_car, encode_car_from_store, CarBlock, CarError};
 use crate::cbor::encode_dag_cbor;
 use crate::cid::{parse_cid, raw_cid, raw_cid_from_sha256_digest};
-use crate::commit::{Did, RepoRev};
+use crate::commit::{CommitBlock, Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
     DirectoryAccountRow, DirectoryCommitEventInput, DirectoryEventRow,
@@ -35,13 +40,15 @@ use crate::do_store::{
 };
 use crate::dpop::{dpop_htu, verify_dpop_proof, DpopError, VerifiedDpopProof};
 use crate::identity::{IdentityError, RepoSigningKey};
+use crate::lexicon::{self, RecordValidationStatus};
 use crate::oauth::{
-    authorization_server_metadata, is_localhost_client_id, is_oauth_well_known_path,
-    parse_authorization_form, parse_authorization_request, parse_pushed_authorization_request,
-    parse_token_request, protected_resource_metadata, validate_client_metadata, OAuthRequestError,
-    TokenRequest, OAUTH_AUTHORIZATION_SERVER_PATH, OAUTH_AUTHORIZE_PATH,
-    OAUTH_PAR_EXPIRES_IN_SECONDS, OAUTH_PAR_PATH, OAUTH_PROTECTED_RESOURCE_PATH,
-    OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
+    authorization_server_metadata, client_auth_method_from_metadata, client_jwks_from_metadata,
+    client_jwks_uri, is_localhost_client_id, is_oauth_well_known_path, parse_authorization_form,
+    parse_authorization_request, parse_pushed_authorization_request, parse_token_request,
+    protected_resource_metadata, validate_client_metadata, verify_private_key_jwt, OAuthClientAuth,
+    OAuthClientAuthMethod, OAuthRequestError, TokenRequest, OAUTH_AUTHORIZATION_SERVER_PATH,
+    OAUTH_AUTHORIZE_PATH, OAUTH_PAR_EXPIRES_IN_SECONDS, OAUTH_PAR_PATH,
+    OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
 };
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
@@ -53,10 +60,11 @@ use crate::repo_import::{
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 use crate::xrpc::{
     at_uri, optional_param, parse_get_blocks_params, parse_list_records_params, required_param,
-    route_xrpc_method, IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE, REPO_APPLY_WRITES,
-    REPO_CREATE_RECORD, REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
-    REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
-    SERVER_ACTIVATE_ACCOUNT, SERVER_CHANGE_PASSWORD, SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION,
+    route_xrpc_method, strong_ref, IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE,
+    IDENTITY_RESOLVE_IDENTITY, REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD,
+    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO, REPO_LIST_MISSING_BLOBS,
+    REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_ACTIVATE_ACCOUNT,
+    SERVER_CHANGE_PASSWORD, SERVER_CREATE_ACCOUNT, SERVER_CREATE_SESSION,
     SERVER_DEACTIVATE_ACCOUNT, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION,
     SERVER_REFRESH_SESSION, SERVER_UPDATE_EMAIL, SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT,
     SYNC_GET_HEAD, SYNC_GET_HOST_STATUS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
@@ -69,8 +77,12 @@ const DID_DOCUMENT_PATH: &str = "/.well-known/did.json";
 const ATPROTO_DID_PATH: &str = "/.well-known/atproto-did";
 const BLOB_BUCKET_BINDING: &str = "BLOB_BUCKET";
 const MAX_BLOB_BYTES: usize = 10 * 1024 * 1024;
+const DEFAULT_MAX_ACCOUNT_BLOB_BYTES: i64 = 1024 * 1024 * 1024;
+const TEMP_BLOB_TTL_SECONDS: i64 = 24 * 60 * 60;
+const BLOB_GC_BATCH_LIMIT: usize = 200;
 const MAX_IMPORT_REPO_BYTES: usize = 25 * 1024 * 1024;
 const MAX_APPLY_WRITES: usize = 200;
+const MAX_DYNAMIC_LEXICON_FETCHES: usize = 32;
 const PASSWORD_SALT_BYTES: usize = 16;
 const SESSION_ID_BYTES: usize = 24;
 const REPO_SIGNING_KEY_BYTES: usize = 32;
@@ -208,6 +220,8 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "repoStatus": "GET /repos/:name/status",
                 "repoInit": "POST /repos/:name/init",
                 "repoDirectorySync": "POST /repos/:name/directory-sync",
+                "repoLexiconPut": "POST /repos/:name/lexicons",
+                "repoLexiconList": "GET /repos/:name/lexicons",
                 "recordCreate": "POST /repos/:name/records",
                 "recordUpdate": "PUT /repos/:name/records",
                 "recordDelete": "DELETE /repos/:name/records",
@@ -221,6 +235,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcDescribeServer": "GET /xrpc/com.atproto.server.describeServer",
                 "xrpcResolveHandle": "GET /xrpc/com.atproto.identity.resolveHandle?handle=:handle",
                 "xrpcResolveDid": "GET /xrpc/com.atproto.identity.resolveDid?did=:did",
+                "xrpcResolveIdentity": "GET /xrpc/com.atproto.identity.resolveIdentity?identifier=:handle_or_did",
                 "xrpcCreateAccount": "POST /xrpc/com.atproto.server.createAccount",
                 "xrpcCreateSession": "POST /xrpc/com.atproto.server.createSession",
                 "xrpcGetSession": "GET /xrpc/com.atproto.server.getSession",
@@ -412,6 +427,8 @@ impl PdsDirectoryObject {
                     self.xrpc_deactivate_account(req).await
                 }
                 (Method::Post, SERVER_ACTIVATE_ACCOUNT) => self.xrpc_activate_account(req, &url),
+                (Method::Get, IDENTITY_RESOLVE_HANDLE) => self.xrpc_resolve_handle(&url),
+                (Method::Get, IDENTITY_RESOLVE_IDENTITY) => self.xrpc_resolve_identity(&url),
                 (
                     _,
                     SERVER_CREATE_ACCOUNT
@@ -423,6 +440,8 @@ impl PdsDirectoryObject {
                     | SERVER_UPDATE_EMAIL
                     | SERVER_DEACTIVATE_ACCOUNT
                     | SERVER_ACTIVATE_ACCOUNT
+                    | IDENTITY_RESOLVE_HANDLE
+                    | IDENTITY_RESOLVE_IDENTITY
                     | SYNC_LIST_REPOS
                     | SYNC_LIST_REPOS_BY_COLLECTION
                     | SYNC_GET_HOST_STATUS
@@ -480,6 +499,56 @@ impl PdsDirectoryObject {
         .map_err(HttpError::worker)
     }
 
+    fn xrpc_resolve_identity(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let identifier = required_param(&params, "identifier").map_err(HttpError::xrpc)?;
+        let Some(account) = self
+            .store()
+            .get_account_by_identifier(&identifier)
+            .map_err(HttpError::worker)?
+        else {
+            let error = if identifier.starts_with("did:") {
+                "DidNotFound"
+            } else {
+                "HandleNotFound"
+            };
+            return Err(HttpError::new(404, error));
+        };
+        if !account.active {
+            return Err(HttpError::new(404, "DidDeactivated"));
+        }
+
+        json_response(
+            200,
+            &identity_info_response_body(&request_origin(url), &account),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    fn xrpc_resolve_handle(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let handle = required_param(&params, "handle")
+            .map_err(HttpError::xrpc)?
+            .to_ascii_lowercase();
+        let Some(account) = self
+            .store()
+            .get_account_by_identifier(&handle)
+            .map_err(HttpError::worker)?
+        else {
+            return Err(HttpError::new(404, "HandleNotFound"));
+        };
+        if account.handle != handle || !account.active {
+            return Err(HttpError::new(404, "HandleNotFound"));
+        }
+        json_response(
+            200,
+            &json!({
+                "did": account.did.to_string(),
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
     fn set_account_active(
         &self,
         did: &Did,
@@ -505,9 +574,9 @@ impl PdsDirectoryObject {
         url: &worker::Url,
     ) -> Result<Response, HttpError> {
         require_admin_with_env(&self.env, req)?;
-        let body: XrpcCreateAccountRequest = req.json().await.map_err(HttpError::worker)?;
+        let mut body: XrpcCreateAccountRequest = req.json().await.map_err(HttpError::worker)?;
+        body.handle = body.handle.to_ascii_lowercase();
         let request_host = request_host(req)?;
-        ensure_supported_account_handle(&body.handle, &request_host)?;
         if body.did.is_some() || body.plc_op.is_some() {
             return Err(HttpError::new(
                 400,
@@ -529,6 +598,8 @@ impl PdsDirectoryObject {
         }
 
         let did = Did::new(format!("did:web:{}", body.handle)).map_err(HttpError::bad_request)?;
+        validate_account_handle_for_creation(&self.env, &body.handle, &request_host, did.as_str())
+            .await?;
         let repo_name = body.handle.clone();
         let signing_key_hex = generate_repo_signing_key_hex()?;
         let init = match self
@@ -548,6 +619,7 @@ impl PdsDirectoryObject {
             }
             Err(error) => return Err(error),
         };
+        validate_account_did_document(&body.handle, did.as_str()).await?;
 
         let salt = random_bytes::<PASSWORD_SALT_BYTES>()?;
         let account = DirectoryAccountRow {
@@ -570,10 +642,14 @@ impl PdsDirectoryObject {
             active: true,
         };
         store.upsert_repo(&repo).map_err(HttpError::worker)?;
-        let event = store
+        let identity_event = store
+            .append_identity_event(&did, &body.handle)
+            .map_err(HttpError::worker)?;
+        self.broadcast_repo_event(&identity_event)?;
+        let account_event = store
             .append_account_event(&did, true, None)
             .map_err(HttpError::worker)?;
-        self.broadcast_repo_event(&event)?;
+        self.broadcast_repo_event(&account_event)?;
 
         let session = self.create_session_for_account(&account)?;
         store
@@ -588,7 +664,10 @@ impl PdsDirectoryObject {
         req: &mut Request,
         url: &worker::Url,
     ) -> Result<Response, HttpError> {
-        let body: XrpcCreateSessionRequest = req.json().await.map_err(HttpError::worker)?;
+        let mut body: XrpcCreateSessionRequest = req.json().await.map_err(HttpError::worker)?;
+        if !body.identifier.starts_with("did:") {
+            body.identifier = body.identifier.to_ascii_lowercase();
+        }
         let Some(account) = self
             .store()
             .get_account_by_identifier(&body.identifier)
@@ -927,6 +1006,10 @@ impl PdsDirectoryObject {
                 handle: account.handle,
                 dpop_jkt: par.dpop_jkt.clone(),
                 dpop_nonce: par.dpop_nonce,
+                client_auth_method: par.client_auth_method,
+                client_auth_kid: par.client_auth_kid,
+                client_auth_alg: par.client_auth_alg,
+                client_auth_jkt: par.client_auth_jkt,
                 expires_at: now.saturating_add(OAUTH_AUTHORIZATION_CODE_TTL_SECONDS),
             })
             .map_err(HttpError::worker)?;
@@ -950,7 +1033,8 @@ impl PdsDirectoryObject {
             Ok(request) => request,
             Err(error) => return oauth_request_error_response(error).map_err(HttpError::worker),
         };
-        self.validate_oauth_client_metadata(&request).await?;
+        let issuer = request_origin(&req.url().map_err(HttpError::worker)?);
+        let client_auth = self.validate_oauth_par_client(&request, &issuer).await?;
         let dpop_proof = match verify_request_dpop(req, None, None, None) {
             Ok(proof) => proof,
             Err(error) => return oauth_dpop_error_response(error, None).map_err(HttpError::worker),
@@ -993,6 +1077,10 @@ impl PdsDirectoryObject {
                 login_hint: request.login_hint,
                 dpop_jkt: dpop_proof.jkt,
                 dpop_nonce: dpop_nonce.clone(),
+                client_auth_method: client_auth.method_str().to_string(),
+                client_auth_kid: client_auth.kid.clone(),
+                client_auth_alg: client_auth.alg.clone(),
+                client_auth_jkt: client_auth.jkt.clone(),
                 params_json,
                 expires_at,
             })
@@ -1018,27 +1106,37 @@ impl PdsDirectoryObject {
                 code,
                 redirect_uri,
                 code_verifier,
-            } => self.oauth_authorization_code_token(
-                req,
-                &client_id,
-                &code,
-                &redirect_uri,
-                &code_verifier,
-            ),
+                client_auth,
+            } => {
+                self.oauth_authorization_code_token(
+                    req,
+                    &client_id,
+                    &code,
+                    &redirect_uri,
+                    &code_verifier,
+                    &client_auth,
+                )
+                .await
+            }
             TokenRequest::RefreshToken {
                 client_id,
                 refresh_token,
-            } => self.oauth_refresh_token(req, &client_id, &refresh_token),
+                client_auth,
+            } => {
+                self.oauth_refresh_token(req, &client_id, &refresh_token, &client_auth)
+                    .await
+            }
         }
     }
 
-    fn oauth_authorization_code_token(
+    async fn oauth_authorization_code_token(
         &self,
         req: &Request,
         client_id: &str,
         code: &str,
         redirect_uri: &str,
         code_verifier: &str,
+        client_auth: &OAuthClientAuth,
     ) -> Result<Response, HttpError> {
         let now = current_unix_time();
         let store = self.store();
@@ -1070,6 +1168,22 @@ impl PdsDirectoryObject {
             return oauth_error_response(400, "invalid_grant", "PKCE verification failed")
                 .map_err(HttpError::worker);
         }
+        let expected_client_auth = OAuthClientAuthBinding::from_parts(
+            &authorization_code.client_auth_method,
+            authorization_code.client_auth_kid.clone(),
+            authorization_code.client_auth_alg.clone(),
+            authorization_code.client_auth_jkt.clone(),
+        )?;
+        let issuer = request_origin(&req.url().map_err(HttpError::worker)?);
+        self.validate_oauth_client_auth(
+            client_id,
+            Some(&authorization_code.redirect_uri),
+            &authorization_code.scope,
+            client_auth,
+            Some(&expected_client_auth),
+            &issuer,
+        )
+        .await?;
         let dpop_proof = match verify_request_dpop(
             req,
             Some(&authorization_code.dpop_jkt),
@@ -1104,6 +1218,7 @@ impl PdsDirectoryObject {
             client_id,
             &authorization_code.scope,
             &authorization_code.dpop_jkt,
+            &expected_client_auth,
             None,
         )?;
         store
@@ -1118,11 +1233,12 @@ impl PdsDirectoryObject {
         .map_err(HttpError::worker)
     }
 
-    fn oauth_refresh_token(
+    async fn oauth_refresh_token(
         &self,
         req: &Request,
         client_id: &str,
         refresh_token: &str,
+        client_auth: &OAuthClientAuth,
     ) -> Result<Response, HttpError> {
         let now = current_unix_time();
         let claims = match verify_token(
@@ -1178,6 +1294,22 @@ impl PdsDirectoryObject {
             return oauth_error_response(400, "invalid_grant", "refresh token is no longer active")
                 .map_err(HttpError::worker);
         }
+        let expected_client_auth = OAuthClientAuthBinding::from_parts(
+            &session.client_auth_method,
+            session.client_auth_kid.clone(),
+            session.client_auth_alg.clone(),
+            session.client_auth_jkt.clone(),
+        )?;
+        let issuer = request_origin(&req.url().map_err(HttpError::worker)?);
+        self.validate_oauth_client_auth(
+            client_id,
+            None,
+            scope,
+            client_auth,
+            Some(&expected_client_auth),
+            &issuer,
+        )
+        .await?;
         let Some(account) = store
             .get_account_by_did(&session.did)
             .map_err(HttpError::worker)?
@@ -1195,6 +1327,7 @@ impl PdsDirectoryObject {
             client_id,
             scope,
             dpop_jkt,
+            &expected_client_auth,
             Some(session.session_id),
         )?;
         store
@@ -1283,6 +1416,7 @@ impl PdsDirectoryObject {
                 .map_err(HttpError::worker)?;
         }
         let stored_event = if let Some(event) = body.event {
+            let event_type = event.event_type;
             let blocks = BASE64_STANDARD
                 .decode(event.blocks_base64)
                 .map_err(HttpError::bad_request)?;
@@ -1296,14 +1430,24 @@ impl PdsDirectoryObject {
                     .map(RepoRev::new)
                     .transpose()
                     .map_err(HttpError::bad_request)?,
+                prev_data: event
+                    .prev_data
+                    .map(|cid| parse_cid(&cid))
+                    .transpose()
+                    .map_err(HttpError::bad_request)?,
                 blocks,
                 ops_json: to_string(&event.ops).map_err(HttpError::worker)?,
                 blobs_json: to_string(&event.blobs.unwrap_or_default())
                     .map_err(HttpError::worker)?,
             };
-            let stored = store
-                .append_commit_event(&event)
-                .map_err(HttpError::worker)?;
+            let stored = match event_type {
+                DirectoryCommitEventType::Sync => {
+                    store.append_sync_event(&event).map_err(HttpError::worker)?
+                }
+                DirectoryCommitEventType::Commit => store
+                    .append_commit_event(&event)
+                    .map_err(HttpError::worker)?,
+            };
             if records.is_none() {
                 store
                     .upsert_repo_record_paths(&row.did, &event_record_paths.upserts)
@@ -1480,6 +1624,10 @@ impl PdsDirectoryObject {
                 did: account.did.clone(),
                 refresh_jti,
                 active: true,
+                client_auth_method: "none".to_string(),
+                client_auth_kid: None,
+                client_auth_alg: None,
+                client_auth_jkt: None,
             },
             tokens: SessionTokens {
                 access_jwt,
@@ -1494,6 +1642,7 @@ impl PdsDirectoryObject {
         client_id: &str,
         oauth_scope: &str,
         dpop_jkt: &str,
+        client_auth: &OAuthClientAuthBinding,
         session_id: Option<String>,
     ) -> Result<CreatedOAuthSession, HttpError> {
         let now = current_unix_time();
@@ -1543,6 +1692,10 @@ impl PdsDirectoryObject {
                 did: account.did.clone(),
                 refresh_jti,
                 active: true,
+                client_auth_method: client_auth.method_str().to_string(),
+                client_auth_kid: client_auth.kid.clone(),
+                client_auth_alg: client_auth.alg.clone(),
+                client_auth_jkt: client_auth.jkt.clone(),
             },
             tokens: SessionTokens {
                 access_jwt,
@@ -1613,22 +1766,120 @@ impl PdsDirectoryObject {
         Ok(account)
     }
 
-    async fn validate_oauth_client_metadata(
+    async fn validate_oauth_par_client(
         &self,
         request: &crate::oauth::PushedAuthorizationRequest,
-    ) -> Result<(), HttpError> {
-        let metadata = if is_localhost_client_id(&request.client_id) {
+        issuer: &str,
+    ) -> Result<OAuthClientAuthBinding, HttpError> {
+        self.validate_oauth_client_auth(
+            &request.client_id,
+            Some(&request.redirect_uri),
+            &request.scope,
+            &request.client_auth,
+            None,
+            issuer,
+        )
+        .await
+    }
+
+    async fn validate_oauth_client_auth(
+        &self,
+        client_id: &str,
+        redirect_uri: Option<&str>,
+        scope: &str,
+        client_auth: &OAuthClientAuth,
+        expected: Option<&OAuthClientAuthBinding>,
+        issuer: &str,
+    ) -> Result<OAuthClientAuthBinding, HttpError> {
+        let metadata = if is_localhost_client_id(client_id) {
             None
         } else {
-            Some(fetch_oauth_client_metadata(&request.client_id).await?)
+            Some(fetch_oauth_client_metadata(client_id).await?)
         };
-        validate_client_metadata(
-            &request.client_id,
-            metadata.as_ref(),
-            &request.redirect_uri,
-            &request.scope,
-        )
-        .map_err(HttpError::bad_request)
+        if let Some(redirect_uri) = redirect_uri {
+            validate_client_metadata(client_id, metadata.as_ref(), redirect_uri, scope)
+                .map_err(HttpError::bad_request)?;
+        }
+
+        let method = if let Some(metadata) = metadata.as_ref() {
+            if metadata.get("client_id").and_then(Value::as_str) != Some(client_id) {
+                return Err(HttpError::bad_request(
+                    OAuthRequestError::InvalidParameter {
+                        parameter: "client_id",
+                        message: "client metadata client_id did not match".to_string(),
+                    },
+                ));
+            }
+            client_auth_method_from_metadata(metadata).map_err(HttpError::bad_request)?
+        } else {
+            OAuthClientAuthMethod::None
+        };
+        if method != client_auth.method() {
+            return Err(HttpError::new(
+                401,
+                format!(
+                    "OAuth client authentication method `{}` did not match client metadata `{}`",
+                    client_auth.method().as_str(),
+                    method.as_str()
+                ),
+            ));
+        }
+
+        let binding = match client_auth {
+            OAuthClientAuth::None => OAuthClientAuthBinding::none(),
+            OAuthClientAuth::PrivateKeyJwt { assertion } => {
+                let metadata = metadata.as_ref().ok_or_else(|| {
+                    HttpError::new(401, "localhost clients cannot use private_key_jwt")
+                })?;
+                let jwks = self.fetch_oauth_client_jwks(metadata).await?;
+                let verified = verify_private_key_jwt(
+                    assertion,
+                    client_id,
+                    issuer,
+                    &jwks,
+                    current_unix_time(),
+                )
+                .map_err(HttpError::bad_request)?;
+                self.remember_oauth_client_assertion(client_id, &verified)?;
+                OAuthClientAuthBinding::from_verified(verified)
+            }
+        };
+        if let Some(expected) = expected {
+            binding.ensure_matches(expected)?;
+        }
+        Ok(binding)
+    }
+
+    async fn fetch_oauth_client_jwks(&self, metadata: &Value) -> Result<Value, HttpError> {
+        let fetched_jwks =
+            if let Some(jwks_uri) = client_jwks_uri(metadata).map_err(HttpError::bad_request)? {
+                Some(fetch_oauth_jwks(&jwks_uri).await?)
+            } else {
+                None
+            };
+        client_jwks_from_metadata(metadata, fetched_jwks.as_ref()).map_err(HttpError::bad_request)
+    }
+
+    fn remember_oauth_client_assertion(
+        &self,
+        client_id: &str,
+        assertion: &crate::oauth::VerifiedClientAssertion,
+    ) -> Result<(), HttpError> {
+        let now = current_unix_time();
+        let store = self.store();
+        store
+            .purge_expired_oauth_client_jtis(now)
+            .map_err(HttpError::worker)?;
+        if store
+            .has_oauth_client_jti(client_id, &assertion.jti)
+            .map_err(HttpError::worker)?
+        {
+            return Err(HttpError::new(401, "OAuth client assertion replay"));
+        }
+        store
+            .insert_oauth_client_jti(client_id, &assertion.jti, assertion.expires_at)
+            .map_err(HttpError::worker)?;
+        Ok(())
     }
 
     fn remember_dpop_proof(
@@ -1684,6 +1935,8 @@ impl RepoObject {
             (Method::Get, "status") => self.status(),
             (Method::Post, "init") => self.init(req, &repo_name).await,
             (Method::Post, "directory-sync") => self.sync_directory(req, &repo_name).await,
+            (Method::Post, "lexicons") => self.put_lexicon(req, &repo_name).await,
+            (Method::Get, "lexicons") => self.list_lexicons(req).await,
             (Method::Post, "records") => self.create_record(req, &repo_name).await,
             (Method::Put, "records") => self.update_record(req, &repo_name).await,
             (Method::Delete, "records") => self.delete_record(req, &repo_name).await,
@@ -1694,6 +1947,120 @@ impl RepoObject {
 
     fn store(&self) -> SqlRepoStore {
         SqlRepoStore::new(self.sql.clone())
+    }
+
+    async fn ensure_record_envelope_dynamic(
+        &self,
+        collection: &Nsid,
+        record: &Value,
+        validate: Option<bool>,
+    ) -> Result<RecordValidationStatus, HttpError> {
+        ensure_record_shape(collection, record)?;
+        if validate == Some(false) {
+            return Ok(RecordValidationStatus::Unknown);
+        }
+        let lexicons = self
+            .lexicons_for_collection(collection, validate == Some(true))
+            .await?;
+        lexicon::validate_record_with_lexicons(
+            collection.as_str(),
+            record,
+            validate == Some(true),
+            &lexicons,
+        )
+        .map_err(|error| HttpError::new(400, error.to_string()))
+    }
+
+    async fn lexicons_for_collection(
+        &self,
+        collection: &Nsid,
+        explicit: bool,
+    ) -> Result<Vec<Value>, HttpError> {
+        let mut lexicons = extra_lexicons_from_env(&self.env)?;
+        for (nsid, cached) in self.store().list_lexicons().map_err(HttpError::worker)? {
+            if lexicons
+                .iter()
+                .any(|lexicon| lexicon.get("id").and_then(Value::as_str) == Some(nsid.as_str()))
+            {
+                continue;
+            }
+            lexicons.push(from_str(&cached).map_err(|error| {
+                HttpError::new(
+                    500,
+                    format!("cached Lexicon `{nsid}` could not be parsed: {error}"),
+                )
+            })?);
+        }
+
+        let has_collection = lexicons
+            .iter()
+            .any(|lexicon| lexicon.get("id").and_then(Value::as_str) == Some(collection.as_str()));
+
+        if !has_collection && explicit {
+            if let Some(published) = fetch_published_lexicon(&self.env, collection.as_str()).await?
+            {
+                let published_json = to_string(&published).map_err(HttpError::worker)?;
+                self.store()
+                    .put_lexicon(collection.as_str(), &published_json, "published")
+                    .map_err(HttpError::worker)?;
+                lexicons.push(published);
+            }
+        }
+        if explicit {
+            self.resolve_published_lexicon_dependencies(&mut lexicons)
+                .await?;
+        }
+
+        Ok(lexicons)
+    }
+
+    async fn resolve_published_lexicon_dependencies(
+        &self,
+        lexicons: &mut Vec<Value>,
+    ) -> Result<(), HttpError> {
+        let mut known = lexicons
+            .iter()
+            .filter_map(|lexicon| lexicon.get("id").and_then(Value::as_str))
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut queue = lexicons
+            .iter()
+            .flat_map(lexicon::referenced_lexicon_ids)
+            .filter(|nsid| !known.contains(nsid))
+            .collect::<VecDeque<_>>();
+        let mut fetched = 0;
+
+        while let Some(nsid) = queue.pop_front() {
+            if known.contains(&nsid) {
+                continue;
+            }
+            if fetched >= MAX_DYNAMIC_LEXICON_FETCHES {
+                return Err(HttpError::new(
+                    400,
+                    format!(
+                        "Lexicon dependency resolution exceeded {MAX_DYNAMIC_LEXICON_FETCHES} remote fetches"
+                    ),
+                ));
+            }
+            fetched += 1;
+
+            let Some(published) = fetch_published_lexicon(&self.env, &nsid).await? else {
+                continue;
+            };
+            let published_json = to_string(&published).map_err(HttpError::worker)?;
+            self.store()
+                .put_lexicon(&nsid, &published_json, "published")
+                .map_err(HttpError::worker)?;
+            known.insert(nsid);
+            for reference in lexicon::referenced_lexicon_ids(&published) {
+                if !known.contains(&reference) {
+                    queue.push_back(reference);
+                }
+            }
+            lexicons.push(published);
+        }
+
+        Ok(())
     }
 
     async fn handle_xrpc(
@@ -1709,7 +2076,7 @@ impl RepoObject {
             (Method::Get, SYNC_GET_LATEST_COMMIT) => self.xrpc_get_latest_commit(url),
             (Method::Get, SYNC_GET_HEAD) => self.xrpc_get_head(url),
             (Method::Get, SYNC_GET_REPO_STATUS) => self.xrpc_get_repo_status(url).await,
-            (Method::Get, SYNC_LIST_BLOBS) => self.xrpc_list_blobs(url),
+            (Method::Get, SYNC_LIST_BLOBS) => self.xrpc_list_blobs(url).await,
             (Method::Get, SYNC_GET_BLOB) => self.xrpc_get_blob(url).await,
             (Method::Get, SYNC_GET_BLOCKS) => self.xrpc_get_blocks(url),
             (Method::Get, SYNC_GET_RECORD) => self.xrpc_get_sync_record(url).await,
@@ -1760,6 +2127,8 @@ impl RepoObject {
         let identity = store.get_repo_identity().map_err(HttpError::worker)?;
         let blocks = store.block_count().map_err(HttpError::worker)?;
         let records = store.record_count().map_err(HttpError::worker)?;
+        let blobs = store.blob_count().map_err(HttpError::worker)?;
+        let blob_bytes = store.total_blob_bytes().map_err(HttpError::worker)?;
 
         json_response(
             200,
@@ -1772,6 +2141,8 @@ impl RepoObject {
                 "latestRev": state.as_ref().map(|row| row.latest_rev.to_string()),
                 "blocks": blocks,
                 "records": records,
+                "blobs": blobs,
+                "blobBytes": blob_bytes,
             }),
         )
         .map_err(HttpError::worker)
@@ -2030,11 +2401,28 @@ impl RepoObject {
         response.json().await.map(Some).map_err(HttpError::worker)
     }
 
-    fn xrpc_list_blobs(&self, url: &worker::Url) -> Result<Response, HttpError> {
+    async fn ensure_repo_publicly_active(
+        &self,
+        url: &worker::Url,
+        state: &RepoStateRow,
+    ) -> Result<(), HttpError> {
+        if self
+            .directory_account_status_for_repo(url, state.did.as_str())
+            .await?
+            .is_some_and(|status| !status.active)
+        {
+            Err(HttpError::new(403, "RepoDeactivated"))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn xrpc_list_blobs(&self, url: &worker::Url) -> Result<Response, HttpError> {
         let params = query_pairs(url);
         let did = required_param(&params, "did").map_err(HttpError::xrpc)?;
         let state = self.repo_state()?;
         ensure_repo_did(&state, &did)?;
+        self.ensure_repo_publicly_active(url, &state).await?;
         let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 500, 1000)?;
         let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
         let (cids, next_cursor) = self
@@ -2096,9 +2484,18 @@ impl RepoObject {
         let cid = required_param(&params, "cid").map_err(HttpError::xrpc)?;
         let state = self.repo_state()?;
         ensure_repo_did(&state, &did)?;
+        self.ensure_repo_publicly_active(url, &state).await?;
         let cid = parse_cid(&cid).map_err(HttpError::bad_request)?;
+        if self
+            .store()
+            .blob_ref_count(&cid)
+            .map_err(HttpError::worker)?
+            == 0
+        {
+            return Err(HttpError::new(404, "BlobNotFound"));
+        }
         let Some(blob) = self.store().get_blob(&cid).map_err(HttpError::worker)? else {
-            return Err(HttpError::new(404, "blob not found"));
+            return Err(HttpError::new(404, "BlobNotFound"));
         };
 
         self.blob_response_for_row(blob).await
@@ -2240,6 +2637,135 @@ impl RepoObject {
         .map_err(HttpError::worker)
     }
 
+    async fn put_lexicon(&self, req: &mut Request, repo_name: &str) -> Result<Response, HttpError> {
+        self.require_admin(req)?;
+        let request_host = request_host(req)?;
+        let body: Value = req.json().await.map_err(HttpError::worker)?;
+        let submitted = submitted_lexicon_from_body(body)?;
+        let lexicon = lexicon::normalize_schema_record(&submitted.lexicon)
+            .map_err(|error| HttpError::new(400, error.to_string()))?;
+        lexicon::validate_lexicon_schema(&lexicon)
+            .map_err(|error| HttpError::new(400, error.to_string()))?;
+        let nsid = lexicon::schema_id(&lexicon)
+            .ok_or_else(|| HttpError::new(400, "Lexicon document must contain string `id`"))?;
+        let lexicon_json = to_string(&lexicon).map_err(HttpError::worker)?;
+        self.store()
+            .put_lexicon(nsid, &lexicon_json, "admin")
+            .map_err(HttpError::worker)?;
+
+        let mut body = json!({
+            "id": nsid,
+            "stored": true,
+            "published": false,
+        });
+        if submitted.publish {
+            let published = self
+                .publish_lexicon_record(&request_host, &repo_name, nsid, &lexicon)
+                .await?;
+            body["published"] = json!(true);
+            body["uri"] = json!(published.uri);
+            body["cid"] = json!(published.cid);
+            body["commit"] = json!({
+                "cid": published.commit_cid,
+                "rev": published.commit_rev,
+                "changed": published.changed,
+            });
+        }
+
+        json_response(200, &body).map_err(HttpError::worker)
+    }
+
+    async fn list_lexicons(&self, req: &Request) -> Result<Response, HttpError> {
+        self.require_admin(req)?;
+        let nsids = self
+            .store()
+            .list_lexicon_nsids()
+            .map_err(HttpError::worker)?;
+        json_response(200, &json!({ "lexicons": nsids })).map_err(HttpError::worker)
+    }
+
+    async fn publish_lexicon_record(
+        &self,
+        request_host: &str,
+        repo_name: &str,
+        nsid: &str,
+        lexicon: &Value,
+    ) -> Result<PublishedLexiconRecord, HttpError> {
+        let path = RepoPath::new(
+            Nsid::new(lexicon::LEXICON_SCHEMA_COLLECTION).map_err(HttpError::bad_request)?,
+            RecordKey::new(nsid).map_err(HttpError::bad_request)?,
+        );
+        let record = lexicon::published_schema_record(lexicon)
+            .map_err(|error| HttpError::new(400, error.to_string()))?;
+        let (previous_state, identity, signing_key, mut repo) =
+            self.open_repo_for_write_with_state()?;
+        let existing = repo
+            .get_record::<Value>(&path)
+            .await
+            .map_err(HttpError::repo)?;
+        if let Some(existing) = existing.as_ref().filter(|stored| stored.record == record) {
+            return Ok(PublishedLexiconRecord {
+                uri: at_uri(
+                    previous_state.did.as_str(),
+                    path.collection.as_str(),
+                    path.rkey.as_str(),
+                ),
+                cid: existing.cid.to_string(),
+                commit_cid: previous_state.latest_commit.to_string(),
+                commit_rev: previous_state.latest_rev.to_string(),
+                changed: false,
+            });
+        }
+
+        let rev = generated_repo_rev(&previous_state.latest_commit)?;
+        let mutation = if existing.is_some() {
+            repo.update_record(path.clone(), &record, rev, &signing_key)
+                .await
+        } else {
+            repo.create_record(path.clone(), &record, rev, &signing_key)
+                .await
+        }
+        .map_err(HttpError::repo)?;
+        let event = self
+            .commit_event_payload(
+                &mut repo,
+                &mutation,
+                Some(previous_state.latest_rev.clone()),
+                Vec::new(),
+            )
+            .await?;
+        let state = self
+            .persist_mutation(repo.storage(), &mutation)
+            .map_err(HttpError::worker)?;
+        self.persist_commit_event(repo.storage(), &state, &event)
+            .map_err(HttpError::worker)?;
+        let record_paths = [path.clone()];
+        self.notify_directory(
+            request_host,
+            repo_name,
+            &identity,
+            &state,
+            Some(&record_paths),
+            Some(&event),
+        )
+        .await?;
+        let record_cid = mutation
+            .record_cid
+            .ok_or_else(|| HttpError::new(500, "Lexicon publication is missing record cid"))?;
+
+        Ok(PublishedLexiconRecord {
+            uri: at_uri(
+                state.did.as_str(),
+                path.collection.as_str(),
+                path.rkey.as_str(),
+            ),
+            cid: record_cid.to_string(),
+            commit_cid: state.latest_commit.to_string(),
+            commit_rev: state.latest_rev.to_string(),
+            changed: true,
+        })
+    }
+
     async fn create_record(
         &self,
         req: &mut Request,
@@ -2251,6 +2777,9 @@ impl RepoObject {
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
+        let validation_status = self
+            .ensure_record_envelope_dynamic(&path.collection, &body.record, body.validate)
+            .await?;
         let blob_cids = extract_record_blob_refs(&body.record)?;
         let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
         let mutation = repo
@@ -2284,7 +2813,11 @@ impl RepoObject {
             Some(&event),
         )
         .await?;
-        json_response(201, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
+        json_response(
+            201,
+            &mutation_response_with_validation(&path, &mutation, validation_status),
+        )
+        .map_err(HttpError::worker)
     }
 
     async fn update_record(
@@ -2298,6 +2831,9 @@ impl RepoObject {
         let (previous_state, identity, signing_key, mut repo) =
             self.open_repo_for_write_with_state()?;
         let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
+        let validation_status = self
+            .ensure_record_envelope_dynamic(&path.collection, &body.record, body.validate)
+            .await?;
         let blob_cids = extract_record_blob_refs(&body.record)?;
         let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
         let mutation = repo
@@ -2331,7 +2867,11 @@ impl RepoObject {
             Some(&event),
         )
         .await?;
-        json_response(200, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
+        json_response(
+            200,
+            &mutation_response_with_validation(&path, &mutation, validation_status),
+        )
+        .map_err(HttpError::worker)
     }
 
     async fn delete_record(
@@ -2426,7 +2966,11 @@ impl RepoObject {
             generated_record_key(&previous_state.latest_commit)?
         };
         let path = RepoPath::new(collection, rkey);
+        let validation_status = self
+            .ensure_record_envelope_dynamic(&path.collection, &body.record, body.validate)
+            .await?;
         let blob_cids = extract_record_blob_refs(&body.record)?;
+        ensure_blob_refs_available(repo.storage(), &blob_cids)?;
         let rev = generated_repo_rev(&previous_state.latest_commit)?;
         let mutation = repo
             .create_record(path.clone(), &body.record, rev, &signing_key)
@@ -2460,11 +3004,8 @@ impl RepoObject {
         )
         .await?;
 
-        json_response(
-            200,
-            &xrpc_record_mutation_response(&state.did, &path, &mutation),
-        )
-        .map_err(HttpError::worker)
+        let body = xrpc_record_mutation_response(&state.did, &path, &mutation, validation_status)?;
+        json_response(200, &body).map_err(HttpError::worker)
     }
 
     async fn xrpc_put_record(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -2485,11 +3026,19 @@ impl RepoObject {
             .get_record::<Value>(&path)
             .await
             .map_err(HttpError::repo)?;
+        let previous_blob_cids = repo
+            .storage()
+            .blob_cids_for_path(&path)
+            .map_err(HttpError::worker)?;
         ensure_swap_record_field(
             existing.as_ref().map(|record| record.cid),
             &body.swap_record,
         )?;
+        let validation_status = self
+            .ensure_record_envelope_dynamic(&path.collection, &body.record, body.validate)
+            .await?;
         let blob_cids = extract_record_blob_refs(&body.record)?;
+        ensure_blob_refs_available(repo.storage(), &blob_cids)?;
         let rev = generated_repo_rev(&previous_state.latest_commit)?;
         let mutation = if existing.is_some() {
             repo.update_record(path.clone(), &body.record, rev, &signing_key)
@@ -2517,6 +3066,8 @@ impl RepoObject {
                 .replace_blob_refs(&path, record_cid, &blob_cids)
                 .map_err(HttpError::worker)?;
         }
+        self.delete_orphan_blobs(repo.storage(), &previous_blob_cids)
+            .await?;
         self.notify_directory(
             &request_host,
             &identity.handle,
@@ -2527,11 +3078,8 @@ impl RepoObject {
         )
         .await?;
 
-        json_response(
-            200,
-            &xrpc_record_mutation_response(&state.did, &path, &mutation),
-        )
-        .map_err(HttpError::worker)
+        let body = xrpc_record_mutation_response(&state.did, &path, &mutation, validation_status)?;
+        json_response(200, &body).map_err(HttpError::worker)
     }
 
     async fn xrpc_delete_record(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -2552,6 +3100,10 @@ impl RepoObject {
             .get_record::<Value>(&path)
             .await
             .map_err(HttpError::repo)?;
+        let previous_blob_cids = repo
+            .storage()
+            .blob_cids_for_path(&path)
+            .map_err(HttpError::worker)?;
         ensure_optional_swap_record(
             existing.as_ref().map(|record| record.cid),
             body.swap_record.as_deref(),
@@ -2581,6 +3133,8 @@ impl RepoObject {
         repo.storage()
             .delete_blob_refs(&path)
             .map_err(HttpError::worker)?;
+        self.delete_orphan_blobs(repo.storage(), &previous_blob_cids)
+            .await?;
         self.notify_directory(
             &request_host,
             &identity.handle,
@@ -2619,6 +3173,8 @@ impl RepoObject {
         let mut writes = Vec::new();
         let mut blob_ref_updates = Vec::new();
         let mut event_blobs = BTreeSet::new();
+        let mut orphan_blob_candidates = BTreeSet::new();
+        let mut validation_statuses = BTreeMap::new();
         for (write_index, raw_write) in body.writes.into_iter().enumerate() {
             let kind = parse_apply_write_kind(&raw_write.write_type)?;
             let collection = Nsid::new(raw_write.collection).map_err(HttpError::bad_request)?;
@@ -2636,9 +3192,14 @@ impl RepoObject {
                         )?
                     };
                     let path = RepoPath::new(collection, rkey);
+                    let validation_status = self
+                        .ensure_record_envelope_dynamic(&path.collection, &record, body.validate)
+                        .await?;
                     let blobs = extract_record_blob_refs(&record)?;
+                    ensure_blob_refs_available(repo.storage(), &blobs)?;
                     event_blobs.extend(blobs.iter().copied());
                     blob_ref_updates.push((path.clone(), Some(blobs)));
+                    validation_statuses.insert(path.clone(), validation_status);
                     writes.push(RepoWrite::Create { path, record });
                 }
                 RepoOperationAction::Update => {
@@ -2652,9 +3213,19 @@ impl RepoObject {
                         collection,
                         RecordKey::new(rkey).map_err(HttpError::bad_request)?,
                     );
+                    orphan_blob_candidates.extend(
+                        repo.storage()
+                            .blob_cids_for_path(&path)
+                            .map_err(HttpError::worker)?,
+                    );
+                    let validation_status = self
+                        .ensure_record_envelope_dynamic(&path.collection, &record, body.validate)
+                        .await?;
                     let blobs = extract_record_blob_refs(&record)?;
+                    ensure_blob_refs_available(repo.storage(), &blobs)?;
                     event_blobs.extend(blobs.iter().copied());
                     blob_ref_updates.push((path.clone(), Some(blobs)));
+                    validation_statuses.insert(path.clone(), validation_status);
                     writes.push(RepoWrite::Update { path, record });
                 }
                 RepoOperationAction::Delete => {
@@ -2664,6 +3235,11 @@ impl RepoObject {
                     let path = RepoPath::new(
                         collection,
                         RecordKey::new(rkey).map_err(HttpError::bad_request)?,
+                    );
+                    orphan_blob_candidates.extend(
+                        repo.storage()
+                            .blob_cids_for_path(&path)
+                            .map_err(HttpError::worker)?,
                     );
                     blob_ref_updates.push((path.clone(), None));
                     writes.push(RepoWrite::Delete { path });
@@ -2711,6 +3287,9 @@ impl RepoObject {
                 }
             }
         }
+        let orphan_blob_candidates = orphan_blob_candidates.into_iter().collect::<Vec<_>>();
+        self.delete_orphan_blobs(repo.storage(), &orphan_blob_candidates)
+            .await?;
         self.notify_directory(
             &request_host,
             &identity.handle,
@@ -2721,8 +3300,8 @@ impl RepoObject {
         )
         .await?;
 
-        json_response(200, &xrpc_apply_writes_response(&state.did, &mutation))
-            .map_err(HttpError::worker)
+        let body = xrpc_apply_writes_response(&state.did, &mutation, &validation_statuses)?;
+        json_response(200, &body).map_err(HttpError::worker)
     }
 
     async fn xrpc_import_repo(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -2742,6 +3321,10 @@ impl RepoObject {
             .into_iter()
             .map(|entry| (entry.path, entry.cid))
             .collect::<Vec<_>>();
+        let previous_blob_cids = existing_repo
+            .storage()
+            .list_referenced_blob_cids()
+            .map_err(HttpError::worker)?;
         let bytes = req.bytes().await.map_err(HttpError::worker)?;
         ensure_import_repo_size_limit(bytes.len() as u64)?;
         let decoded = decode_car(&bytes).map_err(|error| HttpError::new(400, error.to_string()))?;
@@ -2750,7 +3333,9 @@ impl RepoObject {
             .map_err(HttpError::import)?;
         let ops = diff_imported_records(existing_records, &imported.records);
         let event = DirectoryCommitEventPayload {
+            event_type: DirectoryCommitEventType::Sync,
             since: Some(previous_state.latest_rev.clone()),
+            prev_data: Some(existing_repo.mst_root()),
             blocks: imported.current_car.clone(),
             ops: directory_import_ops(&ops),
             blobs: imported_blob_strings(&imported.records),
@@ -2784,6 +3369,8 @@ impl RepoObject {
                 .replace_blob_refs(&record.path, record.cid, &record.blob_cids)
                 .map_err(HttpError::worker)?;
         }
+        self.delete_orphan_blobs(&store, &previous_blob_cids)
+            .await?;
         self.persist_commit_event(&store, &state, &event)
             .map_err(HttpError::worker)?;
         self.notify_directory(
@@ -2802,6 +3389,8 @@ impl RepoObject {
     async fn xrpc_upload_blob(&self, req: &mut Request) -> Result<Response, HttpError> {
         let state = self.repo_state()?;
         self.require_repo_write_auth(req, &state.did).await?;
+        self.purge_expired_unreferenced_blobs(&self.store(), current_unix_time())
+            .await?;
         let mime_type = req
             .headers()
             .get("content-type")
@@ -3072,7 +3661,9 @@ impl RepoObject {
         }
         if let Some(event) = event {
             body["event"] = json!({
+                "eventType": event.event_type,
                 "since": event.since.as_ref().map(|rev| rev.to_string()),
+                "prevData": event.prev_data.map(|cid| cid.to_string()),
                 "blocksBase64": BASE64_STANDARD.encode(&event.blocks),
                 "ops": event.ops,
                 "blobs": event.blobs,
@@ -3108,10 +3699,13 @@ impl RepoObject {
         blobs: Vec<crate::cid::Cid>,
     ) -> Result<DirectoryCommitEventPayload, HttpError> {
         let cids = mutation_diff_cids(repo, mutation).await?;
+        let prev_data = previous_data_root(repo.storage(), mutation.commit.prev)?;
         self.repo_commit_event_payload_from_cids(
             repo,
+            DirectoryCommitEventType::Commit,
             mutation.commit_cid,
             since,
+            prev_data,
             directory_commit_ops(&mutation.ops),
             blobs,
             cids,
@@ -3127,15 +3721,26 @@ impl RepoObject {
         ops: Vec<DirectoryCommitOp>,
     ) -> Result<DirectoryCommitEventPayload, HttpError> {
         let cids = repo.export_cids().await.map_err(HttpError::repo)?;
-        self.repo_commit_event_payload_from_cids(repo, commit_cid, since, ops, Vec::new(), cids)
-            .await
+        self.repo_commit_event_payload_from_cids(
+            repo,
+            DirectoryCommitEventType::Commit,
+            commit_cid,
+            since,
+            None,
+            ops,
+            Vec::new(),
+            cids,
+        )
+        .await
     }
 
     async fn repo_commit_event_payload_from_cids(
         &self,
         repo: &mut SignedRepository<SqlRepoStore>,
+        event_type: DirectoryCommitEventType,
         commit_cid: crate::cid::Cid,
         since: Option<RepoRev>,
+        prev_data: Option<crate::cid::Cid>,
         ops: Vec<DirectoryCommitOp>,
         blobs: Vec<crate::cid::Cid>,
         cids: Vec<crate::cid::Cid>,
@@ -3143,7 +3748,9 @@ impl RepoObject {
         let blocks =
             encode_car_from_store(&[commit_cid], cids, repo.storage()).map_err(HttpError::car)?;
         Ok(DirectoryCommitEventPayload {
+            event_type,
             since,
+            prev_data,
             blocks,
             ops,
             blobs: blobs.into_iter().map(|cid| cid.to_string()).collect(),
@@ -3159,6 +3766,7 @@ impl RepoObject {
         store.append_commit_event(&RepoCommitEventInput {
             rev: state.latest_rev.clone(),
             since: event.since.clone(),
+            prev_data: event.prev_data,
             commit_cid: state.latest_commit,
             blocks: event.blocks.clone(),
             ops_json: to_string(&event.ops)?,
@@ -3240,9 +3848,20 @@ impl RepoObject {
             let digest = hasher.borrow().clone().finalize();
             let cid = raw_cid_from_sha256_digest(&digest);
             let byte_len = byte_len.get();
+            if byte_len != content_length {
+                let _ = bucket.delete(key).await;
+                return Err(HttpError::new(
+                    400,
+                    "blob upload byte count did not match content-length",
+                ));
+            }
             if let Some(existing) = self.store().get_blob(&cid).map_err(HttpError::worker)? {
                 let _ = bucket.delete(key).await;
                 return Ok(existing);
+            }
+            if let Err(error) = self.ensure_blob_quota(&cid, byte_len as i64) {
+                let _ = bucket.delete(key).await;
+                return Err(error);
             }
             return self
                 .store()
@@ -3258,6 +3877,12 @@ impl RepoObject {
 
         let bytes = req.bytes().await.map_err(HttpError::worker)?;
         ensure_blob_size_limit(bytes.len() as u64)?;
+        if content_length.is_some_and(|expected| expected != bytes.len() as u64) {
+            return Err(HttpError::new(
+                400,
+                "blob upload byte count did not match content-length",
+            ));
+        }
         self.put_blob_bytes(mime_type, bytes).await
     }
 
@@ -3268,6 +3893,7 @@ impl RepoObject {
     ) -> Result<RepoBlobRow, HttpError> {
         let cid = raw_cid(&bytes);
         let byte_len = bytes.len();
+        self.ensure_blob_quota(&cid, byte_len as i64)?;
         if let Ok(bucket) = self.env.bucket(BLOB_BUCKET_BINDING) {
             let key = blob_storage_key(&cid);
             bucket
@@ -3284,6 +3910,73 @@ impl RepoObject {
                 .put_blob_bytes(mime_type, bytes)
                 .map_err(HttpError::worker)
         }
+    }
+
+    async fn delete_orphan_blobs(
+        &self,
+        store: &SqlRepoStore,
+        cids: &[crate::cid::Cid],
+    ) -> Result<(), HttpError> {
+        let mut seen = BTreeSet::new();
+        for cid in cids {
+            if !seen.insert(*cid) || store.blob_ref_count(cid).map_err(HttpError::worker)? > 0 {
+                continue;
+            }
+            let Some(blob) = store.get_blob(cid).map_err(HttpError::worker)? else {
+                continue;
+            };
+            if blob.storage_kind == "r2" {
+                if let Ok(bucket) = self.env.bucket(BLOB_BUCKET_BINDING) {
+                    let key = blob.storage_key.unwrap_or_else(|| blob_storage_key(cid));
+                    let _ = bucket.delete(key).await;
+                }
+            }
+            store
+                .delete_unreferenced_blob_metadata(cid)
+                .map_err(HttpError::worker)?;
+        }
+        Ok(())
+    }
+
+    fn ensure_blob_quota(&self, cid: &crate::cid::Cid, byte_len: i64) -> Result<(), HttpError> {
+        let max_bytes = max_account_blob_bytes_from_env(&self.env)?;
+        let store = self.store();
+        if store.get_blob(cid).map_err(HttpError::worker)?.is_some() {
+            return Ok(());
+        }
+        let total = store.total_blob_bytes().map_err(HttpError::worker)?;
+        if total.saturating_add(byte_len) > max_bytes {
+            return Err(HttpError::new(
+                400,
+                format!("BlobQuotaExceeded: account blob quota is {max_bytes} bytes"),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn purge_expired_unreferenced_blobs(
+        &self,
+        store: &SqlRepoStore,
+        now: i64,
+    ) -> Result<(), HttpError> {
+        let cutoff = now.saturating_sub(TEMP_BLOB_TTL_SECONDS);
+        let rows = store
+            .list_unreferenced_blobs_older_than(cutoff, BLOB_GC_BATCH_LIMIT)
+            .map_err(HttpError::worker)?;
+        for blob in rows {
+            if blob.storage_kind == "r2" {
+                if let Ok(bucket) = self.env.bucket(BLOB_BUCKET_BINDING) {
+                    let key = blob
+                        .storage_key
+                        .unwrap_or_else(|| blob_storage_key(&blob.cid));
+                    let _ = bucket.delete(key).await;
+                }
+            }
+            store
+                .delete_unreferenced_blob_metadata(&blob.cid)
+                .map_err(HttpError::worker)?;
+        }
+        Ok(())
     }
 
     fn repo_diff_car_since(&self, state: &RepoStateRow, since: &str) -> Result<Vec<u8>, HttpError> {
@@ -3425,6 +4118,86 @@ struct CreatedOAuthSession {
     dpop_nonce: String,
 }
 
+struct SubmittedLexicon {
+    lexicon: Value,
+    publish: bool,
+}
+
+struct PublishedLexiconRecord {
+    uri: String,
+    cid: String,
+    commit_cid: String,
+    commit_rev: String,
+    changed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OAuthClientAuthBinding {
+    method: OAuthClientAuthMethod,
+    kid: Option<String>,
+    alg: Option<String>,
+    jkt: Option<String>,
+}
+
+impl OAuthClientAuthBinding {
+    fn none() -> Self {
+        Self {
+            method: OAuthClientAuthMethod::None,
+            kid: None,
+            alg: None,
+            jkt: None,
+        }
+    }
+
+    fn from_verified(assertion: crate::oauth::VerifiedClientAssertion) -> Self {
+        Self {
+            method: OAuthClientAuthMethod::PrivateKeyJwt,
+            kid: Some(assertion.kid),
+            alg: Some(assertion.alg),
+            jkt: Some(assertion.jkt),
+        }
+    }
+
+    fn from_parts(
+        method: &str,
+        kid: Option<String>,
+        alg: Option<String>,
+        jkt: Option<String>,
+    ) -> Result<Self, HttpError> {
+        let method = match method {
+            "none" => OAuthClientAuthMethod::None,
+            "private_key_jwt" => OAuthClientAuthMethod::PrivateKeyJwt,
+            other => {
+                return Err(HttpError::new(
+                    500,
+                    format!("unknown OAuth client auth `{other}`"),
+                ))
+            }
+        };
+        Ok(Self {
+            method,
+            kid,
+            alg,
+            jkt,
+        })
+    }
+
+    fn method_str(&self) -> &'static str {
+        self.method.as_str()
+    }
+
+    fn ensure_matches(&self, expected: &Self) -> Result<(), HttpError> {
+        if self == expected {
+            Ok(())
+        } else {
+            Err(HttpError::new(
+                401,
+                "OAuth client authentication key does not match this authorization session",
+            ))
+        }
+    }
+}
+
 struct SessionTokens {
     access_jwt: String,
     refresh_jwt: String,
@@ -3435,6 +4208,8 @@ struct WriteRecordRequest {
     path: String,
     rev: String,
     record: Value,
+    #[serde(default, rename = "validate")]
+    validate: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3445,7 +4220,7 @@ struct XrpcCreateRecordRequest {
     rkey: Option<String>,
     record: Value,
     #[serde(default, rename = "validate")]
-    _validate: Option<bool>,
+    validate: Option<bool>,
     #[serde(default, rename = "swapCommit")]
     swap_commit: Option<String>,
 }
@@ -3457,7 +4232,7 @@ struct XrpcPutRecordRequest {
     rkey: String,
     record: Value,
     #[serde(default, rename = "validate")]
-    _validate: Option<bool>,
+    validate: Option<bool>,
     #[serde(default, rename = "swapRecord")]
     swap_record: SwapRecordField,
     #[serde(default, rename = "swapCommit")]
@@ -3498,7 +4273,7 @@ impl<'de> Deserialize<'de> for SwapRecordField {
 struct XrpcApplyWritesRequest {
     repo: String,
     #[serde(default, rename = "validate")]
-    _validate: Option<bool>,
+    validate: Option<bool>,
     writes: Vec<XrpcApplyWriteRequest>,
     #[serde(default, rename = "swapCommit")]
     swap_commit: Option<String>,
@@ -3539,8 +4314,12 @@ struct DirectoryUpsertRepoRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct DirectoryCommitEventRequest {
+    #[serde(default, rename = "eventType")]
+    event_type: DirectoryCommitEventType,
     #[serde(default)]
     since: Option<String>,
+    #[serde(default, rename = "prevData")]
+    prev_data: Option<String>,
     #[serde(rename = "blocksBase64")]
     blocks_base64: String,
     #[serde(default)]
@@ -3551,11 +4330,28 @@ struct DirectoryCommitEventRequest {
 
 #[derive(Clone, Debug, Serialize)]
 struct DirectoryCommitEventPayload {
+    #[serde(rename = "eventType")]
+    event_type: DirectoryCommitEventType,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     since: Option<RepoRev>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "prevData")]
+    prev_data: Option<crate::cid::Cid>,
     blocks: Vec<u8>,
     ops: Vec<DirectoryCommitOp>,
     blobs: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum DirectoryCommitEventType {
+    Commit,
+    Sync,
+}
+
+impl Default for DirectoryCommitEventType {
+    fn default() -> Self {
+        Self::Commit
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -3692,15 +4488,40 @@ fn mutation_response(path: &RepoPath, mutation: &RepoMutation) -> Value {
     })
 }
 
-fn xrpc_record_mutation_response(did: &Did, path: &RepoPath, mutation: &RepoMutation) -> Value {
-    json!({
-        "uri": at_uri(did.as_str(), path.collection.as_str(), path.rkey.as_str()),
-        "cid": mutation.record_cid.map(|cid| cid.to_string()),
+fn mutation_response_with_validation(
+    path: &RepoPath,
+    mutation: &RepoMutation,
+    validation_status: RecordValidationStatus,
+) -> Value {
+    let mut body = mutation_response(path, mutation);
+    body["validationStatus"] = json!(validation_status.as_str());
+    body
+}
+
+fn xrpc_record_mutation_response(
+    did: &Did,
+    path: &RepoPath,
+    mutation: &RepoMutation,
+    validation_status: RecordValidationStatus,
+) -> Result<Value, HttpError> {
+    let record_cid = mutation
+        .record_cid
+        .ok_or_else(|| HttpError::new(500, "record mutation is missing record cid"))?;
+    let record = strong_ref(
+        did.as_str(),
+        path.collection.as_str(),
+        path.rkey.as_str(),
+        &record_cid.to_string(),
+    );
+    Ok(json!({
+        "uri": record.uri,
+        "cid": record.cid,
         "commit": {
             "cid": mutation.commit_cid.to_string(),
             "rev": mutation.commit.rev.to_string(),
         },
-    })
+        "validationStatus": validation_status.as_str(),
+    }))
 }
 
 fn xrpc_delete_mutation_response(mutation: &RepoMutation) -> Value {
@@ -3721,33 +4542,70 @@ fn xrpc_noop_delete_response(state: &RepoStateRow) -> Value {
     })
 }
 
-fn xrpc_apply_writes_response(did: &Did, mutation: &RepoMutation) -> Value {
-    json!({
+fn xrpc_apply_writes_response(
+    did: &Did,
+    mutation: &RepoMutation,
+    validation_statuses: &BTreeMap<RepoPath, RecordValidationStatus>,
+) -> Result<Value, HttpError> {
+    let results = mutation
+        .ops
+        .iter()
+        .map(|op| match op.action {
+            RepoOperationAction::Create => {
+                let cid = op
+                    .cid
+                    .ok_or_else(|| HttpError::new(500, "create operation is missing record cid"))?;
+                let record = strong_ref(
+                    did.as_str(),
+                    op.path.collection.as_str(),
+                    op.path.rkey.as_str(),
+                    &cid.to_string(),
+                );
+                Ok(json!({
+                    "$type": "com.atproto.repo.applyWrites#createResult",
+                    "uri": record.uri,
+                    "cid": record.cid,
+                    "validationStatus": validation_statuses
+                        .get(&op.path)
+                        .copied()
+                        .unwrap_or(RecordValidationStatus::Unknown)
+                        .as_str(),
+                }))
+            }
+            RepoOperationAction::Update => {
+                let cid = op
+                    .cid
+                    .ok_or_else(|| HttpError::new(500, "update operation is missing record cid"))?;
+                let record = strong_ref(
+                    did.as_str(),
+                    op.path.collection.as_str(),
+                    op.path.rkey.as_str(),
+                    &cid.to_string(),
+                );
+                Ok(json!({
+                    "$type": "com.atproto.repo.applyWrites#updateResult",
+                    "uri": record.uri,
+                    "cid": record.cid,
+                    "validationStatus": validation_statuses
+                        .get(&op.path)
+                        .copied()
+                        .unwrap_or(RecordValidationStatus::Unknown)
+                        .as_str(),
+                }))
+            }
+            RepoOperationAction::Delete => Ok(json!({
+                "$type": "com.atproto.repo.applyWrites#deleteResult",
+            })),
+        })
+        .collect::<Result<Vec<_>, HttpError>>()?;
+
+    Ok(json!({
         "commit": {
             "cid": mutation.commit_cid.to_string(),
             "rev": mutation.commit.rev.to_string(),
         },
-        "results": mutation.ops
-            .iter()
-            .map(|op| match op.action {
-                RepoOperationAction::Create => json!({
-                    "$type": "com.atproto.repo.applyWrites#createResult",
-                    "uri": at_uri(did.as_str(), op.path.collection.as_str(), op.path.rkey.as_str()),
-                    "cid": op.cid.map(|cid| cid.to_string()),
-                    "validationStatus": "unknown",
-                }),
-                RepoOperationAction::Update => json!({
-                    "$type": "com.atproto.repo.applyWrites#updateResult",
-                    "uri": at_uri(did.as_str(), op.path.collection.as_str(), op.path.rkey.as_str()),
-                    "cid": op.cid.map(|cid| cid.to_string()),
-                    "validationStatus": "unknown",
-                }),
-                RepoOperationAction::Delete => json!({
-                    "$type": "com.atproto.repo.applyWrites#deleteResult",
-                }),
-            })
-            .collect::<Vec<_>>(),
-    })
+        "results": results,
+    }))
 }
 
 fn directory_commit_ops(ops: &[RepoOperation]) -> Vec<DirectoryCommitOp> {
@@ -3846,8 +4704,74 @@ async fn mutation_diff_cids(
     Ok(cids)
 }
 
+fn previous_data_root(
+    store: &SqlRepoStore,
+    previous_commit: Option<crate::cid::Cid>,
+) -> Result<Option<crate::cid::Cid>, HttpError> {
+    previous_commit
+        .map(|cid| {
+            CommitBlock::read_from(store, &cid)
+                .map_err(HttpError::worker)?
+                .map(|block| block.commit.data)
+                .ok_or_else(|| HttpError::new(500, format!("previous commit `{cid}` not found")))
+        })
+        .transpose()
+}
+
 fn extract_record_blob_refs(record: &Value) -> Result<Vec<crate::cid::Cid>, HttpError> {
     extract_import_record_blob_refs(record).map_err(HttpError::import)
+}
+
+#[allow(dead_code)]
+fn ensure_record_envelope(
+    collection: &Nsid,
+    record: &Value,
+    validate: Option<bool>,
+    extra_lexicons: &[Value],
+) -> Result<RecordValidationStatus, HttpError> {
+    ensure_record_shape(collection, record)?;
+    if validate == Some(false) {
+        return Ok(RecordValidationStatus::Unknown);
+    }
+    lexicon::validate_record_with_lexicons(
+        collection.as_str(),
+        record,
+        validate == Some(true),
+        extra_lexicons,
+    )
+    .map_err(|error| HttpError::new(400, error.to_string()))
+}
+
+fn ensure_record_shape(collection: &Nsid, record: &Value) -> Result<(), HttpError> {
+    let Some(object) = record.as_object() else {
+        return Err(HttpError::new(400, "record must be a JSON object"));
+    };
+    match object.get("$type").and_then(Value::as_str) {
+        Some(record_type) if record_type == collection.as_str() => {}
+        Some(record_type) => {
+            return Err(HttpError::new(
+                400,
+                format!("record $type `{record_type}` does not match collection `{collection}`"),
+            ));
+        }
+        None => return Err(HttpError::new(400, "record must contain a string $type")),
+    }
+    Ok(())
+}
+
+fn ensure_blob_refs_available(
+    store: &SqlRepoStore,
+    cids: &[crate::cid::Cid],
+) -> Result<(), HttpError> {
+    for cid in cids {
+        if store.get_blob(cid).map_err(HttpError::worker)?.is_none() {
+            return Err(HttpError::new(
+                400,
+                format!("referenced blob `{cid}` is missing"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_swap_commit(state: &RepoStateRow, swap_commit: Option<&str>) -> Result<(), HttpError> {
@@ -4055,6 +4979,296 @@ fn token_secret_from_env(env: &Env) -> Result<String, HttpError> {
     }
 }
 
+fn max_account_blob_bytes_from_env(env: &Env) -> Result<i64, HttpError> {
+    let Ok(value) = env.var("PDS_MAX_ACCOUNT_BLOB_BYTES") else {
+        return Ok(DEFAULT_MAX_ACCOUNT_BLOB_BYTES);
+    };
+    let value = value.to_string();
+    if value.trim().is_empty() {
+        return Ok(DEFAULT_MAX_ACCOUNT_BLOB_BYTES);
+    }
+    value
+        .trim()
+        .parse::<i64>()
+        .map_err(|_| {
+            HttpError::new(
+                500,
+                "PDS_MAX_ACCOUNT_BLOB_BYTES must be a positive integer byte count",
+            )
+        })
+        .and_then(|bytes| {
+            if bytes > 0 {
+                Ok(bytes)
+            } else {
+                Err(HttpError::new(
+                    500,
+                    "PDS_MAX_ACCOUNT_BLOB_BYTES must be greater than zero",
+                ))
+            }
+        })
+}
+
+fn extra_lexicons_from_env(env: &Env) -> Result<Vec<Value>, HttpError> {
+    let Ok(value) = env.var("PDS_LEXICONS_JSON") else {
+        return Ok(Vec::new());
+    };
+    let value = value.to_string();
+    if value.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    match from_str::<Value>(&value).map_err(|error| {
+        HttpError::new(
+            500,
+            format!("PDS_LEXICONS_JSON must be a Lexicon JSON object or array: {error}"),
+        )
+    })? {
+        Value::Array(values) => Ok(values),
+        Value::Object(_) => Ok(vec![from_str(&value).map_err(|error| {
+            HttpError::new(
+                500,
+                format!("PDS_LEXICONS_JSON object could not be parsed: {error}"),
+            )
+        })?]),
+        _ => Err(HttpError::new(
+            500,
+            "PDS_LEXICONS_JSON must be a Lexicon JSON object or array",
+        )),
+    }
+}
+
+fn submitted_lexicon_from_body(body: Value) -> Result<SubmittedLexicon, HttpError> {
+    if body.get("lexicon").is_some() && body.get("id").is_some() && body.get("defs").is_some() {
+        return Ok(SubmittedLexicon {
+            lexicon: body,
+            publish: true,
+        });
+    }
+
+    let publish = body.get("publish").and_then(Value::as_bool).unwrap_or(true);
+    let lexicon = body
+        .get("schema")
+        .or_else(|| {
+            body.get("lexicon")
+                .filter(|value| value.get("id").is_some() && value.get("defs").is_some())
+        })
+        .cloned()
+        .filter(Value::is_object)
+        .ok_or_else(|| {
+            HttpError::new(
+                400,
+                "request body must be a Lexicon JSON document or {\"schema\": {...}, \"publish\": bool}",
+            )
+        })?;
+    Ok(SubmittedLexicon { lexicon, publish })
+}
+
+async fn fetch_published_lexicon(env: &Env, collection: &str) -> Result<Option<Value>, HttpError> {
+    let Some(txt_name) = lexicon_txt_name(collection) else {
+        return Ok(None);
+    };
+    let did = if let Some(did) = lexicon_authority_did_from_env(env, collection)? {
+        did
+    } else {
+        let records = fetch_dns_txt_records(&txt_name).await?;
+        let Some(did) = unique_prefixed_txt_value(&records, "did=", &txt_name)? else {
+            return Ok(None);
+        };
+        did
+    };
+    Did::new(did.clone()).map_err(HttpError::bad_request)?;
+    let did_doc = fetch_did_document(&did).await?;
+    ensure_did_document_id(&did_doc, &did).map_err(HttpError::bad_request)?;
+    let endpoint = did_document_pds_endpoint(&did_doc).ok_or_else(|| {
+        HttpError::new(
+            502,
+            format!("Lexicon authority DID `{did}` has no AtprotoPersonalDataServer service"),
+        )
+    })?;
+    let url = format!(
+        "{endpoint}/xrpc/com.atproto.repo.getRecord?repo={}&collection=com.atproto.lexicon.schema&rkey={}",
+        encode_query_component(&did),
+        encode_query_component(collection),
+    );
+    let Some(record) = fetch_json_url_optional(&url).await? else {
+        return Ok(None);
+    };
+    let lexicon = record
+        .get("value")
+        .cloned()
+        .ok_or_else(|| HttpError::new(502, "published Lexicon record did not contain `value`"))?;
+    let lexicon = lexicon::normalize_schema_record(&lexicon)
+        .map_err(|error| HttpError::new(502, error.to_string()))?;
+    if lexicon::schema_id(&lexicon) != Some(collection) {
+        return Err(HttpError::new(
+            502,
+            format!("published Lexicon record value id did not match `{collection}`"),
+        ));
+    }
+    lexicon::validate_lexicon_schema(&lexicon)
+        .map_err(|error| HttpError::new(502, error.to_string()))?;
+    Ok(Some(lexicon))
+}
+
+fn lexicon_authority_did_from_env(
+    env: &Env,
+    collection: &str,
+) -> Result<Option<String>, HttpError> {
+    let Some(authority_domain) = lexicon_authority_domain(collection) else {
+        return Ok(None);
+    };
+    let Ok(value) = env.var("PDS_LEXICON_AUTHORITY_DIDS") else {
+        return Ok(None);
+    };
+    let did = lexicon_authority_did_override(&value.to_string(), &authority_domain)
+        .map_err(HttpError::bad_request)?;
+    if let Some(did) = did.as_deref() {
+        Did::new(did.to_string()).map_err(HttpError::bad_request)?;
+    }
+    Ok(did)
+}
+
+async fn resolve_handle_did(handle: &str) -> Result<Option<String>, HttpError> {
+    validate_handle_syntax(handle).map_err(HttpError::bad_request)?;
+    if let Ok(records) = fetch_dns_txt_records(&handle_did_txt_name(handle)).await {
+        if let Some(did) = unique_prefixed_txt_value(&records, "did=", handle)? {
+            Did::new(did.clone()).map_err(HttpError::bad_request)?;
+            return Ok(Some(did));
+        }
+    }
+
+    let url = format!("https://{handle}/.well-known/atproto-did");
+    let Some(text) = fetch_text_url_optional(&url).await? else {
+        return Ok(None);
+    };
+    let did = text.trim().to_string();
+    if did.is_empty() {
+        return Ok(None);
+    }
+    Did::new(did.clone()).map_err(HttpError::bad_request)?;
+    Ok(Some(did))
+}
+
+fn unique_prefixed_txt_value(
+    records: &[String],
+    prefix: &str,
+    label: &str,
+) -> Result<Option<String>, HttpError> {
+    let values = prefixed_txt_values(records, prefix)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if values.len() > 1 {
+        return Err(HttpError::new(
+            400,
+            format!("ambiguous TXT records for `{label}`"),
+        ));
+    }
+    Ok(values.into_iter().next())
+}
+
+async fn fetch_did_document(did: &str) -> Result<Value, HttpError> {
+    let url = if did.starts_with("did:web:") {
+        did_web_document_url(did).map_err(HttpError::bad_request)?
+    } else if did.starts_with("did:plc:") {
+        format!("https://plc.directory/{}", encode_query_component(did))
+    } else {
+        return Err(HttpError::new(
+            400,
+            format!("unsupported DID method for `{did}`"),
+        ));
+    };
+    let doc = fetch_json_url(&url).await?;
+    ensure_did_document_id(&doc, did).map_err(HttpError::bad_request)?;
+    Ok(doc)
+}
+
+async fn fetch_dns_txt_records(name: &str) -> Result<Vec<String>, HttpError> {
+    let url = format!(
+        "https://cloudflare-dns.com/dns-query?name={}&type=TXT",
+        encode_query_component(name)
+    );
+    let headers = Headers::new();
+    headers
+        .set("accept", "application/dns-json")
+        .map_err(HttpError::worker)?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Get).with_headers(headers);
+    let request = Request::new_with_init(&url, &init).map_err(HttpError::worker)?;
+    let mut response = Fetch::Request(request)
+        .send()
+        .await
+        .map_err(HttpError::worker)?;
+    if response.status_code() != 200 {
+        return Err(HttpError::new(
+            502,
+            format!(
+                "DNS TXT lookup for `{name}` failed with status {}",
+                response.status_code()
+            ),
+        ));
+    }
+    let body: DnsJsonResponse = response.json().await.map_err(HttpError::worker)?;
+    Ok(body
+        .answers
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|answer| answer.record_type == 16)
+        .map(|answer| answer.data)
+        .collect())
+}
+
+async fn fetch_json_url(url: &str) -> Result<Value, HttpError> {
+    fetch_json_url_optional(url)
+        .await?
+        .ok_or_else(|| HttpError::new(404, "remote JSON document not found"))
+}
+
+async fn fetch_json_url_optional(url: &str) -> Result<Option<Value>, HttpError> {
+    let url = ::url::Url::parse(url)
+        .map_err(|error| HttpError::new(400, format!("invalid URL: {error}")))?;
+    let mut response = Fetch::Url(url).send().await.map_err(HttpError::worker)?;
+    let status = response.status_code();
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..=299).contains(&status) {
+        return Err(HttpError::new(
+            502,
+            format!("remote JSON fetch failed with status {status}"),
+        ));
+    }
+    response.json().await.map(Some).map_err(HttpError::worker)
+}
+
+async fn fetch_text_url_optional(url: &str) -> Result<Option<String>, HttpError> {
+    let url = ::url::Url::parse(url)
+        .map_err(|error| HttpError::new(400, format!("invalid URL: {error}")))?;
+    let mut response = Fetch::Url(url).send().await.map_err(HttpError::worker)?;
+    let status = response.status_code();
+    if status == 404 {
+        return Ok(None);
+    }
+    if !(200..=299).contains(&status) {
+        return Err(HttpError::new(
+            502,
+            format!("remote text fetch failed with status {status}"),
+        ));
+    }
+    response.text().await.map(Some).map_err(HttpError::worker)
+}
+
+#[derive(Debug, Deserialize)]
+struct DnsJsonResponse {
+    #[serde(default, rename = "Answer")]
+    answers: Option<Vec<DnsJsonAnswer>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DnsJsonAnswer {
+    #[serde(rename = "type")]
+    record_type: u16,
+    data: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AuthScheme {
     Bearer,
@@ -4132,15 +5346,98 @@ fn http_method_name(method: &Method) -> &'static str {
     }
 }
 
-fn ensure_supported_account_handle(handle: &str, request_host: &str) -> Result<(), HttpError> {
+async fn validate_account_handle_for_creation(
+    env: &Env,
+    handle: &str,
+    request_host: &str,
+    expected_did: &str,
+) -> Result<(), HttpError> {
+    validate_handle_syntax(handle).map_err(HttpError::bad_request)?;
     if handle == request_host {
+        return Ok(());
+    }
+    if !configured_account_handle_allowed(env, handle) {
+        return Err(HttpError::new(
+            400,
+            format!(
+                "UnsupportedDomain: `{handle}` is not the request host `{request_host}` and is not allowed by PDS_ALLOWED_ACCOUNT_HANDLES or PDS_ALLOWED_ACCOUNT_HANDLE_SUFFIXES"
+            ),
+        ));
+    }
+    let Some(resolved_did) = resolve_handle_did(handle).await? else {
+        return Err(HttpError::new(
+            400,
+            format!("HandleNotResolvable: `{handle}` did not resolve to a DID"),
+        ));
+    };
+    if resolved_did == expected_did {
         Ok(())
     } else {
         Err(HttpError::new(
             400,
-            format!("UnsupportedDomain: this PDS currently supports only `{request_host}`"),
+            format!("HandleMismatch: `{handle}` resolves to `{resolved_did}`, expected `{expected_did}`"),
         ))
     }
+}
+
+async fn validate_account_did_document(handle: &str, did: &str) -> Result<(), HttpError> {
+    let doc = fetch_did_document(did).await?;
+    if !did_document_claims_handle(&doc, handle) {
+        return Err(HttpError::new(
+            400,
+            format!("HandleMismatch: DID document `{did}` does not claim at://{handle}"),
+        ));
+    }
+    let Some(resolved_did) = resolve_handle_did(handle).await? else {
+        return Err(HttpError::new(
+            400,
+            format!("HandleNotResolvable: `{handle}` did not resolve to a DID"),
+        ));
+    };
+    if resolved_did != did {
+        return Err(HttpError::new(
+            400,
+            format!("HandleMismatch: `{handle}` resolves to `{resolved_did}`, expected `{did}`"),
+        ));
+    }
+    if did_document_pds_endpoint(&doc).is_none() {
+        return Err(HttpError::new(
+            400,
+            format!(
+                "InvalidDidDocument: DID document `{did}` has no AtprotoPersonalDataServer service"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn configured_account_handle_allowed(env: &Env, handle: &str) -> bool {
+    env_list(env, "PDS_ALLOWED_ACCOUNT_HANDLES")
+        .iter()
+        .any(|allowed| allowed == "*" || allowed.eq_ignore_ascii_case(handle))
+        || env_list(env, "PDS_ALLOWED_ACCOUNT_HANDLE_SUFFIXES")
+            .iter()
+            .any(|suffix| handle_matches_suffix(handle, suffix))
+}
+
+fn handle_matches_suffix(handle: &str, suffix: &str) -> bool {
+    let suffix = suffix.trim_start_matches('.');
+    handle.eq_ignore_ascii_case(suffix)
+        || handle
+            .strip_suffix(suffix)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+}
+
+fn env_list(env: &Env, name: &str) -> Vec<String> {
+    env.var(name)
+        .ok()
+        .map(|value| value.to_string())
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn ensure_password_strength(password: &str) -> Result<(), HttpError> {
@@ -4189,6 +5486,19 @@ fn session_response(
         body["refreshJwt"] = json!(tokens.refresh_jwt);
     }
     body
+}
+
+fn identity_info_response_body(origin: &str, account: &DirectoryAccountRow) -> Value {
+    json!({
+        "did": account.did.to_string(),
+        "handle": account.handle.clone(),
+        "didDoc": did_document(
+            account.did.as_str(),
+            &account.handle,
+            &account.public_key_multibase,
+            origin,
+        ),
+    })
 }
 
 fn generate_repo_signing_key_hex() -> Result<String, HttpError> {
@@ -4322,8 +5632,11 @@ fn ensure_repo_identifier(
 }
 
 fn subscribe_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError> {
-    if event.event_type == "account" {
-        return subscribe_account_event_frame(event);
+    match event.event_type.as_str() {
+        "account" => return subscribe_account_event_frame(event),
+        "identity" => return subscribe_identity_event_frame(event),
+        "sync" => return subscribe_sync_event_frame(event),
+        _ => {}
     }
 
     let commit = event
@@ -4369,9 +5682,51 @@ fn subscribe_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError
         commit,
         rev: rev.to_string(),
         since: event.since.as_ref().map(|rev| rev.to_string()),
+        prev_data: event.prev_data,
         blocks: event.blocks.clone().unwrap_or_default(),
         ops: frame_ops,
         blobs: frame_blobs,
+        time: event.created_at.clone(),
+    };
+
+    let mut frame = encode_dag_cbor(&header).map_err(HttpError::worker)?;
+    frame.extend(encode_dag_cbor(&body).map_err(HttpError::worker)?);
+    Ok(frame)
+}
+
+fn subscribe_sync_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError> {
+    let rev = event
+        .rev
+        .as_ref()
+        .ok_or_else(|| HttpError::new(500, "directory sync event is missing rev"))?;
+    let header = SubscribeReposHeader {
+        op: 1,
+        kind: "#sync",
+    };
+    let body = SubscribeReposSync {
+        seq: event.seq,
+        did: event.did.to_string(),
+        blocks: event.blocks.clone().unwrap_or_default(),
+        rev: rev.to_string(),
+        time: event.created_at.clone(),
+    };
+
+    let mut frame = encode_dag_cbor(&header).map_err(HttpError::worker)?;
+    frame.extend(encode_dag_cbor(&body).map_err(HttpError::worker)?);
+    Ok(frame)
+}
+
+fn subscribe_identity_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError> {
+    let payload =
+        from_str::<DirectoryIdentityEventPayload>(&event.blobs_json).map_err(HttpError::worker)?;
+    let header = SubscribeReposHeader {
+        op: 1,
+        kind: "#identity",
+    };
+    let body = SubscribeReposIdentity {
+        seq: event.seq,
+        did: event.did.to_string(),
+        handle: payload.handle,
         time: event.created_at.clone(),
     };
 
@@ -4416,12 +5771,37 @@ struct SubscribeReposCommit {
     repo: String,
     commit: crate::cid::Cid,
     rev: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     since: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "prevData")]
+    prev_data: Option<crate::cid::Cid>,
     #[serde(with = "serde_bytes")]
     blocks: Vec<u8>,
     ops: Vec<SubscribeReposOp>,
     blobs: Vec<crate::cid::Cid>,
+    time: String,
+}
+
+#[derive(Serialize)]
+struct SubscribeReposSync {
+    seq: i64,
+    did: String,
+    #[serde(with = "serde_bytes")]
+    blocks: Vec<u8>,
+    rev: String,
+    time: String,
+}
+
+#[derive(Deserialize)]
+struct DirectoryIdentityEventPayload {
+    handle: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SubscribeReposIdentity {
+    seq: i64,
+    did: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    handle: Option<String>,
     time: String,
 }
 
@@ -4519,7 +5899,9 @@ fn describe_server(url: &worker::Url) -> worker::Result<Response> {
 
 fn xrpc_resolve_handle(url: &worker::Url) -> Result<Response, HttpError> {
     let params = query_pairs(url);
-    let handle = required_param(&params, "handle").map_err(HttpError::xrpc)?;
+    let handle = required_param(&params, "handle")
+        .map_err(HttpError::xrpc)?
+        .to_ascii_lowercase();
     let Some(host) = url.host_str() else {
         return Err(HttpError::new(400, "request host is required"));
     };
@@ -4649,6 +6031,31 @@ async fn fetch_oauth_client_metadata(client_id: &str) -> Result<Value, HttpError
     response.json().await.map_err(HttpError::worker)
 }
 
+async fn fetch_oauth_jwks(jwks_uri: &str) -> Result<Value, HttpError> {
+    let url = ::url::Url::parse(jwks_uri)
+        .map_err(|error| HttpError::new(400, format!("invalid jwks_uri: {error}")))?;
+    let mut response = Fetch::Url(url).send().await.map_err(HttpError::worker)?;
+    if response.status_code() != 200 {
+        return Err(HttpError::new(
+            400,
+            format!("JWKS fetch failed with status {}", response.status_code()),
+        ));
+    }
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .map_err(HttpError::worker)?
+        .and_then(|value| value.split(';').next().map(|part| part.trim().to_string()))
+        .unwrap_or_default();
+    if !content_type.eq_ignore_ascii_case("application/json") {
+        return Err(HttpError::new(
+            400,
+            "JWKS response must have content-type application/json",
+        ));
+    }
+    response.json().await.map_err(HttpError::worker)
+}
+
 fn directory_repo_json(row: DirectoryRepoRow) -> Value {
     json!({
         "did": row.did.to_string(),
@@ -4741,6 +6148,12 @@ fn car_response(bytes: Vec<u8>) -> worker::Result<Response> {
 fn blob_response(bytes: Vec<u8>, mime_type: &str) -> worker::Result<Response> {
     let mut response = Response::from_bytes(bytes)?;
     response.headers_mut().set("content-type", mime_type)?;
+    response
+        .headers_mut()
+        .set("content-security-policy", "default-src 'none'; sandbox")?;
+    response
+        .headers_mut()
+        .set("x-content-type-options", "nosniff")?;
     set_cors(&mut response)?;
     Ok(response)
 }
@@ -4752,6 +6165,12 @@ fn blob_stream_response(
 ) -> worker::Result<Response> {
     let mut response = Response::from_body(body)?;
     response.headers_mut().set("content-type", mime_type)?;
+    response
+        .headers_mut()
+        .set("content-security-policy", "default-src 'none'; sandbox")?;
+    response
+        .headers_mut()
+        .set("x-content-type-options", "nosniff")?;
     if byte_len >= 0 {
         response
             .headers_mut()
@@ -5114,6 +6533,135 @@ mod tests {
         assert!(error.message.contains("latest commit"));
     }
 
+    #[test]
+    fn builds_identity_info_response_body() {
+        let account = DirectoryAccountRow {
+            did: Did::new("did:web:gsv-pds.example.com").unwrap(),
+            handle: "gsv-pds.example.com".to_string(),
+            email: None,
+            password_hash: "hash".to_string(),
+            repo_name: "gsv-pds.example.com".to_string(),
+            public_key_multibase: "zPublicKey".to_string(),
+            active: true,
+            status: None,
+        };
+
+        let body = identity_info_response_body("https://gsv-pds.example.com", &account);
+
+        assert_eq!(body["did"], "did:web:gsv-pds.example.com");
+        assert_eq!(body["handle"], "gsv-pds.example.com");
+        assert_eq!(body["didDoc"]["id"], "did:web:gsv-pds.example.com");
+        assert_eq!(
+            body["didDoc"]["service"][0]["serviceEndpoint"],
+            "https://gsv-pds.example.com"
+        );
+    }
+
+    #[test]
+    fn accepts_and_validates_known_record_envelopes() {
+        let collection = Nsid::new("app.gsv.record").unwrap();
+        let lexicons = vec![test_record_lexicon("app.gsv.record")];
+        assert_eq!(
+            ensure_record_envelope(
+                &collection,
+                &json!({
+                    "$type": "app.gsv.record",
+                    "text": "hello",
+                }),
+                None,
+                &lexicons,
+            )
+            .unwrap(),
+            RecordValidationStatus::Valid
+        );
+        assert_eq!(
+            ensure_record_envelope(
+                &collection,
+                &json!({
+                    "$type": "app.gsv.record",
+                    "text": "hello",
+                }),
+                Some(true),
+                &lexicons,
+            )
+            .unwrap(),
+            RecordValidationStatus::Valid
+        );
+    }
+
+    #[test]
+    fn explicit_no_validation_returns_unknown_status() {
+        let collection = Nsid::new("app.gsv.record").unwrap();
+        assert_eq!(
+            ensure_record_envelope(
+                &collection,
+                &json!({
+                    "$type": "app.gsv.record",
+                    "text": "hello",
+                }),
+                Some(false),
+                &[],
+            )
+            .unwrap(),
+            RecordValidationStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn optimistic_unknown_lexicon_returns_unknown_status() {
+        let collection = Nsid::new("app.gsv.unknown").unwrap();
+        assert_eq!(
+            ensure_record_envelope(
+                &collection,
+                &json!({
+                    "$type": "app.gsv.unknown",
+                    "text": "hello",
+                }),
+                None,
+                &[],
+            )
+            .unwrap(),
+            RecordValidationStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_record_envelopes_and_unknown_validate_true() {
+        let collection = Nsid::new("app.gsv.record").unwrap();
+
+        let error =
+            ensure_record_envelope(&collection, &json!({"text": "hello"}), None, &[]).unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("$type"));
+
+        let error = ensure_record_envelope(
+            &collection,
+            &json!({
+                "$type": "app.gsv.other",
+                "text": "hello",
+            }),
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("does not match"));
+
+        let unknown_collection = Nsid::new("app.gsv.unknown").unwrap();
+        let error = ensure_record_envelope(
+            &unknown_collection,
+            &json!({
+                "$type": "app.gsv.unknown",
+                "text": "hello",
+            }),
+            Some(true),
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(error.status, 400);
+        assert!(error.message.contains("lexicon"));
+    }
+
     fn matching_repo_status() -> InternalRepoStatusResponse {
         InternalRepoStatusResponse {
             initialized: true,
@@ -5123,5 +6671,26 @@ mod tests {
             latest_commit: Some("bafyreiatestcommit".to_string()),
             latest_rev: Some("3lzpfxn2f6h2c".to_string()),
         }
+    }
+
+    fn test_record_lexicon(id: &str) -> Value {
+        json!({
+            "lexicon": 1,
+            "id": id,
+            "defs": {
+                "main": {
+                    "type": "record",
+                    "key": "any",
+                    "record": {
+                        "type": "object",
+                        "required": ["$type", "text"],
+                        "properties": {
+                            "$type": { "type": "string", "const": id },
+                            "text": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        })
     }
 }

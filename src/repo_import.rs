@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::car::{encode_car_from_store, CarBlock, CarError, DecodedCar};
+use crate::car::{encode_car, CarBlock, CarError, DecodedCar};
 use crate::cbor::{decode_dag_cbor, CborError};
 use crate::cid::{parse_cid, Cid};
 use crate::commit::{CommitBlock, CommitError, Did, RepoRev};
@@ -77,12 +77,20 @@ pub enum RepoImportError {
     #[error("CAR root block `{root}` was not found")]
     MissingRootBlock { root: Cid },
 
+    #[error("commit data root `{root}` was not found")]
+    MissingDataRoot { root: Cid },
+
     #[error("import root DID `{actual}` does not match repo DID `{expected}`")]
     DidMismatch { expected: Did, actual: Did },
 
     #[error("record `{path}` points to missing block `{cid}`")]
     MissingRecordBlock { path: RepoPath, cid: Cid },
+
+    #[error("record blob reference nesting exceeded max depth {max_depth}")]
+    BlobRefDepthExceeded { max_depth: usize },
 }
+
+const MAX_BLOB_REF_DEPTH: usize = 32;
 
 pub async fn validate_imported_repo(
     decoded: DecodedCar,
@@ -111,6 +119,11 @@ pub async fn validate_imported_repo(
             actual: commit.commit.did.clone(),
         });
     }
+    if !store.has_block(&commit.commit.data)? {
+        return Err(RepoImportError::MissingDataRoot {
+            root: commit.commit.data,
+        });
+    }
 
     let mut repo = SignedRepository::open(store, root)?;
     let entries = repo.entries().await?;
@@ -131,15 +144,34 @@ pub async fn validate_imported_repo(
     }
 
     let cids = repo.export_cids().await?;
-    let current_car = encode_car_from_store(&[root], cids, repo.storage())?;
+    let blocks = reachable_repo_blocks(&cids, repo.storage())?;
+    let current_car = encode_car(&[root], blocks.clone())?;
 
     Ok(ImportedRepo {
         root,
         rev: commit.commit.rev,
         records,
         current_car,
-        blocks: decoded.blocks,
+        blocks,
     })
+}
+
+fn reachable_repo_blocks(
+    cids: &[Cid],
+    storage: &impl RepoBlockStore,
+) -> Result<Vec<CarBlock>, RepoImportError> {
+    let mut blocks = Vec::with_capacity(cids.len());
+    let mut seen = BTreeSet::new();
+    for cid in cids {
+        if !seen.insert(*cid) {
+            continue;
+        }
+        let bytes = storage
+            .get_block(cid)?
+            .ok_or(CarError::MissingBlock { cid: *cid })?;
+        blocks.push(CarBlock { cid: *cid, bytes });
+    }
+    Ok(blocks)
 }
 
 pub fn diff_imported_records(
@@ -187,14 +219,20 @@ pub fn diff_imported_records(
 
 pub fn extract_record_blob_refs(record: &Value) -> Result<Vec<Cid>, RepoImportError> {
     let mut cids = BTreeSet::new();
-    collect_record_blob_refs(record, &mut cids)?;
+    collect_record_blob_refs(record, &mut cids, 0)?;
     Ok(cids.into_iter().collect())
 }
 
 fn collect_record_blob_refs(
     record: &Value,
     cids: &mut BTreeSet<Cid>,
+    depth: usize,
 ) -> Result<(), RepoImportError> {
+    if depth > MAX_BLOB_REF_DEPTH {
+        return Err(RepoImportError::BlobRefDepthExceeded {
+            max_depth: MAX_BLOB_REF_DEPTH,
+        });
+    }
     match record {
         Value::Object(map) => {
             if map.get("$type").and_then(Value::as_str) == Some("blob") {
@@ -208,12 +246,12 @@ fn collect_record_blob_refs(
                 }
             }
             for value in map.values() {
-                collect_record_blob_refs(value, cids)?;
+                collect_record_blob_refs(value, cids, depth + 1)?;
             }
         }
         Value::Array(values) => {
             for value in values {
-                collect_record_blob_refs(value, cids)?;
+                collect_record_blob_refs(value, cids, depth + 1)?;
             }
         }
         _ => {}
@@ -229,7 +267,8 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::*;
-    use crate::car::decode_car;
+    use crate::car::{decode_car, encode_car_from_store};
+    use crate::cbor::encode_block;
     use crate::cid::raw_cid;
     use crate::commit::{CommitSigner, RepoRev};
     use crate::data_model::{Nsid, RecordKey};
@@ -374,6 +413,76 @@ mod tests {
                 Err(RepoImportError::MissingRootBlock { .. })
             ));
         });
+    }
+
+    #[test]
+    fn rejects_import_with_missing_data_root() {
+        block_on(async {
+            let car = repo_car(did()).await;
+            let decoded = decode_car(&car).unwrap();
+            let root = decoded.roots[0];
+
+            let mut store = MemoryRepoStore::new();
+            for block in &decoded.blocks {
+                store
+                    .put_block_with_cid(block.cid, block.bytes.clone())
+                    .unwrap();
+            }
+            let commit = CommitBlock::read_from(&store, &root).unwrap().unwrap();
+            let data_root = commit.commit.data;
+            let without_data_root = DecodedCar {
+                roots: decoded.roots,
+                blocks: decoded
+                    .blocks
+                    .into_iter()
+                    .filter(|block| block.cid != data_root)
+                    .collect(),
+            };
+
+            assert!(matches!(
+                validate_imported_repo(without_data_root, &did()).await,
+                Err(RepoImportError::MissingDataRoot { root }) if root == data_root
+            ));
+        });
+    }
+
+    #[test]
+    fn prunes_unreachable_blocks_from_imported_repo() {
+        block_on(async {
+            let car = repo_car(did()).await;
+            let mut decoded = decode_car(&car).unwrap();
+            let extra = encode_block(&json!({ "unused": true })).unwrap();
+            decoded.blocks.push(CarBlock {
+                cid: extra.cid,
+                bytes: extra.bytes,
+            });
+
+            let imported = validate_imported_repo(decoded, &did()).await.unwrap();
+            assert!(!imported.blocks.iter().any(|block| block.cid == extra.cid));
+
+            let exported = decode_car(&imported.current_car).unwrap();
+            assert!(!exported.blocks.iter().any(|block| block.cid == extra.cid));
+            assert_eq!(exported.blocks, imported.blocks);
+        });
+    }
+
+    #[test]
+    fn rejects_deep_blob_ref_nesting() {
+        let mut value = json!({
+            "$type": "blob",
+            "ref": { "$link": raw_cid(b"hello").to_string() },
+            "mimeType": "text/plain",
+            "size": 5,
+        });
+        for _ in 0..=MAX_BLOB_REF_DEPTH {
+            value = json!({ "child": value });
+        }
+
+        assert!(matches!(
+            extract_record_blob_refs(&value),
+            Err(RepoImportError::BlobRefDepthExceeded { max_depth })
+                if max_depth == MAX_BLOB_REF_DEPTH
+        ));
     }
 
     #[test]

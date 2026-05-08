@@ -2,7 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine as _;
+use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use url::Url;
 
@@ -15,6 +19,55 @@ pub const OAUTH_REQUEST_URI_PREFIX: &str = "urn:ietf:params:oauth:request_uri:";
 pub const OAUTH_PAR_EXPIRES_IN_SECONDS: i64 = 300;
 pub const OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER: &str =
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+const CLIENT_ASSERTION_MAX_AGE_SECONDS: i64 = 10 * 60;
+const CLIENT_ASSERTION_MAX_FUTURE_IAT_SECONDS: i64 = 60;
+const P256_COORDINATE_BYTES: usize = 32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OAuthClientAuth {
+    None,
+    PrivateKeyJwt { assertion: String },
+}
+
+impl OAuthClientAuth {
+    pub fn method(&self) -> OAuthClientAuthMethod {
+        match self {
+            Self::None => OAuthClientAuthMethod::None,
+            Self::PrivateKeyJwt { .. } => OAuthClientAuthMethod::PrivateKeyJwt,
+        }
+    }
+
+    pub fn assertion(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::PrivateKeyJwt { assertion } => Some(assertion),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OAuthClientAuthMethod {
+    None,
+    PrivateKeyJwt,
+}
+
+impl OAuthClientAuthMethod {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::PrivateKeyJwt => "private_key_jwt",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedClientAssertion {
+    pub kid: String,
+    pub alg: String,
+    pub jkt: String,
+    pub jti: String,
+    pub expires_at: i64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PushedAuthorizationRequest {
@@ -26,8 +79,7 @@ pub struct PushedAuthorizationRequest {
     pub redirect_uri: String,
     pub scope: String,
     pub login_hint: Option<String>,
-    pub client_assertion_type: Option<String>,
-    pub client_assertion: Option<String>,
+    pub client_auth: OAuthClientAuth,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,10 +104,12 @@ pub enum TokenRequest {
         code: String,
         redirect_uri: String,
         code_verifier: String,
+        client_auth: OAuthClientAuth,
     },
     RefreshToken {
         client_id: String,
         refresh_token: String,
+        client_auth: OAuthClientAuth,
     },
 }
 
@@ -74,8 +128,8 @@ impl PushedAuthorizationRequest {
             "redirect_uri": self.redirect_uri,
             "scope": self.scope,
             "login_hint": self.login_hint,
-            "client_assertion_type": self.client_assertion_type,
-            "client_assertion": self.client_assertion,
+            "client_assertion_type": self.client_auth.assertion().map(|_| OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER),
+            "client_assertion": self.client_auth.assertion(),
         })
     }
 }
@@ -223,13 +277,9 @@ pub fn validate_client_metadata(
             "client metadata must require DPoP-bound access tokens".to_string(),
         ));
     }
-    if metadata
-        .get("token_endpoint_auth_method")
-        .and_then(Value::as_str)
-        .unwrap_or("none")
-        != "none"
-    {
-        return Err(OAuthRequestError::UnsupportedClientAuthentication);
+    let auth_method = client_auth_method_from_metadata(metadata)?;
+    if auth_method == OAuthClientAuthMethod::PrivateKeyJwt {
+        validate_confidential_client_metadata(metadata)?;
     }
     if !metadata
         .get("redirect_uris")
@@ -250,6 +300,74 @@ pub fn validate_client_metadata(
         .and_then(Value::as_str)
         .ok_or_else(|| invalid_param("scope", "client metadata must declare scope".to_string()))?;
     validate_requested_scope_subset(declared_scope, scope)
+}
+
+pub fn client_auth_method_from_metadata(
+    metadata: &Value,
+) -> Result<OAuthClientAuthMethod, OAuthRequestError> {
+    match metadata
+        .get("token_endpoint_auth_method")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+    {
+        "none" => Ok(OAuthClientAuthMethod::None),
+        "private_key_jwt" => Ok(OAuthClientAuthMethod::PrivateKeyJwt),
+        other => Err(invalid_param(
+            "client_id",
+            format!("unsupported token_endpoint_auth_method `{other}`"),
+        )),
+    }
+}
+
+pub fn client_jwks_uri(metadata: &Value) -> Result<Option<String>, OAuthRequestError> {
+    let Some(value) = metadata.get("jwks_uri") else {
+        return Ok(None);
+    };
+    let uri = value
+        .as_str()
+        .ok_or_else(|| invalid_param("client_id", "jwks_uri must be a string".to_string()))?;
+    let url = Url::parse(uri).map_err(|error| invalid_param("client_id", error.to_string()))?;
+    if url.scheme() != "https" || url.host_str().is_none() || url.fragment().is_some() {
+        return Err(invalid_param(
+            "client_id",
+            "jwks_uri must be a fully-qualified https URL without a fragment".to_string(),
+        ));
+    }
+    Ok(Some(uri.to_string()))
+}
+
+pub fn client_jwks_from_metadata(
+    metadata: &Value,
+    fetched_jwks: Option<&Value>,
+) -> Result<Value, OAuthRequestError> {
+    match (metadata.get("jwks"), fetched_jwks) {
+        (Some(jwks), None) => Ok(jwks.clone()),
+        (None, Some(jwks)) => Ok(jwks.clone()),
+        (Some(_), Some(_)) => Err(invalid_param(
+            "client_id",
+            "client metadata must not combine jwks and jwks_uri".to_string(),
+        )),
+        (None, None) => Err(invalid_param(
+            "client_id",
+            "confidential client metadata must include jwks or jwks_uri".to_string(),
+        )),
+    }
+}
+
+fn validate_confidential_client_metadata(metadata: &Value) -> Result<(), OAuthRequestError> {
+    let has_jwks = metadata.get("jwks").is_some();
+    let has_jwks_uri = client_jwks_uri(metadata)?.is_some();
+    match (has_jwks, has_jwks_uri) {
+        (true, true) => Err(invalid_param(
+            "client_id",
+            "confidential client metadata must not include both jwks and jwks_uri".to_string(),
+        )),
+        (false, false) => Err(invalid_param(
+            "client_id",
+            "confidential client metadata must include jwks or jwks_uri".to_string(),
+        )),
+        _ => Ok(()),
+    }
 }
 
 pub fn parse_authorization_request(
@@ -338,31 +456,7 @@ pub fn parse_pushed_authorization_request(
         validate_nonempty_length("login_hint", login_hint, 2048)?;
     }
 
-    let client_assertion_type = optional_single(&fields, "client_assertion_type")?;
-    let client_assertion = optional_single(&fields, "client_assertion")?;
-    match (&client_assertion_type, &client_assertion) {
-        (None, None) => {}
-        (Some(kind), Some(assertion)) if kind == OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER => {
-            validate_nonempty_length("client_assertion", assertion, 100_000)?;
-            return Err(OAuthRequestError::UnsupportedClientAuthentication);
-        }
-        (Some(_), Some(_)) => {
-            return Err(invalid_param(
-                "client_assertion_type",
-                "expected JWT bearer client assertion type".to_string(),
-            ));
-        }
-        (Some(_), None) => {
-            return Err(OAuthRequestError::MissingParameter {
-                parameter: "client_assertion",
-            });
-        }
-        (None, Some(_)) => {
-            return Err(OAuthRequestError::MissingParameter {
-                parameter: "client_assertion_type",
-            });
-        }
-    }
+    let client_auth = parse_client_auth_fields(&fields)?;
 
     Ok(PushedAuthorizationRequest {
         client_id,
@@ -373,15 +467,14 @@ pub fn parse_pushed_authorization_request(
         redirect_uri,
         scope,
         login_hint,
-        client_assertion_type,
-        client_assertion,
+        client_auth,
     })
 }
 
 pub fn parse_token_request(body: &str) -> Result<TokenRequest, OAuthRequestError> {
     let fields = parse_form_urlencoded(body)?;
     reject_unsupported_client_secret(&fields)?;
-    reject_unsupported_client_assertion(&fields)?;
+    let client_auth = parse_client_auth_fields(&fields)?;
 
     let grant_type = required_single(&fields, "grant_type")?;
     match grant_type.as_str() {
@@ -399,6 +492,7 @@ pub fn parse_token_request(body: &str) -> Result<TokenRequest, OAuthRequestError
                 code,
                 redirect_uri,
                 code_verifier,
+                client_auth,
             })
         }
         "refresh_token" => {
@@ -409,6 +503,7 @@ pub fn parse_token_request(body: &str) -> Result<TokenRequest, OAuthRequestError
             Ok(TokenRequest::RefreshToken {
                 client_id,
                 refresh_token,
+                client_auth,
             })
         }
         _ => Err(OAuthRequestError::UnsupportedGrantType { grant_type }),
@@ -445,16 +540,18 @@ fn reject_unsupported_client_secret(
     }
 }
 
-fn reject_unsupported_client_assertion(
+fn parse_client_auth_fields(
     fields: &BTreeMap<String, Vec<String>>,
-) -> Result<(), OAuthRequestError> {
+) -> Result<OAuthClientAuth, OAuthRequestError> {
     let client_assertion_type = optional_single(fields, "client_assertion_type")?;
     let client_assertion = optional_single(fields, "client_assertion")?;
     match (&client_assertion_type, &client_assertion) {
-        (None, None) => Ok(()),
+        (None, None) => Ok(OAuthClientAuth::None),
         (Some(kind), Some(assertion)) if kind == OAUTH_CLIENT_ASSERTION_TYPE_JWT_BEARER => {
             validate_nonempty_length("client_assertion", assertion, 100_000)?;
-            Err(OAuthRequestError::UnsupportedClientAuthentication)
+            Ok(OAuthClientAuth::PrivateKeyJwt {
+                assertion: assertion.to_string(),
+            })
         }
         (Some(_), Some(_)) => Err(invalid_param(
             "client_assertion_type",
@@ -692,6 +789,247 @@ fn json_array_contains(value: Option<&Value>, needle: &str) -> bool {
         .is_some_and(|values| values.iter().any(|value| value.as_str() == Some(needle)))
 }
 
+pub fn verify_private_key_jwt(
+    assertion: &str,
+    client_id: &str,
+    issuer: &str,
+    jwks: &Value,
+    now: i64,
+) -> Result<VerifiedClientAssertion, OAuthRequestError> {
+    let (encoded_header, encoded_claims, encoded_signature) = split_jwt(assertion)
+        .ok_or_else(|| invalid_param("client_assertion", "malformed JWT assertion".to_string()))?;
+    let header: ClientAssertionHeader = decode_jwt_json(encoded_header)?;
+    let claims: ClientAssertionClaims = decode_jwt_json(encoded_claims)?;
+
+    if header.alg != "ES256" {
+        return Err(invalid_param(
+            "client_assertion",
+            "client assertion must use ES256".to_string(),
+        ));
+    }
+    if header.typ.as_deref().is_some_and(|typ| typ != "JWT") {
+        return Err(invalid_param(
+            "client_assertion",
+            "client assertion typ must be JWT when present".to_string(),
+        ));
+    }
+    let kid = header.kid.ok_or_else(|| {
+        invalid_param(
+            "client_assertion",
+            "client assertion header must include kid".to_string(),
+        )
+    })?;
+    let jwk = find_jwk(jwks, &kid)?;
+    let verifying_key = verifying_key_from_jwk(jwk)?;
+    let signature = decode_base64url(encoded_signature)?;
+    let signature = Signature::from_slice(&signature).map_err(|_| {
+        invalid_param(
+            "client_assertion",
+            "invalid client assertion signature encoding".to_string(),
+        )
+    })?;
+    let signing_input = format!("{encoded_header}.{encoded_claims}");
+    verifying_key
+        .verify(signing_input.as_bytes(), &signature)
+        .map_err(|_| {
+            invalid_param(
+                "client_assertion",
+                "invalid client assertion signature".to_string(),
+            )
+        })?;
+
+    if claims.iss != client_id || claims.sub != client_id {
+        return Err(invalid_param(
+            "client_assertion",
+            "client assertion iss and sub must match client_id".to_string(),
+        ));
+    }
+    if !audience_matches(&claims.aud, issuer) {
+        return Err(invalid_param(
+            "client_assertion",
+            "client assertion aud must match authorization server issuer".to_string(),
+        ));
+    }
+    if claims.jti.trim().is_empty() {
+        return Err(invalid_param(
+            "client_assertion",
+            "client assertion jti must not be empty".to_string(),
+        ));
+    }
+    if claims.exp <= now {
+        return Err(invalid_param(
+            "client_assertion",
+            "client assertion has expired".to_string(),
+        ));
+    }
+    if claims.iat > now.saturating_add(CLIENT_ASSERTION_MAX_FUTURE_IAT_SECONDS)
+        || claims.iat < now.saturating_sub(CLIENT_ASSERTION_MAX_AGE_SECONDS)
+        || claims.exp > claims.iat.saturating_add(CLIENT_ASSERTION_MAX_AGE_SECONDS)
+    {
+        return Err(invalid_param(
+            "client_assertion",
+            "client assertion timestamp window is invalid".to_string(),
+        ));
+    }
+
+    Ok(VerifiedClientAssertion {
+        kid,
+        alg: "ES256".to_string(),
+        jkt: jwk_thumbprint(jwk)?,
+        jti: claims.jti,
+        expires_at: claims.exp,
+    })
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClientAssertionHeader {
+    alg: String,
+    #[serde(default)]
+    typ: Option<String>,
+    #[serde(default)]
+    kid: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ClientAssertionClaims {
+    iss: String,
+    sub: String,
+    aud: AudienceClaim,
+    exp: i64,
+    iat: i64,
+    jti: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum AudienceClaim {
+    String(String),
+    Strings(Vec<String>),
+}
+
+fn audience_matches(audience: &AudienceClaim, issuer: &str) -> bool {
+    match audience {
+        AudienceClaim::String(value) => value == issuer,
+        AudienceClaim::Strings(values) => values.iter().any(|value| value == issuer),
+    }
+}
+
+fn split_jwt(jwt: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = jwt.split('.');
+    let header = parts.next()?;
+    let claims = parts.next()?;
+    let signature = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((header, claims, signature))
+}
+
+fn decode_jwt_json<T: for<'de> serde::Deserialize<'de>>(
+    value: &str,
+) -> Result<T, OAuthRequestError> {
+    let bytes = decode_base64url(value)?;
+    serde_json::from_slice(&bytes).map_err(|_| {
+        invalid_param(
+            "client_assertion",
+            "malformed client assertion JSON".to_string(),
+        )
+    })
+}
+
+fn decode_base64url(value: &str) -> Result<Vec<u8>, OAuthRequestError> {
+    URL_SAFE_NO_PAD.decode(value).map_err(|_| {
+        invalid_param(
+            "client_assertion",
+            "malformed base64url client assertion".to_string(),
+        )
+    })
+}
+
+fn find_jwk<'a>(jwks: &'a Value, kid: &str) -> Result<&'a Value, OAuthRequestError> {
+    jwks.get("keys")
+        .and_then(Value::as_array)
+        .and_then(|keys| {
+            keys.iter()
+                .find(|key| key.get("kid").and_then(Value::as_str) == Some(kid))
+        })
+        .ok_or_else(|| {
+            invalid_param(
+                "client_assertion",
+                "client assertion kid was not found in client JWKS".to_string(),
+            )
+        })
+}
+
+fn verifying_key_from_jwk(jwk: &Value) -> Result<VerifyingKey, OAuthRequestError> {
+    if jwk.get("kty").and_then(Value::as_str) != Some("EC")
+        || jwk.get("crv").and_then(Value::as_str) != Some("P-256")
+        || jwk.get("d").is_some()
+    {
+        return Err(invalid_param(
+            "client_assertion",
+            "client assertion key must be a public P-256 EC JWK".to_string(),
+        ));
+    }
+    if jwk
+        .get("alg")
+        .and_then(Value::as_str)
+        .is_some_and(|alg| alg != "ES256")
+    {
+        return Err(invalid_param(
+            "client_assertion",
+            "client assertion JWK alg must be ES256 when present".to_string(),
+        ));
+    }
+    let x = jwk
+        .get("x")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_param("client_assertion", "JWK x is required".to_string()))
+        .and_then(decode_base64url)?;
+    let y = jwk
+        .get("y")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_param("client_assertion", "JWK y is required".to_string()))
+        .and_then(decode_base64url)?;
+    if x.len() != P256_COORDINATE_BYTES || y.len() != P256_COORDINATE_BYTES {
+        return Err(invalid_param(
+            "client_assertion",
+            "JWK coordinates must be 32 bytes each".to_string(),
+        ));
+    }
+    let mut sec1 = Vec::with_capacity(1 + P256_COORDINATE_BYTES * 2);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&x);
+    sec1.extend_from_slice(&y);
+    VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| {
+        invalid_param(
+            "client_assertion",
+            "invalid P-256 public key coordinates".to_string(),
+        )
+    })
+}
+
+fn jwk_thumbprint(jwk: &Value) -> Result<String, OAuthRequestError> {
+    let crv = jwk
+        .get("crv")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_param("client_assertion", "JWK crv is required".to_string()))?;
+    let kty = jwk
+        .get("kty")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_param("client_assertion", "JWK kty is required".to_string()))?;
+    let x = jwk
+        .get("x")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_param("client_assertion", "JWK x is required".to_string()))?;
+    let y = jwk
+        .get("y")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid_param("client_assertion", "JWK y is required".to_string()))?;
+    let canonical = format!(r#"{{"crv":"{crv}","kty":"{kty}","x":"{x}","y":"{y}"}}"#);
+    Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(canonical.as_bytes())))
+}
+
 fn validate_request_uri(value: &str) -> Result<(), OAuthRequestError> {
     validate_nonempty_length("request_uri", value, 2048)?;
     if value
@@ -814,6 +1152,17 @@ mod tests {
         assert!(array_strings(&metadata, "grant_types_supported").contains(&"authorization_code"));
         assert!(array_strings(&metadata, "grant_types_supported").contains(&"refresh_token"));
         assert!(array_strings(&metadata, "code_challenge_methods_supported").contains(&"S256"));
+        assert_eq!(
+            array_strings(&metadata, "token_endpoint_auth_methods_supported"),
+            vec!["none", "private_key_jwt"]
+        );
+        assert_eq!(
+            array_strings(
+                &metadata,
+                "token_endpoint_auth_signing_alg_values_supported"
+            ),
+            vec!["ES256"]
+        );
         assert!(array_strings(&metadata, "scopes_supported").contains(&"atproto"));
         assert_eq!(
             metadata["authorization_response_iss_parameter_supported"],
@@ -849,6 +1198,7 @@ mod tests {
         assert_eq!(request.redirect_uri, "http://127.0.0.1/callback");
         assert_eq!(request.scope, "atproto transition:generic");
         assert_eq!(request.login_hint.as_deref(), Some("alice.example"));
+        assert_eq!(request.client_auth, OAuthClientAuth::None);
         assert!(request.requested_scopes().contains("atproto"));
     }
 
@@ -964,6 +1314,32 @@ mod tests {
     }
 
     #[test]
+    fn validates_confidential_client_metadata_document() {
+        let metadata = json!({
+            "client_id": "https://client.example.com/oauth.json",
+            "grant_types": ["authorization_code", "refresh_token"],
+            "response_types": ["code"],
+            "redirect_uris": ["https://client.example.com/callback"],
+            "scope": "atproto transition:generic",
+            "dpop_bound_access_tokens": true,
+            "token_endpoint_auth_method": "private_key_jwt",
+            "jwks": {"keys": []},
+        });
+
+        validate_client_metadata(
+            "https://client.example.com/oauth.json",
+            Some(&metadata),
+            "https://client.example.com/callback",
+            "atproto",
+        )
+        .unwrap();
+        assert_eq!(
+            client_auth_method_from_metadata(&metadata).unwrap(),
+            OAuthClientAuthMethod::PrivateKeyJwt
+        );
+    }
+
+    #[test]
     fn rejects_missing_atproto_scope() {
         let error = parse_pushed_authorization_request(&format!(
             "client_id=http%3A%2F%2Flocalhost&response_type=code&code_challenge={CODE_CHALLENGE}&code_challenge_method=S256&state=abc123&redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback&scope=transition%3Ageneric"
@@ -1032,6 +1408,7 @@ mod tests {
                 code: "abc".to_string(),
                 redirect_uri: "http://127.0.0.1/callback".to_string(),
                 code_verifier: CODE_CHALLENGE.to_string(),
+                client_auth: OAuthClientAuth::None,
             }
         );
     }
@@ -1048,8 +1425,77 @@ mod tests {
             TokenRequest::RefreshToken {
                 client_id: "http://localhost".to_string(),
                 refresh_token: "token".to_string(),
+                client_auth: OAuthClientAuth::None,
             }
         );
+    }
+
+    #[test]
+    fn verifies_private_key_jwt_client_assertion() {
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        let key = SigningKey::from_slice(&[11_u8; 32]).unwrap();
+        let public = key.verifying_key().to_encoded_point(false);
+        let jwks = json!({
+            "keys": [{
+                "kty": "EC",
+                "crv": "P-256",
+                "kid": "key-1",
+                "alg": "ES256",
+                "x": URL_SAFE_NO_PAD.encode(public.x().unwrap()),
+                "y": URL_SAFE_NO_PAD.encode(public.y().unwrap()),
+            }]
+        });
+        let assertion = signed_client_assertion(
+            &key,
+            "key-1",
+            "https://client.example.com/oauth.json",
+            "https://pds.example.com",
+            1000,
+        );
+
+        let verified = verify_private_key_jwt(
+            &assertion,
+            "https://client.example.com/oauth.json",
+            "https://pds.example.com",
+            &jwks,
+            1000,
+        )
+        .unwrap();
+
+        assert_eq!(verified.kid, "key-1");
+        assert_eq!(verified.alg, "ES256");
+        assert_eq!(verified.jti, "assertion-1");
+
+        fn signed_client_assertion(
+            key: &SigningKey,
+            kid: &str,
+            client_id: &str,
+            issuer: &str,
+            now: i64,
+        ) -> String {
+            let header = json!({
+                "typ": "JWT",
+                "alg": "ES256",
+                "kid": kid,
+            });
+            let claims = json!({
+                "iss": client_id,
+                "sub": client_id,
+                "aud": issuer,
+                "iat": now,
+                "exp": now + 300,
+                "jti": "assertion-1",
+            });
+            let encoded_header = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
+            let encoded_claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+            let signing_input = format!("{encoded_header}.{encoded_claims}");
+            let signature: Signature = key.sign(signing_input.as_bytes());
+            format!(
+                "{signing_input}.{}",
+                URL_SAFE_NO_PAD.encode(signature.to_bytes())
+            )
+        }
     }
 
     #[test]

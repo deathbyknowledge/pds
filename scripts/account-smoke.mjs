@@ -30,6 +30,40 @@ if (session.did !== `did:web:${handle}` || session.handle !== handle || !session
 }
 
 await expectJson(
+  "put account Lexicon",
+  "POST",
+  `/repos/${encodePath(handle)}/lexicons`,
+  recordLexicon(collection),
+  (body) => {
+    if (
+      body.id !== collection ||
+      body.stored !== true ||
+      body.published !== true ||
+      body.uri !== `at://${session.did}/com.atproto.lexicon.schema/${collection}`
+    ) {
+      throw new Error(`unexpected put Lexicon response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectJson(
+  "published account Lexicon record",
+  "GET",
+  `/xrpc/com.atproto.repo.getRecord?repo=${encodeQuery(session.did)}&collection=com.atproto.lexicon.schema&rkey=${encodeQuery(collection)}`,
+  null,
+  (body) => {
+    if (
+      body.uri !== `at://${session.did}/com.atproto.lexicon.schema/${collection}` ||
+      body.value?.$type !== "com.atproto.lexicon.schema" ||
+      body.value?.id !== collection
+    ) {
+      throw new Error(`unexpected published Lexicon record ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+await expectJson(
   "get session",
   "GET",
   "/xrpc/com.atproto.server.getSession",
@@ -96,6 +130,7 @@ const createRecord = await expectJson(
     repo: session.did,
     collection,
     rkey,
+    validate: true,
     record: {
       $type: collection,
       text: "created through account auth",
@@ -104,7 +139,12 @@ const createRecord = await expectJson(
     },
   },
   (body) => {
-    if (body.uri !== `at://${session.did}/${collection}/${rkey}` || !body.cid || !body.commit?.cid) {
+    if (
+      body.uri !== `at://${session.did}/${collection}/${rkey}` ||
+      !body.cid ||
+      !body.commit?.cid ||
+      body.validationStatus !== "valid"
+    ) {
       throw new Error(`unexpected createRecord response ${JSON.stringify(body)}`);
     }
   },
@@ -471,7 +511,10 @@ async function expectOAuthDiscovery() {
       if (
         body.require_pushed_authorization_requests !== true ||
         body.client_id_metadata_document_supported !== true ||
-        !body.dpop_signing_alg_values_supported?.includes("ES256")
+        !body.dpop_signing_alg_values_supported?.includes("ES256") ||
+        !body.token_endpoint_auth_methods_supported?.includes("none") ||
+        !body.token_endpoint_auth_methods_supported?.includes("private_key_jwt") ||
+        !body.token_endpoint_auth_signing_alg_values_supported?.includes("ES256")
       ) {
         throw new Error(`OAuth metadata is missing required atproto capabilities ${JSON.stringify(body)}`);
       }
@@ -781,12 +824,43 @@ function encodeQuery(value) {
   return encodeURIComponent(value);
 }
 
+function encodePath(value) {
+  return value.split("/").map(encodeURIComponent).join("/");
+}
+
 function blobRef(cid, mimeType, size) {
   return {
     $type: "blob",
     ref: { $link: cid },
     mimeType,
     size,
+  };
+}
+
+function recordLexicon(id) {
+  return {
+    lexicon: 1,
+    id,
+    defs: {
+      main: {
+        type: "record",
+        key: "any",
+        record: {
+          type: "object",
+          required: ["$type", "text"],
+          properties: {
+            $type: { type: "string", const: id },
+            text: { type: "string", maxLength: 4096 },
+            createdAt: { type: "string", format: "datetime" },
+            attachment: {
+              type: "blob",
+              accept: ["*/*"],
+              maxSize: 10485760,
+            },
+          },
+        },
+      },
+    },
   };
 }
 

@@ -65,6 +65,26 @@ await expectJson(
   },
 );
 
+await expectJson(
+  "resolve identity by handle",
+  "GET",
+  `/xrpc/com.atproto.identity.resolveIdentity?identifier=${encodeQuery(handle)}`,
+  null,
+  (body) => {
+    expectIdentityInfo(body);
+  },
+);
+
+await expectJson(
+  "resolve identity by DID",
+  "GET",
+  `/xrpc/com.atproto.identity.resolveIdentity?identifier=${encodeQuery(did)}`,
+  null,
+  (body) => {
+    expectIdentityInfo(body);
+  },
+);
+
 await expectJsonStatus(
   "unknown DID",
   "GET",
@@ -74,6 +94,19 @@ await expectJsonStatus(
   (body) => {
     if (body.error !== "DidNotFound" || typeof body.message !== "string") {
       throw new Error(`unexpected unknown DID response ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+await expectJsonStatus(
+  "unknown identity",
+  "GET",
+  `/xrpc/com.atproto.identity.resolveIdentity?identifier=${encodeQuery(`unknown-${handle}`)}`,
+  null,
+  404,
+  (body) => {
+    if (body.error !== "HandleNotFound" || typeof body.message !== "string") {
+      throw new Error(`unexpected unknown identity response ${JSON.stringify(body)}`);
     }
   },
 );
@@ -419,6 +452,16 @@ function repoNameFromDidOrHandle(did, handle) {
 
 function atprotoServiceEndpoint(didDocument) {
   return didDocument?.service?.find((service) => service.id === "#atproto_pds")?.serviceEndpoint;
+}
+
+function expectIdentityInfo(body) {
+  if (body.did !== did || body.handle !== handle || body.didDoc?.id !== did) {
+    throw new Error(`unexpected identityInfo ${JSON.stringify(body)}`);
+  }
+  const serviceEndpoint = atprotoServiceEndpoint(body.didDoc);
+  if (serviceEndpoint !== baseOrigin) {
+    throw new Error(`identityInfo service endpoint ${serviceEndpoint}, expected ${baseOrigin}`);
+  }
 }
 
 function recordPathFromUri(uri, expectedDid) {

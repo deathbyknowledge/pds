@@ -63,6 +63,7 @@ pub const CREATE_REPO_COMMIT_EVENTS: &str = "CREATE TABLE IF NOT EXISTS repo_com
     seq        INTEGER PRIMARY KEY AUTOINCREMENT,
     rev        TEXT NOT NULL UNIQUE,
     since      TEXT,
+    prev_data  TEXT,
     commit_cid TEXT NOT NULL,
     blocks     BLOB NOT NULL,
     ops_json   TEXT NOT NULL DEFAULT '[]',
@@ -73,6 +74,13 @@ pub const CREATE_REPO_COMMIT_EVENTS: &str = "CREATE TABLE IF NOT EXISTS repo_com
 pub const CREATE_REPO_COMMIT_EVENTS_REV_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_repo_commit_events_rev
      ON repo_commit_events(rev)";
+
+pub const CREATE_REPO_LEXICONS: &str = "CREATE TABLE IF NOT EXISTS repo_lexicons (
+    nsid         TEXT PRIMARY KEY,
+    lexicon_json TEXT NOT NULL,
+    source       TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL DEFAULT (unixepoch())
+)";
 
 pub const ALL_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_REPO_STATE,
@@ -86,6 +94,7 @@ pub const ALL_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_REPO_BLOB_REFS_CID_INDEX,
     CREATE_REPO_COMMIT_EVENTS,
     CREATE_REPO_COMMIT_EVENTS_REV_INDEX,
+    CREATE_REPO_LEXICONS,
 ];
 
 pub const CREATE_DIRECTORY_REPOS: &str = "CREATE TABLE IF NOT EXISTS directory_repos (
@@ -122,6 +131,7 @@ pub const CREATE_DIRECTORY_EVENTS: &str = "CREATE TABLE IF NOT EXISTS directory_
     commit_cid TEXT,
     rev        TEXT,
     since      TEXT,
+    prev_data  TEXT,
     blocks     BLOB,
     ops_json   TEXT NOT NULL DEFAULT '[]',
     blobs_json TEXT NOT NULL DEFAULT '[]',
@@ -150,12 +160,16 @@ pub const CREATE_DIRECTORY_ACCOUNTS_HANDLE_INDEX: &str =
      ON directory_accounts(handle)";
 
 pub const CREATE_DIRECTORY_SESSIONS: &str = "CREATE TABLE IF NOT EXISTS directory_sessions (
-    session_id  TEXT PRIMARY KEY,
-    did         TEXT NOT NULL,
-    refresh_jti TEXT NOT NULL UNIQUE,
-    active      INTEGER NOT NULL DEFAULT 1,
-    created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
-    updated_at  INTEGER NOT NULL DEFAULT (unixepoch())
+    session_id         TEXT PRIMARY KEY,
+    did                TEXT NOT NULL,
+    refresh_jti        TEXT NOT NULL UNIQUE,
+    active             INTEGER NOT NULL DEFAULT 1,
+    client_auth_method TEXT NOT NULL DEFAULT 'none',
+    client_auth_kid    TEXT,
+    client_auth_alg    TEXT,
+    client_auth_jkt    TEXT,
+    created_at         INTEGER NOT NULL DEFAULT (unixepoch()),
+    updated_at         INTEGER NOT NULL DEFAULT (unixepoch())
 )";
 
 pub const CREATE_DIRECTORY_SESSIONS_DID_INDEX: &str =
@@ -174,6 +188,10 @@ pub const CREATE_DIRECTORY_OAUTH_PAR_REQUESTS: &str =
     login_hint            TEXT,
     dpop_jkt              TEXT NOT NULL DEFAULT '',
     dpop_nonce            TEXT NOT NULL,
+    client_auth_method    TEXT NOT NULL DEFAULT 'none',
+    client_auth_kid       TEXT,
+    client_auth_alg       TEXT,
+    client_auth_jkt       TEXT,
     params_json           TEXT NOT NULL,
     expires_at            INTEGER NOT NULL,
     created_at            INTEGER NOT NULL DEFAULT (unixepoch()),
@@ -198,6 +216,10 @@ pub const CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES: &str =
     handle                TEXT NOT NULL,
     dpop_jkt              TEXT NOT NULL DEFAULT '',
     dpop_nonce            TEXT NOT NULL,
+    client_auth_method    TEXT NOT NULL DEFAULT 'none',
+    client_auth_kid       TEXT,
+    client_auth_alg       TEXT,
+    client_auth_jkt       TEXT,
     expires_at            INTEGER NOT NULL,
     consumed_at           INTEGER,
     created_at            INTEGER NOT NULL DEFAULT (unixepoch())
@@ -223,6 +245,19 @@ pub const CREATE_DIRECTORY_DPOP_JTIS_EXPIRES_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_directory_dpop_jtis_expires_at
      ON directory_dpop_jtis(expires_at)";
 
+pub const CREATE_DIRECTORY_OAUTH_CLIENT_JTIS: &str =
+    "CREATE TABLE IF NOT EXISTS directory_oauth_client_jtis (
+    client_id  TEXT NOT NULL,
+    jti        TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (client_id, jti)
+)";
+
+pub const CREATE_DIRECTORY_OAUTH_CLIENT_JTIS_EXPIRES_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_oauth_client_jtis_expires_at
+     ON directory_oauth_client_jtis(expires_at)";
+
 pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_REPOS,
     CREATE_DIRECTORY_REPOS_UPDATED_INDEX,
@@ -241,6 +276,8 @@ pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_OAUTH_AUTHORIZATION_CODES_DID_INDEX,
     CREATE_DIRECTORY_DPOP_JTIS,
     CREATE_DIRECTORY_DPOP_JTIS_EXPIRES_INDEX,
+    CREATE_DIRECTORY_OAUTH_CLIENT_JTIS,
+    CREATE_DIRECTORY_OAUTH_CLIENT_JTIS_EXPIRES_INDEX,
 ];
 
 #[cfg(test)]
@@ -258,6 +295,7 @@ mod tests {
         assert!(joined.contains("record_index"));
         assert!(joined.contains("repo_blob_refs"));
         assert!(joined.contains("repo_commit_events"));
+        assert!(joined.contains("repo_lexicons"));
         assert!(joined.contains("idx_record_index_collection_path"));
     }
 
@@ -303,6 +341,13 @@ mod tests {
     }
 
     #[test]
+    fn repo_lexicons_cache_schema_documents_by_nsid() {
+        assert!(CREATE_REPO_LEXICONS.contains("nsid         TEXT PRIMARY KEY"));
+        assert!(CREATE_REPO_LEXICONS.contains("lexicon_json TEXT NOT NULL"));
+        assert!(CREATE_REPO_LEXICONS.contains("source       TEXT NOT NULL"));
+    }
+
+    #[test]
     fn directory_schema_indexes_repos_and_events() {
         let joined = DIRECTORY_SCHEMA_STATEMENTS.join("\n");
 
@@ -319,7 +364,8 @@ mod tests {
         assert!(joined.contains("directory_accounts"));
         assert!(joined.contains("password_hash        TEXT NOT NULL"));
         assert!(joined.contains("directory_sessions"));
-        assert!(joined.contains("refresh_jti TEXT NOT NULL UNIQUE"));
+        assert!(joined.contains("refresh_jti        TEXT NOT NULL UNIQUE"));
+        assert!(joined.contains("client_auth_method TEXT NOT NULL DEFAULT 'none'"));
         assert!(joined.contains("directory_oauth_par_requests"));
         assert!(joined.contains("UNIQUE (client_id, state)"));
         assert!(joined.contains("directory_oauth_authorization_codes"));
@@ -327,5 +373,6 @@ mod tests {
         assert!(joined.contains("consumed_at           INTEGER"));
         assert!(joined.contains("dpop_jkt"));
         assert!(joined.contains("directory_dpop_jtis"));
+        assert!(joined.contains("directory_oauth_client_jtis"));
     }
 }
