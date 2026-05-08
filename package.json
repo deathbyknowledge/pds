@@ -9,6 +9,7 @@
     "seed:test-repo": "node scripts/seed-test-repo.mjs",
     "smoke:account": "node scripts/account-smoke.mjs",
     "smoke:lexicon": "node scripts/lexicon-cross-repo-smoke.mjs",
+    "smoke:oauth:confidential": "node scripts/oauth-confidential-smoke.mjs",
     "smoke:public": "node scripts/public-smoke.mjs",
     "build:worker": "worker-build --release .",
     "test:rust": "cargo test",

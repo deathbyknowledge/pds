@@ -46,6 +46,11 @@ if [[ -n "${PDS_BASE_URL:-}" ]]; then
   npm run smoke:account
   npm run smoke:public
   npm run smoke:lexicon
+  if [[ -n "${OAUTH_CONFIDENTIAL_CLIENT_ID:-}" && -n "${OAUTH_CONFIDENTIAL_CLIENT_PRIVATE_KEY_JWK:-}" ]]; then
+    npm run smoke:oauth:confidential
+  else
+    echo "Skipping smoke:oauth:confidential; set OAUTH_CONFIDENTIAL_CLIENT_ID and OAUTH_CONFIDENTIAL_CLIENT_PRIVATE_KEY_JWK to enable it."
+  fi
   exit 0
 fi
 
@@ -60,5 +65,10 @@ Run remote smokes with:
   npm run smoke:account && \
   npm run smoke:public && \
   npm run smoke:lexicon
+
+Optional confidential OAuth smoke:
+  OAUTH_CONFIDENTIAL_CLIENT_ID=https://client.example.com/client.json \
+  OAUTH_CONFIDENTIAL_CLIENT_PRIVATE_KEY_JWK=@private-client-key.jwk \
+  npm run smoke:oauth:confidential
 
 MSG
