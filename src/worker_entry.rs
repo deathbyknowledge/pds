@@ -60,10 +60,11 @@ use crate::repo_import::{
 };
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 use crate::xrpc::{
-    at_uri, optional_param, parse_get_blocks_params, parse_list_records_params, required_param,
-    route_xrpc_method, strong_ref, IDENTITY_REFRESH_IDENTITY, IDENTITY_RESOLVE_DID,
-    IDENTITY_RESOLVE_HANDLE, IDENTITY_RESOLVE_IDENTITY, IDENTITY_UPDATE_HANDLE, REPO_APPLY_WRITES,
-    REPO_CREATE_RECORD, REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
+    at_uri, optional_param, parse_get_blocks_params, parse_list_records_params,
+    repo_object_name_from_identifier, required_param, route_xrpc_method, strong_ref,
+    IDENTITY_REFRESH_IDENTITY, IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE,
+    IDENTITY_RESOLVE_IDENTITY, IDENTITY_UPDATE_HANDLE, REPO_APPLY_WRITES, REPO_CREATE_RECORD,
+    REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
     REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
     SERVER_ACTIVATE_ACCOUNT, SERVER_CHANGE_PASSWORD, SERVER_CHECK_ACCOUNT_STATUS,
     SERVER_CONFIRM_EMAIL, SERVER_CREATE_ACCOUNT, SERVER_CREATE_APP_PASSWORD, SERVER_CREATE_SESSION,
@@ -639,11 +640,8 @@ impl PdsDirectoryObject {
         body.handle = body.handle.to_ascii_lowercase();
         body.email = normalize_account_email(body.email);
         let request_host = request_host(req)?;
-        if body.did.is_some() || body.plc_op.is_some() {
-            return Err(HttpError::new(
-                400,
-                "importing existing DIDs is not implemented",
-            ));
+        if body.plc_op.is_some() {
+            return Err(HttpError::new(400, "PLC operations are not implemented"));
         }
         let password = body
             .password
@@ -659,10 +657,20 @@ impl PdsDirectoryObject {
             return Err(HttpError::new(400, "HandleNotAvailable"));
         }
 
-        let did = Did::new(format!("did:web:{}", body.handle)).map_err(HttpError::bad_request)?;
-        validate_account_handle_for_creation(&self.env, &body.handle, &request_host, did.as_str())
-            .await?;
-        let repo_name = body.handle.clone();
+        let (did, repo_name, validate_did_document) = account_identity_for_creation(
+            &self.env,
+            &body.handle,
+            body.did.as_deref(),
+            &request_host,
+        )
+        .await?;
+        if store
+            .get_account_by_did(&did)
+            .map_err(HttpError::worker)?
+            .is_some()
+        {
+            return Err(HttpError::new(400, "DidNotAvailable"));
+        }
         let signing_key_hex = generate_repo_signing_key_hex()?;
         let init = match self
             .initialize_account_repo(
@@ -681,7 +689,9 @@ impl PdsDirectoryObject {
             }
             Err(error) => return Err(error),
         };
-        validate_account_did_document(&body.handle, did.as_str()).await?;
+        if validate_did_document {
+            validate_account_did_document(&body.handle, did.as_str()).await?;
+        }
 
         let salt = random_bytes::<PASSWORD_SALT_BYTES>()?;
         let account = DirectoryAccountRow {
@@ -6034,6 +6044,33 @@ async fn validate_account_did_document(handle: &str, did: &str) -> Result<(), Ht
         ));
     }
     Ok(())
+}
+
+async fn account_identity_for_creation(
+    env: &Env,
+    handle: &str,
+    requested_did: Option<&str>,
+    request_host: &str,
+) -> Result<(Did, String, bool), HttpError> {
+    validate_handle_syntax(handle).map_err(HttpError::bad_request)?;
+    let Some(requested_did) = requested_did else {
+        let did = Did::new(format!("did:web:{handle}")).map_err(HttpError::bad_request)?;
+        validate_account_handle_for_creation(env, handle, request_host, did.as_str()).await?;
+        return Ok((did, handle.to_string(), true));
+    };
+
+    let did = Did::new(requested_did.to_string()).map_err(HttpError::bad_request)?;
+    if !did.as_str().starts_with("did:gsv:") {
+        return Err(HttpError::new(
+            400,
+            "UnsupportedDid: admin-created custom accounts currently support did:gsv DIDs only",
+        ));
+    }
+    let repo_name = repo_object_name_from_identifier(did.as_str());
+    if repo_name.is_empty() {
+        return Err(HttpError::new(400, "InvalidDid"));
+    }
+    Ok((did, repo_name, false))
 }
 
 fn configured_account_handle_allowed(env: &Env, handle: &str) -> bool {

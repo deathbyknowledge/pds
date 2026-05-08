@@ -44,6 +44,7 @@ npx wrangler deploy "$@"
 if [[ -n "${PDS_BASE_URL:-}" ]]; then
   npm run seed:test-repo
   npm run smoke:account
+  npm run smoke:delete-account
   npm run smoke:public
   npm run smoke:lexicon
   if [[ -n "${OAUTH_CONFIDENTIAL_CLIENT_ID:-}" && -n "${OAUTH_CONFIDENTIAL_CLIENT_PRIVATE_KEY_JWK:-}" ]]; then
@@ -63,6 +64,7 @@ Run remote smokes with:
   PDS_ADMIN_TOKEN=<same-token> \
   npm run seed:test-repo && \
   npm run smoke:account && \
+  npm run smoke:delete-account && \
   npm run smoke:public && \
   npm run smoke:lexicon
 
