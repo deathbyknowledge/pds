@@ -214,11 +214,13 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
         };
     }
 
-    if parts.len() >= 2 && parts[0] == "repos" && !parts[1].is_empty() {
-        let namespace = env.durable_object("REPO_OBJECTS")?;
-        let id = namespace.id_from_name(parts[1])?;
-        let stub = id.get_stub()?;
-        return stub.fetch_with_request(req).await;
+    if url.path() != "/" {
+        return json_response(
+            404,
+            &json!({
+                "error": "not found",
+            }),
+        );
     }
 
     json_response(
@@ -228,16 +230,6 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
             "version": env!("CARGO_PKG_VERSION"),
             "status": "ready",
             "routes": {
-                "repoStatus": "GET /repos/:name/status",
-                "repoInit": "POST /repos/:name/init",
-                "repoDirectorySync": "POST /repos/:name/directory-sync",
-                "repoLexiconPut": "POST /repos/:name/lexicons",
-                "repoLexiconList": "GET /repos/:name/lexicons",
-                "recordCreate": "POST /repos/:name/records",
-                "recordUpdate": "PUT /repos/:name/records",
-                "recordDelete": "DELETE /repos/:name/records",
-                "recordRead": "GET /repos/:name/records?path=collection/rkey",
-                "recordList": "GET /repos/:name/records?collection=nsid",
                 "oauthProtectedResource": "GET /.well-known/oauth-protected-resource",
                 "oauthAuthorizationServer": "GET /.well-known/oauth-authorization-server",
                 "oauthPar": "POST /oauth/par",
@@ -296,7 +288,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcApplyWrites": "POST /xrpc/com.atproto.repo.applyWrites",
                 "xrpcImportRepo": "POST /xrpc/com.atproto.repo.importRepo",
                 "xrpcUploadBlob": "POST /xrpc/com.atproto.repo.uploadBlob",
-                "xrpcListMissingBlobs": "GET /xrpc/com.atproto.repo.listMissingBlobs",
+                "xrpcListMissingBlobs": "GET /xrpc/com.atproto.repo.listMissingBlobs?repo=:repo",
                 "xrpcGetLatestCommit": "GET /xrpc/com.atproto.sync.getLatestCommit?did=:did",
                 "xrpcGetHead": "GET /xrpc/com.atproto.sync.getHead?did=:did",
                 "xrpcGetRepoStatus": "GET /xrpc/com.atproto.sync.getRepoStatus?did=:did",
@@ -3370,14 +3362,9 @@ impl RepoObject {
             (Method::Post, "init") => self.init(req, &repo_name).await,
             (Method::Put, "identity") => self.update_identity(req).await,
             (Method::Put, "signing-key") => self.update_signing_key(req).await,
-            (Method::Post, "directory-sync") => self.sync_directory(req, &repo_name).await,
             (Method::Post, "service-auth") => self.service_auth(req).await,
             (Method::Post, "lexicons") => self.put_lexicon(req, &repo_name).await,
             (Method::Get, "lexicons") => self.list_lexicons(req).await,
-            (Method::Post, "records") => self.create_record(req, &repo_name).await,
-            (Method::Put, "records") => self.update_record(req, &repo_name).await,
-            (Method::Delete, "records") => self.delete_record(req, &repo_name).await,
-            (Method::Get, "records") => self.read_records(&url).await,
             _ => Err(HttpError::new(404, "not found")),
         }
     }
@@ -4278,189 +4265,6 @@ impl RepoObject {
         })
     }
 
-    async fn create_record(
-        &self,
-        req: &mut Request,
-        repo_name: &str,
-    ) -> Result<Response, HttpError> {
-        let body: WriteRecordRequest = req.json().await.map_err(HttpError::worker)?;
-        self.require_admin(req)?;
-        let request_host = request_host(req)?;
-        let (previous_state, identity, signing_key, mut repo) =
-            self.open_repo_for_write_with_state()?;
-        let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
-        let validation_status = self
-            .ensure_record_envelope_dynamic(&path.collection, &body.record, body.validate)
-            .await?;
-        let blob_cids = extract_record_blob_refs(&body.record)?;
-        let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
-        let mutation = repo
-            .create_record(path.clone(), &body.record, rev, &signing_key)
-            .await
-            .map_err(HttpError::repo)?;
-        let event = self
-            .commit_event_payload(
-                &mut repo,
-                &mutation,
-                Some(previous_state.latest_rev.clone()),
-                blob_cids.clone(),
-            )
-            .await?;
-        let state = self
-            .persist_mutation(repo.storage(), &mutation)
-            .map_err(HttpError::worker)?;
-        self.persist_commit_event(repo.storage(), &state, &event)
-            .map_err(HttpError::worker)?;
-        if let Some(record_cid) = mutation.record_cid {
-            repo.storage()
-                .replace_blob_refs(&path, record_cid, &blob_cids)
-                .map_err(HttpError::worker)?;
-        }
-        self.notify_directory(
-            &request_host,
-            repo_name,
-            &identity,
-            &state,
-            None,
-            Some(&event),
-        )
-        .await?;
-        json_response(
-            201,
-            &mutation_response_with_validation(&path, &mutation, validation_status),
-        )
-        .map_err(HttpError::worker)
-    }
-
-    async fn update_record(
-        &self,
-        req: &mut Request,
-        repo_name: &str,
-    ) -> Result<Response, HttpError> {
-        let body: WriteRecordRequest = req.json().await.map_err(HttpError::worker)?;
-        self.require_admin(req)?;
-        let request_host = request_host(req)?;
-        let (previous_state, identity, signing_key, mut repo) =
-            self.open_repo_for_write_with_state()?;
-        let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
-        let validation_status = self
-            .ensure_record_envelope_dynamic(&path.collection, &body.record, body.validate)
-            .await?;
-        let blob_cids = extract_record_blob_refs(&body.record)?;
-        let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
-        let mutation = repo
-            .update_record(path.clone(), &body.record, rev, &signing_key)
-            .await
-            .map_err(HttpError::repo)?;
-        let event = self
-            .commit_event_payload(
-                &mut repo,
-                &mutation,
-                Some(previous_state.latest_rev.clone()),
-                blob_cids.clone(),
-            )
-            .await?;
-        let state = self
-            .persist_mutation(repo.storage(), &mutation)
-            .map_err(HttpError::worker)?;
-        self.persist_commit_event(repo.storage(), &state, &event)
-            .map_err(HttpError::worker)?;
-        if let Some(record_cid) = mutation.record_cid {
-            repo.storage()
-                .replace_blob_refs(&path, record_cid, &blob_cids)
-                .map_err(HttpError::worker)?;
-        }
-        self.notify_directory(
-            &request_host,
-            repo_name,
-            &identity,
-            &state,
-            None,
-            Some(&event),
-        )
-        .await?;
-        json_response(
-            200,
-            &mutation_response_with_validation(&path, &mutation, validation_status),
-        )
-        .map_err(HttpError::worker)
-    }
-
-    async fn delete_record(
-        &self,
-        req: &mut Request,
-        repo_name: &str,
-    ) -> Result<Response, HttpError> {
-        let body: DeleteRecordRequest = req.json().await.map_err(HttpError::worker)?;
-        self.require_admin(req)?;
-        let request_host = request_host(req)?;
-        let (previous_state, identity, signing_key, mut repo) =
-            self.open_repo_for_write_with_state()?;
-        let path = RepoPath::parse(&body.path).map_err(HttpError::bad_request)?;
-        let rev = RepoRev::new(body.rev).map_err(HttpError::bad_request)?;
-        let mutation = repo
-            .delete_record(&path, rev, &signing_key)
-            .await
-            .map_err(HttpError::repo)?;
-        let event = self
-            .commit_event_payload(
-                &mut repo,
-                &mutation,
-                Some(previous_state.latest_rev.clone()),
-                Vec::new(),
-            )
-            .await?;
-        let state = self
-            .persist_mutation(repo.storage(), &mutation)
-            .map_err(HttpError::worker)?;
-        self.persist_commit_event(repo.storage(), &state, &event)
-            .map_err(HttpError::worker)?;
-        repo.storage()
-            .delete_blob_refs(&path)
-            .map_err(HttpError::worker)?;
-        self.notify_directory(
-            &request_host,
-            repo_name,
-            &identity,
-            &state,
-            None,
-            Some(&event),
-        )
-        .await?;
-        json_response(200, &mutation_response(&path, &mutation)).map_err(HttpError::worker)
-    }
-
-    async fn sync_directory(
-        &self,
-        req: &mut Request,
-        repo_name: &str,
-    ) -> Result<Response, HttpError> {
-        self.require_admin(req)?;
-        let request_host = request_host(req)?;
-        let (state, identity, mut repo) = self.open_repo_with_identity()?;
-        let records = repo_record_paths(&mut repo).await?;
-        self.notify_directory(
-            &request_host,
-            repo_name,
-            &identity,
-            &state,
-            Some(&records),
-            None,
-        )
-        .await?;
-
-        json_response(
-            200,
-            &json!({
-                "ok": true,
-                "did": state.did.to_string(),
-                "latestCommit": state.latest_commit.to_string(),
-                "latestRev": state.latest_rev.to_string(),
-            }),
-        )
-        .map_err(HttpError::worker)
-    }
-
     async fn xrpc_create_record(&self, req: &mut Request) -> Result<Response, HttpError> {
         let body: XrpcCreateRecordRequest = req.json().await.map_err(HttpError::worker)?;
         let request_host = request_host(req)?;
@@ -4924,66 +4728,6 @@ impl RepoObject {
             }),
         )
         .map_err(HttpError::worker)
-    }
-
-    async fn read_records(&self, url: &worker::Url) -> Result<Response, HttpError> {
-        let mut repo = self.open_repo()?;
-        let params = url.query_pairs().collect::<Vec<_>>();
-        let path = params
-            .iter()
-            .find(|(key, _)| key == "path")
-            .map(|(_, value)| value.to_string());
-        if let Some(path) = path {
-            let path = RepoPath::parse(&path).map_err(HttpError::bad_request)?;
-            let stored = repo
-                .get_record::<Value>(&path)
-                .await
-                .map_err(HttpError::repo)?;
-            let Some(stored) = stored else {
-                return Err(HttpError::new(404, "record not found"));
-            };
-            return json_response(
-                200,
-                &json!({
-                    "path": stored.path.to_string(),
-                    "cid": stored.cid.to_string(),
-                    "record": stored.record,
-                }),
-            )
-            .map_err(HttpError::worker);
-        }
-
-        let collection = params
-            .iter()
-            .find(|(key, _)| key == "collection")
-            .map(|(_, value)| value.to_string());
-        let entries = if let Some(collection) = collection {
-            let collection = Nsid::new(collection).map_err(HttpError::bad_request)?;
-            repo.entries_for_collection(&collection)
-                .await
-                .map_err(HttpError::repo)?
-        } else {
-            repo.entries().await.map_err(HttpError::repo)?
-        };
-
-        json_response(
-            200,
-            &json!({
-                "records": entries
-                    .into_iter()
-                    .map(|entry| json!({
-                        "path": entry.path.to_string(),
-                        "cid": entry.cid.to_string(),
-                    }))
-                    .collect::<Vec<_>>()
-            }),
-        )
-        .map_err(HttpError::worker)
-    }
-
-    fn open_repo(&self) -> Result<SignedRepository<SqlRepoStore>, HttpError> {
-        let (_, repo) = self.open_repo_with_state()?;
-        Ok(repo)
     }
 
     fn open_repo_for_write_with_state(
@@ -5895,15 +5639,6 @@ struct SessionTokens {
 }
 
 #[derive(Debug, Deserialize)]
-struct WriteRecordRequest {
-    path: String,
-    rev: String,
-    record: Value,
-    #[serde(default, rename = "validate")]
-    validate: Option<bool>,
-}
-
-#[derive(Debug, Deserialize)]
 struct XrpcCreateRecordRequest {
     repo: String,
     collection: String,
@@ -5979,12 +5714,6 @@ struct XrpcApplyWriteRequest {
     rkey: Option<String>,
     #[serde(default)]
     value: Option<Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeleteRecordRequest {
-    path: String,
-    rev: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6168,27 +5897,6 @@ fn init_response_from_repo_status(
     })
 }
 
-fn mutation_response(path: &RepoPath, mutation: &RepoMutation) -> Value {
-    json!({
-        "path": path.to_string(),
-        "recordCid": mutation.record_cid.map(|cid| cid.to_string()),
-        "latestCommit": mutation.commit_cid.to_string(),
-        "latestRev": mutation.commit.rev.to_string(),
-        "mstRoot": mutation.mst_root.to_string(),
-        "prev": mutation.commit.prev.map(|cid| cid.to_string()),
-    })
-}
-
-fn mutation_response_with_validation(
-    path: &RepoPath,
-    mutation: &RepoMutation,
-    validation_status: RecordValidationStatus,
-) -> Value {
-    let mut body = mutation_response(path, mutation);
-    body["validationStatus"] = json!(validation_status.as_str());
-    body
-}
-
 fn xrpc_record_mutation_response(
     did: &Did,
     path: &RepoPath,
@@ -6329,18 +6037,6 @@ fn imported_blob_strings(records: &[crate::repo_import::ImportedRecord]) -> Vec<
         .into_iter()
         .map(|cid| cid.to_string())
         .collect()
-}
-
-async fn repo_record_paths(
-    repo: &mut SignedRepository<SqlRepoStore>,
-) -> Result<Vec<RepoPath>, HttpError> {
-    Ok(repo
-        .entries()
-        .await
-        .map_err(HttpError::repo)?
-        .into_iter()
-        .map(|entry| entry.path)
-        .collect())
 }
 
 fn validate_repo_paths(paths: Vec<String>) -> Result<Vec<RepoPath>, HttpError> {

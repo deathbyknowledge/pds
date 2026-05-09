@@ -32,19 +32,24 @@ if (session.did !== `did:web:${handle}` || session.handle !== handle || !session
 await expectJson(
   "put account Lexicon",
   "POST",
-  `/repos/${encodePath(handle)}/lexicons`,
-  recordLexicon(collection),
+  "/xrpc/com.atproto.repo.putRecord",
+  {
+    repo: session.did,
+    collection: "com.atproto.lexicon.schema",
+    rkey: collection,
+    validate: false,
+    record: publishedLexiconRecord(recordLexicon(collection)),
+  },
   (body) => {
     if (
-      body.id !== collection ||
-      body.stored !== true ||
-      body.published !== true ||
-      body.uri !== `at://${session.did}/com.atproto.lexicon.schema/${collection}`
+      body.uri !== `at://${session.did}/com.atproto.lexicon.schema/${collection}` ||
+      !body.cid ||
+      !body.commit?.cid
     ) {
       throw new Error(`unexpected put Lexicon response ${JSON.stringify(body)}`);
     }
   },
-  { authorization: `Bearer ${config.adminToken}` },
+  { authorization: `Bearer ${session.accessJwt}` },
 );
 
 await expectJson(
@@ -1225,10 +1230,6 @@ function encodeQuery(value) {
   return encodeURIComponent(value);
 }
 
-function encodePath(value) {
-  return value.split("/").map(encodeURIComponent).join("/");
-}
-
 function blobRef(cid, mimeType, size) {
   return {
     $type: "blob",
@@ -1262,6 +1263,13 @@ function recordLexicon(id) {
         },
       },
     },
+  };
+}
+
+function publishedLexiconRecord(lexicon) {
+  return {
+    ...lexicon,
+    $type: "com.atproto.lexicon.schema",
   };
 }
 

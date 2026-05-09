@@ -1,7 +1,4 @@
 #!/usr/bin/env node
-import { webcrypto } from "node:crypto";
-
-const crypto = globalThis.crypto ?? webcrypto;
 
 const config = {
   baseUrl: requiredEnv("PDS_BASE_URL").replace(/\/+$/, ""),
@@ -13,10 +10,6 @@ const config = {
     "PDS_SEED_ACCOUNT_PASSWORD",
     optionalEnv("PDS_ACCOUNT_PASSWORD", "dev-account-password"),
   ),
-  signingKeyHex: optionalEnv("PDS_SIGNING_KEY_P256_HEX"),
-  reset: optionalEnv("PDS_RESET", "true") !== "false",
-  initRev: optionalEnv("PDS_INIT_REV", "2222222222222"),
-  recordRev: optionalEnv("PDS_RECORD_REV", "2222222222223"),
   recordPath: optionalEnv("PDS_RECORD_PATH", "app.gsv.record/seed"),
   recordJson: optionalEnv("PDS_RECORD_JSON"),
 };
@@ -25,7 +18,6 @@ const base = new URL(config.baseUrl);
 const host = config.handle ?? base.hostname;
 const did = config.did ?? `did:web:${host}`;
 const repo = config.repo ?? repoNameFromDidOrHandle(did, host);
-const signingKeyHex = config.signingKeyHex ?? (await generateP256PrivateKeyHex());
 const [collection, rkey] = parseRecordPath(config.recordPath);
 const record = config.recordJson
   ? JSON.parse(config.recordJson)
@@ -36,21 +28,22 @@ const record = config.recordJson
     };
 const baseOrigin = base.origin;
 
-assertP256Hex(signingKeyHex);
-
 await expectJson("health", "GET", "/xrpc/_health", null, (body) => {
   if (body.status !== "ok") {
     throw new Error(`expected health status ok, got ${JSON.stringify(body)}`);
   }
 });
 
-const init = await expectJson("init repo", "POST", `/repos/${encodePath(repo)}/init`, {
-  did,
-  handle: host,
-  rev: config.initRev,
-  signingKeyP256Hex: signingKeyHex,
-  reset: config.reset,
-});
+await expectJsonStatus(
+  "direct repo route is not public",
+  "GET",
+  `/repos/${encodeURIComponent(repo)}/status`,
+  null,
+  404,
+);
+
+const session = await ensureAccountSession();
+const writeAuthHeaders = { authorization: `Bearer ${session.accessJwt}` };
 
 const didDocument = await expectJson(
   "DID document",
@@ -79,18 +72,24 @@ const handleDid = await expectText("handle DID", "GET", "/.well-known/atproto-di
 await expectJson(
   "put Lexicon",
   "POST",
-  `/repos/${encodePath(repo)}/lexicons`,
-  recordLexicon(collection),
+  "/xrpc/com.atproto.repo.putRecord",
+  {
+    repo: did,
+    collection: "com.atproto.lexicon.schema",
+    rkey: collection,
+    validate: false,
+    record: publishedLexiconRecord(recordLexicon(collection)),
+  },
   (body) => {
     if (
-      body.id !== collection ||
-      body.stored !== true ||
-      body.published !== true ||
-      body.uri !== `at://${did}/com.atproto.lexicon.schema/${collection}`
+      body.uri !== `at://${did}/com.atproto.lexicon.schema/${collection}` ||
+      !body.cid ||
+      !body.commit?.cid
     ) {
       throw new Error(`unexpected put Lexicon response ${JSON.stringify(body)}`);
     }
   },
+  writeAuthHeaders,
 );
 
 await expectJson(
@@ -109,14 +108,29 @@ await expectJson(
   },
 );
 
-const mutation = await expectJson("seed record", "POST", `/repos/${encodePath(repo)}/records`, {
-  path: config.recordPath,
-  rev: config.recordRev,
-  record,
-});
-
-const session = await ensureAccountSession();
-const writeAuthHeaders = { authorization: `Bearer ${session.accessJwt}` };
+const seedRecord = await expectJson(
+  "seed record",
+  "POST",
+  "/xrpc/com.atproto.repo.putRecord",
+  {
+    repo: did,
+    collection,
+    rkey,
+    validate: true,
+    record,
+  },
+  (body) => {
+    if (
+      body.uri !== `at://${did}/${collection}/${rkey}` ||
+      !body.cid ||
+      !body.commit?.cid ||
+      body.validationStatus !== "valid"
+    ) {
+      throw new Error(`unexpected seed record response ${JSON.stringify(body)}`);
+    }
+  },
+  writeAuthHeaders,
+);
 
 const xrpcRkey = "xrpc-seed";
 const xrpcCreate = await expectJson(
@@ -214,6 +228,7 @@ if (!blobCid) {
 }
 
 const applySinceRev = latestRev;
+const applySeedRkey = `apply-seed-${Date.now().toString(36)}`;
 await expectJsonStatus(
   "stale swapCommit",
   "POST",
@@ -262,7 +277,7 @@ const applyWrites = await expectJson(
       {
         $type: "com.atproto.repo.applyWrites#create",
         collection,
-        rkey: "apply-seed",
+        rkey: applySeedRkey,
         value: {
           $type: collection,
           text: "created through applyWrites",
@@ -306,12 +321,6 @@ const applyWrites = await expectJson(
 );
 latestCommit = applyWrites.commit.cid;
 latestRev = applyWrites.commit.rev;
-
-await expectJson("directory sync", "POST", `/repos/${encodePath(repo)}/directory-sync`, null, (body) => {
-  if (body.ok !== true || body.latestCommit !== latestCommit || body.latestRev !== latestRev) {
-    throw new Error(`unexpected directory-sync response ${JSON.stringify(body)}`);
-  }
-});
 
 const listRepos = await expectJson(
   "list repos",
@@ -448,7 +457,7 @@ await expectJson(
 const missingBlob = await expectJsonStatus(
   "missing blob",
   "GET",
-  `/xrpc/com.atproto.sync.getBlob?did=${encodeQuery(did)}&cid=${encodeQuery(mutation.latestCommit)}`,
+  `/xrpc/com.atproto.sync.getBlob?did=${encodeQuery(did)}&cid=${encodeQuery(seedRecord.commit.cid)}`,
   null,
   404,
 );
@@ -491,7 +500,7 @@ if (
 
 const blocksCar = await request(
   "GET",
-  `/xrpc/com.atproto.sync.getBlocks?did=${encodeQuery(did)}&cids=${encodeQuery(latestCommit)}&cids=${encodeQuery(mutation.latestCommit)}`,
+  `/xrpc/com.atproto.sync.getBlocks?did=${encodeQuery(did)}&cids=${encodeQuery(latestCommit)}&cids=${encodeQuery(seedRecord.commit.cid)}`,
 );
 const blocksContentType = blocksCar.headers.get("content-type") ?? "";
 const blocksCarBytes = await blocksCar.arrayBuffer();
@@ -528,16 +537,13 @@ if (!repoDiffCar.ok || !diffContentType.includes("application/vnd.ipld.car") || 
 const importSourceCommit = latestCommit;
 const importSourceRev = latestRev;
 const importSourceBytes = new Uint8Array(carBytes);
-const importSourceStatus = await expectJson(
+const importSourceStatus = await checkAccountStatus(
   "status before import probe",
-  "GET",
-  `/repos/${encodePath(repo)}/status`,
-  null,
   (body) => {
-    if (body.latestCommit !== importSourceCommit || body.latestRev !== importSourceRev) {
+    if (body.repoCommit !== importSourceCommit || body.repoRev !== importSourceRev) {
       throw new Error(`unexpected status before import probe ${JSON.stringify(body)}`);
     }
-    if (typeof body.blobs !== "number" || typeof body.blobBytes !== "number") {
+    if (typeof body.importedBlobs !== "number" || typeof body.expectedBlobs !== "number") {
       throw new Error(`repo status did not include blob counters ${JSON.stringify(body)}`);
     }
   },
@@ -586,21 +592,16 @@ const importProbe = await expectJson(
 latestCommit = importProbe.commit.cid;
 latestRev = importProbe.commit.rev;
 
-if (config.reset) {
-  await expectJson(
-    "status with import probe blob",
-    "GET",
-    `/repos/${encodePath(repo)}/status`,
-    null,
-    (body) => {
-      if (body.blobs !== importSourceStatus.blobs + 1) {
-        throw new Error(
-          `import probe blob was not tracked as a new blob: before=${JSON.stringify(importSourceStatus)} after=${JSON.stringify(body)}`,
-        );
-      }
-    },
-  );
-}
+await checkAccountStatus("status with import probe blob", (body) => {
+  if (
+    body.importedBlobs !== importSourceStatus.importedBlobs + 1 ||
+    body.expectedBlobs !== importSourceStatus.expectedBlobs + 1
+  ) {
+    throw new Error(
+      `import probe blob was not tracked as a new blob: before=${JSON.stringify(importSourceStatus)} after=${JSON.stringify(body)}`,
+    );
+  }
+});
 
 await expectJson(
   "import probe exists",
@@ -653,21 +654,16 @@ await expectJsonStatus(
   404,
 );
 
-if (config.reset) {
-  await expectJson(
-    "status after import blob GC",
-    "GET",
-    `/repos/${encodePath(repo)}/status`,
-    null,
-    (body) => {
-      if (body.blobs !== importSourceStatus.blobs || body.blobBytes !== importSourceStatus.blobBytes) {
-        throw new Error(
-          `importRepo did not GC the probe blob: before=${JSON.stringify(importSourceStatus)} after=${JSON.stringify(body)}`,
-        );
-      }
-    },
-  );
-}
+await checkAccountStatus("status after import blob GC", (body) => {
+  if (
+    body.importedBlobs !== importSourceStatus.importedBlobs ||
+    body.expectedBlobs !== importSourceStatus.expectedBlobs
+  ) {
+    throw new Error(
+      `importRepo did not GC the probe blob: before=${JSON.stringify(importSourceStatus)} after=${JSON.stringify(body)}`,
+    );
+  }
+});
 
 const listReposAfterImport = await expectJson(
   "list repos after import",
@@ -710,8 +706,7 @@ console.log(
       handle: host,
       handleDid: handleDid.trim(),
       didDocumentServiceEndpoint: atprotoServiceEndpoint(didDocument),
-      publicKeyMultibase: init.publicKeyMultibase,
-      seedRecordCommit: mutation.latestCommit,
+      seedRecordCommit: seedRecord.commit.cid,
       latestCommit,
       latestRev,
       xrpcCreateCommit: xrpcCreate.commit.cid,
@@ -744,8 +739,6 @@ console.log(
       listedReposByCollectionAfterImport: reposByCollectionAfterImport.repos.length,
       pdslsRepoUrl,
       pdslsRecordUrl,
-      generatedSigningKey: config.signingKeyHex ? false : true,
-      signingKeyP256Hex: signingKeyHex,
       handleIsCorrect: describe.handleIsCorrect,
     },
     null,
@@ -800,32 +793,35 @@ async function ensureAccountSession() {
 }
 
 async function maybeCreateAccount() {
+  const requestBody = {
+    handle: host,
+    password: config.accountPassword,
+  };
+  if (!did.startsWith("did:web:")) {
+    requestBody.did = did;
+  }
   const response = await request(
     "POST",
     "/xrpc/com.atproto.server.createAccount",
-    {
-      handle: host,
-      did,
-      password: config.accountPassword,
-    },
+    requestBody,
     { authorization: `Bearer ${config.adminToken}` },
   );
   const text = await response.text();
-  let body = {};
+  let parsed = {};
   try {
-    body = text ? JSON.parse(text) : {};
+    parsed = text ? JSON.parse(text) : {};
   } catch (error) {
     throw new Error(`createAccount returned non-JSON status=${response.status}: ${text}`, {
       cause: error,
     });
   }
   if (response.ok) {
-    if (body.did !== did || body.handle !== host || !body.accessJwt) {
-      throw new Error(`unexpected createAccount response ${JSON.stringify(body)}`);
+    if (parsed.did !== did || parsed.handle !== host || !parsed.accessJwt) {
+      throw new Error(`unexpected createAccount response ${JSON.stringify(parsed)}`);
     }
     return true;
   }
-  const error = String(body.error ?? "");
+  const error = String(parsed.error ?? "");
   if (
     response.status === 400 &&
     (error.includes("HandleNotAvailable") || error.includes("DidNotAvailable"))
@@ -835,7 +831,23 @@ async function maybeCreateAccount() {
   if (response.status === 409 && error.includes("repo already initialized")) {
     return false;
   }
-  throw new Error(`createAccount failed status=${response.status}: ${JSON.stringify(body)}`);
+  throw new Error(`createAccount failed status=${response.status}: ${JSON.stringify(parsed)}`);
+}
+
+async function checkAccountStatus(label, validate = undefined) {
+  return expectJson(
+    label,
+    "GET",
+    "/xrpc/com.atproto.server.checkAccountStatus",
+    null,
+    (body) => {
+      if (body.activated !== true || body.validDid !== true) {
+        throw new Error(`unexpected account status ${JSON.stringify(body)}`);
+      }
+      validate?.(body);
+    },
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
 }
 
 async function expectText(label, method, path, body, validate = undefined) {
@@ -1015,6 +1027,13 @@ function recordLexicon(id) {
   };
 }
 
+function publishedLexiconRecord(lexicon) {
+  return {
+    ...lexicon,
+    $type: "com.atproto.lexicon.schema",
+  };
+}
+
 function blobRef(cid, mimeType, size) {
   return {
     $type: "blob",
@@ -1032,39 +1051,6 @@ function parseRecordPath(path) {
   return parts;
 }
 
-function encodePath(value) {
-  return encodeURIComponent(value);
-}
-
 function encodeQuery(value) {
   return encodeURIComponent(value);
-}
-
-function assertP256Hex(value) {
-  if (!/^[0-9a-fA-F]{64}$/.test(value)) {
-    throw new Error("PDS_SIGNING_KEY_P256_HEX must be 64 hex characters");
-  }
-}
-
-async function generateP256PrivateKeyHex() {
-  const keyPair = await crypto.subtle.generateKey(
-    { name: "ECDSA", namedCurve: "P-256" },
-    true,
-    ["sign", "verify"],
-  );
-  const jwk = await crypto.subtle.exportKey("jwk", keyPair.privateKey);
-  if (!jwk.d) {
-    throw new Error("generated P-256 key did not include private scalar");
-  }
-  return bytesToHex(base64UrlDecode(jwk.d));
-}
-
-function base64UrlDecode(value) {
-  const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
-  const padded = normalized.padEnd(normalized.length + ((4 - (normalized.length % 4)) % 4), "=");
-  return Uint8Array.from(Buffer.from(padded, "base64"));
-}
-
-function bytesToHex(bytes) {
-  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
