@@ -223,6 +223,20 @@ pub const CREATE_DIRECTORY_INVITE_CODE_USES_USED_BY_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_directory_invite_code_uses_used_by
      ON directory_invite_code_uses(used_by, used_at)";
 
+pub const CREATE_DIRECTORY_RESERVED_SIGNING_KEYS: &str =
+    "CREATE TABLE IF NOT EXISTS directory_reserved_signing_keys (
+    signing_key           TEXT PRIMARY KEY,
+    public_key_multibase  TEXT NOT NULL UNIQUE,
+    signing_key_p256_hex  TEXT NOT NULL,
+    did                   TEXT,
+    consumed_at           INTEGER,
+    created_at            INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_DIRECTORY_RESERVED_SIGNING_KEYS_DID_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_reserved_signing_keys_did
+     ON directory_reserved_signing_keys(did, created_at)";
+
 pub const CREATE_DIRECTORY_ACTION_TOKENS: &str =
     "CREATE TABLE IF NOT EXISTS directory_action_tokens (
     token_digest TEXT PRIMARY KEY,
@@ -342,6 +356,8 @@ pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_INVITE_CODE_USES,
     CREATE_DIRECTORY_INVITE_CODE_USES_CODE_INDEX,
     CREATE_DIRECTORY_INVITE_CODE_USES_USED_BY_INDEX,
+    CREATE_DIRECTORY_RESERVED_SIGNING_KEYS,
+    CREATE_DIRECTORY_RESERVED_SIGNING_KEYS_DID_INDEX,
     CREATE_DIRECTORY_ACTION_TOKENS,
     CREATE_DIRECTORY_ACTION_TOKENS_DID_INDEX,
     CREATE_DIRECTORY_ACTION_TOKENS_EXPIRES_INDEX,
@@ -448,6 +464,8 @@ mod tests {
         assert!(joined.contains("available   INTEGER NOT NULL"));
         assert!(joined.contains("directory_invite_code_uses"));
         assert!(joined.contains("PRIMARY KEY (code, used_by)"));
+        assert!(joined.contains("directory_reserved_signing_keys"));
+        assert!(joined.contains("signing_key_p256_hex  TEXT NOT NULL"));
         assert!(joined.contains("directory_action_tokens"));
         assert!(joined.contains("token_digest TEXT PRIMARY KEY"));
         assert!(joined.contains("idx_directory_action_tokens_did_purpose"));

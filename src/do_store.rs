@@ -135,6 +135,24 @@ pub struct DirectoryInviteCodeUseRow {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryReservedSigningKeyInput {
+    pub signing_key: String,
+    pub public_key_multibase: String,
+    pub signing_key_p256_hex: String,
+    pub did: Option<Did>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryReservedSigningKeyRow {
+    pub signing_key: String,
+    pub public_key_multibase: String,
+    pub signing_key_p256_hex: String,
+    pub did: Option<Did>,
+    pub consumed_at: Option<i64>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectoryActionTokenInput {
     pub token_digest: String,
     pub did: Did,
@@ -388,6 +406,23 @@ impl SqlRepoStore {
                 SqlStorageValue::from(row.handle.clone()),
                 SqlStorageValue::from(row.signing_key_p256_hex.clone()),
                 SqlStorageValue::from(row.public_key_multibase.clone()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_repo_signing_key(
+        &self,
+        signing_key_p256_hex: &str,
+        public_key_multibase: &str,
+    ) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE repo_identity
+             SET signing_key_p256_hex = ?, public_key_multibase = ?
+             WHERE id = 1",
+            vec![
+                SqlStorageValue::from(signing_key_p256_hex.to_string()),
+                SqlStorageValue::from(public_key_multibase.to_string()),
             ],
         )?;
         Ok(())
@@ -1281,6 +1316,60 @@ impl SqlDirectoryStore {
         Ok(uses_by_code)
     }
 
+    pub fn insert_reserved_signing_key(
+        &self,
+        row: &DirectoryReservedSigningKeyInput,
+    ) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO directory_reserved_signing_keys (
+                signing_key, public_key_multibase, signing_key_p256_hex, did
+             )
+             VALUES (?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(row.signing_key.clone()),
+                SqlStorageValue::from(row.public_key_multibase.clone()),
+                SqlStorageValue::from(row.signing_key_p256_hex.clone()),
+                optional_text(row.did.as_ref().map(|did| did.to_string())),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_reserved_signing_key(
+        &self,
+        signing_key: &str,
+    ) -> worker::Result<Option<DirectoryReservedSigningKeyRow>> {
+        let rows: Vec<DirectoryReservedSigningKeyStorageRow> = self
+            .sql
+            .exec(
+                "SELECT signing_key, public_key_multibase, signing_key_p256_hex, did,
+                        consumed_at,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_reserved_signing_keys
+                 WHERE signing_key = ?
+                 LIMIT 1",
+                vec![SqlStorageValue::from(signing_key.to_string())],
+            )?
+            .to_array()?;
+        rows.into_iter()
+            .next()
+            .map(directory_reserved_signing_key_from_row)
+            .transpose()
+    }
+
+    pub fn consume_reserved_signing_key(&self, signing_key: &str, did: &Did) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_reserved_signing_keys
+             SET consumed_at = unixepoch(), did = COALESCE(did, ?)
+             WHERE signing_key = ? AND consumed_at IS NULL",
+            vec![
+                SqlStorageValue::from(did.to_string()),
+                SqlStorageValue::from(signing_key.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn disable_invite_codes(&self, codes: &[String], accounts: &[Did]) -> worker::Result<()> {
         for code in codes {
             self.sql.exec(
@@ -1431,6 +1520,23 @@ impl SqlDirectoryStore {
              WHERE did = ?",
             vec![
                 SqlStorageValue::from(handle.to_string()),
+                SqlStorageValue::from(did.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_account_public_key(
+        &self,
+        did: &Did,
+        public_key_multibase: &str,
+    ) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_accounts
+             SET public_key_multibase = ?, updated_at = unixepoch()
+             WHERE did = ?",
+            vec![
+                SqlStorageValue::from(public_key_multibase.to_string()),
                 SqlStorageValue::from(did.to_string()),
             ],
         )?;
@@ -2412,6 +2518,22 @@ fn directory_action_token_from_row(
     })
 }
 
+fn directory_reserved_signing_key_from_row(
+    row: DirectoryReservedSigningKeyStorageRow,
+) -> worker::Result<DirectoryReservedSigningKeyRow> {
+    Ok(DirectoryReservedSigningKeyRow {
+        signing_key: row.signing_key,
+        public_key_multibase: row.public_key_multibase,
+        signing_key_p256_hex: row.signing_key_p256_hex,
+        did: row
+            .did
+            .map(|did| Did::new(did).map_err(worker_error))
+            .transpose()?,
+        consumed_at: row.consumed_at,
+        created_at: row.created_at,
+    })
+}
+
 trait IntoDirectoryRepoRow {
     fn into_directory_repo_row(self) -> worker::Result<DirectoryRepoRow>;
 }
@@ -2463,6 +2585,16 @@ struct DirectoryActionTokenStorageRow {
     email: Option<String>,
     expires_at: i64,
     consumed_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct DirectoryReservedSigningKeyStorageRow {
+    signing_key: String,
+    public_key_multibase: String,
+    signing_key_p256_hex: String,
+    did: Option<String>,
+    consumed_at: Option<i64>,
+    created_at: String,
 }
 
 #[derive(Deserialize)]

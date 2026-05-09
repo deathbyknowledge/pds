@@ -36,8 +36,9 @@ use crate::do_store::{
     DirectoryAccountRow, DirectoryActionTokenInput, DirectoryActionTokenRow,
     DirectoryCommitEventInput, DirectoryEventRow, DirectoryInviteCodeInput, DirectoryInviteCodeRow,
     DirectoryInviteCodeUseRow, DirectoryOauthAuthorizationCodeInput, DirectoryOauthParRequestInput,
-    DirectoryOauthParRequestRow, DirectoryRepoRow, DirectorySessionRow, RepoBlobRow,
-    RepoCommitEventInput, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
+    DirectoryOauthParRequestRow, DirectoryRepoRow, DirectoryReservedSigningKeyInput,
+    DirectoryReservedSigningKeyRow, DirectorySessionRow, RepoBlobRow, RepoCommitEventInput,
+    RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
 };
 use crate::dpop::{dpop_htu, verify_dpop_proof, DpopError, VerifiedDpopProof};
 use crate::identity::{IdentityError, RepoSigningKey};
@@ -500,7 +501,9 @@ impl PdsDirectoryObject {
                 (Method::Get, SERVER_GET_SERVICE_AUTH) => {
                     self.xrpc_get_service_auth(req, &url).await
                 }
-                (Method::Post, SERVER_RESERVE_SIGNING_KEY) => self.xrpc_reserve_signing_key(),
+                (Method::Post, SERVER_RESERVE_SIGNING_KEY) => {
+                    self.xrpc_reserve_signing_key(req).await
+                }
                 (Method::Post, SERVER_CREATE_INVITE_CODE) => {
                     self.xrpc_create_invite_code(req).await
                 }
@@ -557,7 +560,7 @@ impl PdsDirectoryObject {
                     self.xrpc_admin_update_account_password(req).await
                 }
                 (Method::Post, ADMIN_UPDATE_ACCOUNT_SIGNING_KEY) => {
-                    self.xrpc_admin_update_account_signing_key()
+                    self.xrpc_admin_update_account_signing_key(req, &url).await
                 }
                 (Method::Post, ADMIN_UPDATE_SUBJECT_STATUS) => {
                     self.xrpc_admin_update_subject_status(req).await
@@ -1191,13 +1194,29 @@ impl PdsDirectoryObject {
         json_response(200, &json!({ "token": token })).map_err(HttpError::worker)
     }
 
-    fn xrpc_reserve_signing_key(&self) -> Result<Response, HttpError> {
+    async fn xrpc_reserve_signing_key(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let body: XrpcReserveSigningKeyRequest = optional_json_body(req).await?;
+        let did = body
+            .did
+            .map(Did::new)
+            .transpose()
+            .map_err(HttpError::bad_request)?;
         let key_hex = generate_repo_signing_key_hex()?;
         let key = RepoSigningKey::from_p256_hex(&key_hex).map_err(HttpError::identity)?;
+        let public_key_multibase = key.public_key_multibase().map_err(HttpError::identity)?;
+        let signing_key = did_key_from_public_key_multibase(&public_key_multibase)?;
+        self.store()
+            .insert_reserved_signing_key(&DirectoryReservedSigningKeyInput {
+                signing_key: signing_key.clone(),
+                public_key_multibase,
+                signing_key_p256_hex: key.to_p256_hex(),
+                did,
+            })
+            .map_err(HttpError::worker)?;
         json_response(
             200,
             &json!({
-                "signingKey": key.public_key_multibase().map_err(HttpError::identity)?,
+                "signingKey": signing_key,
             }),
         )
         .map_err(HttpError::worker)
@@ -1514,11 +1533,27 @@ impl PdsDirectoryObject {
         empty_response(200).map_err(HttpError::worker)
     }
 
-    fn xrpc_admin_update_account_signing_key(&self) -> Result<Response, HttpError> {
-        Err(HttpError::new(
-            501,
-            "NotImplemented: signing key rotation requires private-key migration support",
-        ))
+    async fn xrpc_admin_update_account_signing_key(
+        &self,
+        req: &mut Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcAdminUpdateAccountSigningKeyRequest =
+            req.json().await.map_err(HttpError::worker)?;
+        let did = Did::new(body.did).map_err(HttpError::bad_request)?;
+        let account = self.account_by_did(&did)?;
+        let reserved = self.take_reserved_signing_key(&did, &body.signing_key)?;
+        self.update_account_repo_signing_key(
+            url,
+            &account.repo_name,
+            &reserved.signing_key_p256_hex,
+        )
+        .await?;
+        self.store()
+            .update_account_public_key(&did, &reserved.public_key_multibase)
+            .map_err(HttpError::worker)?;
+        empty_response(200).map_err(HttpError::worker)
     }
 
     async fn xrpc_admin_update_subject_status(
@@ -2537,6 +2572,52 @@ impl PdsDirectoryObject {
         Ok(())
     }
 
+    async fn update_account_repo_signing_key(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+        signing_key_p256_hex: &str,
+    ) -> Result<(), HttpError> {
+        let namespace = self
+            .env
+            .durable_object("REPO_OBJECTS")
+            .map_err(HttpError::worker)?;
+        let id = namespace
+            .id_from_name(repo_name)
+            .map_err(HttpError::worker)?;
+        let stub = id.get_stub().map_err(HttpError::worker)?;
+        let headers = Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(HttpError::worker)?;
+        headers
+            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
+            .map_err(HttpError::worker)?;
+        let body = to_string(&json!({ "signingKeyP256Hex": signing_key_p256_hex }))
+            .map_err(HttpError::worker)?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Put)
+            .with_headers(headers)
+            .with_body(Some(JsValue::from_str(&body)));
+        let request = Request::new_with_init(
+            &format!("{}/repos/{}/signing-key", request_origin(url), repo_name),
+            &init,
+        )
+        .map_err(HttpError::worker)?;
+        let mut response = stub
+            .fetch_with_request(request)
+            .await
+            .map_err(HttpError::worker)?;
+        if !(200..=299).contains(&response.status_code()) {
+            let text = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(HttpError::new(
+                response.status_code(),
+                format!("failed to update repo signing key: {text}"),
+            ));
+        }
+        Ok(())
+    }
+
     async fn account_repo_status(
         &self,
         url: &worker::Url,
@@ -2755,6 +2836,37 @@ impl PdsDirectoryObject {
             .delete_action_tokens_for_did(&account.did)
             .map_err(HttpError::worker)?;
         self.set_account_active(&account.did, false, Some("deleted"))
+    }
+
+    fn take_reserved_signing_key(
+        &self,
+        did: &Did,
+        signing_key: &str,
+    ) -> Result<DirectoryReservedSigningKeyRow, HttpError> {
+        let signing_key = normalize_did_key(signing_key)?;
+        let reserved = self
+            .store()
+            .get_reserved_signing_key(&signing_key)
+            .map_err(HttpError::worker)?
+            .ok_or_else(|| HttpError::new(400, "InvalidSigningKey"))?;
+        if reserved.consumed_at.is_some() {
+            return Err(HttpError::new(400, "InvalidSigningKey"));
+        }
+        if reserved
+            .did
+            .as_ref()
+            .is_some_and(|reserved_did| reserved_did != did)
+        {
+            return Err(HttpError::new(400, "InvalidSigningKey"));
+        }
+        let public_key_multibase = public_key_multibase_from_did_key(&signing_key)?;
+        if public_key_multibase != reserved.public_key_multibase {
+            return Err(HttpError::new(400, "InvalidSigningKey"));
+        }
+        self.store()
+            .consume_reserved_signing_key(&signing_key, did)
+            .map_err(HttpError::worker)?;
+        Ok(reserved)
     }
 
     fn create_session_for_account(
@@ -3181,6 +3293,7 @@ impl RepoObject {
             (Method::Get, "status") => self.status(),
             (Method::Post, "init") => self.init(req, &repo_name).await,
             (Method::Put, "identity") => self.update_identity(req).await,
+            (Method::Put, "signing-key") => self.update_signing_key(req).await,
             (Method::Post, "directory-sync") => self.sync_directory(req, &repo_name).await,
             (Method::Post, "service-auth") => self.service_auth(req).await,
             (Method::Post, "lexicons") => self.put_lexicon(req, &repo_name).await,
@@ -3930,6 +4043,29 @@ impl RepoObject {
             &json!({
                 "handle": identity.handle,
                 "publicKeyMultibase": identity.public_key_multibase,
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    async fn update_signing_key(&self, req: &mut Request) -> Result<Response, HttpError> {
+        self.require_admin(req)?;
+        let body: UpdateRepoSigningKeyRequest = req.json().await.map_err(HttpError::worker)?;
+        let signing_key = RepoSigningKey::from_p256_hex(&body.signing_key_p256_hex)
+            .map_err(HttpError::identity)?;
+        let public_key_multibase = signing_key
+            .public_key_multibase()
+            .map_err(HttpError::identity)?;
+        let store = self.store();
+        self.repo_identity_from(&store)?;
+        store
+            .update_repo_signing_key(&signing_key.to_p256_hex(), &public_key_multibase)
+            .map_err(HttpError::worker)?;
+        json_response(
+            200,
+            &json!({
+                "signingKey": did_key_from_public_key_multibase(&public_key_multibase)?,
+                "publicKeyMultibase": public_key_multibase,
             }),
         )
         .map_err(HttpError::worker)
@@ -5349,6 +5485,12 @@ struct UpdateRepoIdentityRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct UpdateRepoSigningKeyRequest {
+    #[serde(rename = "signingKeyP256Hex", alias = "signing_key_p256_hex")]
+    signing_key_p256_hex: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct XrpcCreateAccountRequest {
     handle: String,
     #[serde(default)]
@@ -5416,6 +5558,12 @@ struct XrpcUpdateHandleRequest {
 #[derive(Debug, Deserialize)]
 struct XrpcRefreshIdentityRequest {
     identifier: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct XrpcReserveSigningKeyRequest {
+    #[serde(default)]
+    did: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5497,6 +5645,13 @@ struct XrpcAdminUpdateAccountHandleRequest {
 struct XrpcAdminUpdateAccountPasswordRequest {
     did: String,
     password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminUpdateAccountSigningKeyRequest {
+    did: String,
+    #[serde(rename = "signingKey", alias = "signing_key")]
+    signing_key: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -7055,6 +7210,54 @@ fn did_from_admin_subject(subject: &Value) -> Result<Did, HttpError> {
         ));
     };
     Did::new(did.to_string()).map_err(HttpError::bad_request)
+}
+
+async fn optional_json_body<T>(req: &mut Request) -> Result<T, HttpError>
+where
+    T: for<'de> Deserialize<'de> + Default,
+{
+    let body = req.text().await.map_err(HttpError::worker)?;
+    if body.trim().is_empty() {
+        return Ok(T::default());
+    }
+    from_str(&body).map_err(HttpError::bad_request)
+}
+
+fn did_key_from_public_key_multibase(public_key_multibase: &str) -> Result<String, HttpError> {
+    validate_public_key_multibase(public_key_multibase)?;
+    Ok(format!("did:key:{public_key_multibase}"))
+}
+
+fn normalize_did_key(signing_key: &str) -> Result<String, HttpError> {
+    let signing_key = signing_key.trim();
+    if let Some(public_key_multibase) = signing_key.strip_prefix("did:key:") {
+        validate_public_key_multibase(public_key_multibase)?;
+        return Ok(format!("did:key:{public_key_multibase}"));
+    }
+    validate_public_key_multibase(signing_key)?;
+    Ok(format!("did:key:{signing_key}"))
+}
+
+fn public_key_multibase_from_did_key(signing_key: &str) -> Result<String, HttpError> {
+    let signing_key = normalize_did_key(signing_key)?;
+    signing_key
+        .strip_prefix("did:key:")
+        .map(ToString::to_string)
+        .ok_or_else(|| HttpError::new(400, "InvalidSigningKey"))
+}
+
+fn validate_public_key_multibase(public_key_multibase: &str) -> Result<(), HttpError> {
+    if !public_key_multibase.starts_with('z') {
+        return Err(HttpError::new(400, "InvalidSigningKey"));
+    }
+    let decoded = bs58::decode(public_key_multibase.trim_start_matches('z'))
+        .into_vec()
+        .map_err(|_| HttpError::new(400, "InvalidSigningKey"))?;
+    if decoded.len() == 35 && decoded.starts_with(&[0x80, 0x24]) {
+        Ok(())
+    } else {
+        Err(HttpError::new(400, "InvalidSigningKey"))
+    }
 }
 
 fn service_auth_jwt(

@@ -78,13 +78,39 @@ const reservedKey = await expectJson(
   "reserve signing key",
   "POST",
   "/xrpc/com.atproto.server.reserveSigningKey",
-  {},
+  { did },
   (body) => {
-    if (typeof body.signingKey !== "string" || !body.signingKey.startsWith("z")) {
+    if (typeof body.signingKey !== "string" || !body.signingKey.startsWith("did:key:z")) {
       throw new Error(`unexpected reserveSigningKey response ${JSON.stringify(body)}`);
     }
   },
   { authorization: `Bearer ${config.adminToken}` },
+);
+const reservedPublicKeyMultibase = reservedKey.signingKey.replace(/^did:key:/, "");
+
+await expectStatus(
+  "admin update account signing key",
+  "POST",
+  "/xrpc/com.atproto.admin.updateAccountSigningKey",
+  {
+    did,
+    signingKey: reservedKey.signingKey,
+  },
+  200,
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectJson(
+  "rotated signing key updates identity",
+  "GET",
+  `/xrpc/com.atproto.identity.resolveIdentity?identifier=${encodeQuery(handle)}`,
+  null,
+  (body) => {
+    const publicKey = body.didDoc?.verificationMethod?.[0]?.publicKeyMultibase;
+    if (body.did !== did || publicKey !== reservedPublicKeyMultibase) {
+      throw new Error(`unexpected rotated identity response ${JSON.stringify(body)}`);
+    }
+  },
 );
 
 const invite = await expectJson(
