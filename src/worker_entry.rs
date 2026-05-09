@@ -187,20 +187,9 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 let stub = id.get_stub()?;
                 stub.fetch_with_request(req).await
             }
-            Ok(XrpcRoute::HostRepoObject) => {
-                let Some(host) = url.host_str() else {
-                    return json_response(
-                        400,
-                        &json!({
-                            "error": "InvalidRequest",
-                            "message": "request host is required",
-                        }),
-                    );
-                };
-                let namespace = env.durable_object("REPO_OBJECTS")?;
-                let id = namespace.id_from_name(host)?;
-                let stub = id.get_stub()?;
-                stub.fetch_with_request(req).await
+            Ok(XrpcRoute::RepoObjectByJsonBodyRepo) => forward_xrpc_json_body_repo(req, &env).await,
+            Ok(XrpcRoute::RepoObjectByBearerSubject) => {
+                forward_xrpc_bearer_subject(req, &env).await
             }
             Ok(XrpcRoute::RepoObject { name }) => {
                 let namespace = env.durable_object("REPO_OBJECTS")?;
@@ -326,6 +315,93 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
             }
         }),
     )
+}
+
+async fn forward_xrpc_json_body_repo(req: Request, env: &Env) -> worker::Result<Response> {
+    match try_forward_xrpc_json_body_repo(req, env).await {
+        Ok(response) => Ok(response),
+        Err(error) => json_response(
+            error.status,
+            &xrpc_error_body(&error.message, Some(error.message.as_str())),
+        ),
+    }
+}
+
+async fn try_forward_xrpc_json_body_repo(
+    mut req: Request,
+    env: &Env,
+) -> Result<Response, HttpError> {
+    let url = req.url().map_err(HttpError::worker)?.to_string();
+    let method = req.method().clone();
+    let headers = req.headers().clone();
+    let body = req.text().await.map_err(HttpError::worker)?;
+    let repo = xrpc_body_repo(&body)?;
+    let request = request_with_text_body(&url, method, headers, &body)?;
+    forward_request_to_repo_name(env, &repo_object_name_from_identifier(&repo), request).await
+}
+
+async fn forward_xrpc_bearer_subject(req: Request, env: &Env) -> worker::Result<Response> {
+    match try_forward_xrpc_bearer_subject(req, env).await {
+        Ok(response) => Ok(response),
+        Err(error) => json_response(
+            error.status,
+            &xrpc_error_body(&error.message, Some(error.message.as_str())),
+        ),
+    }
+}
+
+async fn try_forward_xrpc_bearer_subject(req: Request, env: &Env) -> Result<Response, HttpError> {
+    let presented = authorization_token(&req)?;
+    let claims = verify_token(
+        &token_secret_from_env(env)?,
+        &presented.token,
+        ACCESS_SCOPE,
+        current_unix_time(),
+    )
+    .map_err(HttpError::auth)?;
+    let did = Did::new(claims.sub).map_err(HttpError::bad_request)?;
+    forward_request_to_repo_name(env, &repo_object_name_from_identifier(did.as_str()), req).await
+}
+
+async fn forward_request_to_repo_name(
+    env: &Env,
+    repo_name: &str,
+    req: Request,
+) -> Result<Response, HttpError> {
+    let namespace = env
+        .durable_object("REPO_OBJECTS")
+        .map_err(HttpError::worker)?;
+    let id = namespace
+        .id_from_name(repo_name)
+        .map_err(HttpError::worker)?;
+    let stub = id.get_stub().map_err(HttpError::worker)?;
+    stub.fetch_with_request(req)
+        .await
+        .map_err(HttpError::worker)
+}
+
+fn request_with_text_body(
+    url: &str,
+    method: Method,
+    headers: Headers,
+    body: &str,
+) -> Result<Request, HttpError> {
+    let mut init = RequestInit::new();
+    init.with_method(method)
+        .with_headers(headers)
+        .with_body(Some(JsValue::from_str(body)));
+    Request::new_with_init(url, &init).map_err(HttpError::worker)
+}
+
+fn xrpc_body_repo(body: &str) -> Result<String, HttpError> {
+    let value: Value = from_str(body).map_err(HttpError::bad_request)?;
+    value
+        .get("repo")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|repo| !repo.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| HttpError::new(400, "MissingRepo"))
 }
 
 #[durable_object]
@@ -3840,9 +3916,11 @@ impl RepoObject {
         url: &worker::Url,
     ) -> Result<Response, HttpError> {
         let params = query_pairs(url);
+        let repo = required_param(&params, "repo").map_err(HttpError::xrpc)?;
         let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 500, 1000)?;
         let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
         let state = self.repo_state()?;
+        ensure_repo_identifier(&state, &self.repo_identity()?, &repo)?;
         self.require_repo_write_auth(req, &state.did).await?;
         let (refs, next_cursor) = self
             .store()

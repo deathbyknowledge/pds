@@ -81,7 +81,8 @@ const MAX_GET_BLOCKS_CIDS: usize = 200;
 pub enum XrpcRoute {
     Worker,
     DirectoryObject,
-    HostRepoObject,
+    RepoObjectByJsonBodyRepo,
+    RepoObjectByBearerSubject,
     RepoObject { name: String },
     Unsupported,
 }
@@ -175,13 +176,16 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | SYNC_LIST_REPOS_BY_COLLECTION
         | SYNC_GET_HOST_STATUS
         | SYNC_SUBSCRIBE_REPOS => Ok(XrpcRoute::DirectoryObject),
-        REPO_CREATE_RECORD
-        | REPO_PUT_RECORD
-        | REPO_DELETE_RECORD
-        | REPO_APPLY_WRITES
-        | REPO_IMPORT_REPO
-        | REPO_UPLOAD_BLOB
-        | REPO_LIST_MISSING_BLOBS => Ok(XrpcRoute::HostRepoObject),
+        REPO_CREATE_RECORD | REPO_PUT_RECORD | REPO_DELETE_RECORD | REPO_APPLY_WRITES => {
+            Ok(XrpcRoute::RepoObjectByJsonBodyRepo)
+        }
+        REPO_IMPORT_REPO | REPO_UPLOAD_BLOB => Ok(XrpcRoute::RepoObjectByBearerSubject),
+        REPO_LIST_MISSING_BLOBS => {
+            let repo = required_param(query, "repo")?;
+            Ok(XrpcRoute::RepoObject {
+                name: repo_object_name_from_identifier(&repo),
+            })
+        }
         REPO_DESCRIBE_REPO | REPO_GET_RECORD | REPO_LIST_RECORDS => {
             let repo = required_param(query, "repo")?;
             Ok(XrpcRoute::RepoObject {
@@ -418,21 +422,43 @@ mod tests {
     }
 
     #[test]
-    fn routes_write_methods_to_host_repo_object() {
+    fn routes_json_write_methods_by_body_repo() {
         for method in [
             REPO_CREATE_RECORD,
             REPO_PUT_RECORD,
             REPO_DELETE_RECORD,
             REPO_APPLY_WRITES,
-            REPO_IMPORT_REPO,
-            REPO_UPLOAD_BLOB,
-            REPO_LIST_MISSING_BLOBS,
         ] {
             assert_eq!(
                 route_xrpc_method(method, &[]).unwrap(),
-                XrpcRoute::HostRepoObject
+                XrpcRoute::RepoObjectByJsonBodyRepo
             );
         }
+    }
+
+    #[test]
+    fn routes_auth_scoped_write_methods_by_bearer_subject() {
+        for method in [REPO_IMPORT_REPO, REPO_UPLOAD_BLOB] {
+            assert_eq!(
+                route_xrpc_method(method, &[]).unwrap(),
+                XrpcRoute::RepoObjectByBearerSubject
+            );
+        }
+    }
+
+    #[test]
+    fn routes_missing_blob_listing_by_repo_query() {
+        assert_eq!(
+            route_xrpc_method(
+                REPO_LIST_MISSING_BLOBS,
+                &query(&[("repo", "did:gsv:alice")])
+            )
+            .unwrap(),
+            XrpcRoute::RepoObject {
+                name: "alice".to_string()
+            }
+        );
+        assert!(route_xrpc_method(REPO_LIST_MISSING_BLOBS, &[]).is_err());
     }
 
     #[test]

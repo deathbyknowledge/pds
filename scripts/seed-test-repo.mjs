@@ -9,6 +9,10 @@ const config = {
   handle: optionalEnv("PDS_HANDLE"),
   did: optionalEnv("PDS_DID"),
   repo: optionalEnv("PDS_REPO"),
+  accountPassword: optionalEnv(
+    "PDS_SEED_ACCOUNT_PASSWORD",
+    optionalEnv("PDS_ACCOUNT_PASSWORD", "dev-account-password"),
+  ),
   signingKeyHex: optionalEnv("PDS_SIGNING_KEY_P256_HEX"),
   reset: optionalEnv("PDS_RESET", "true") !== "false",
   initRev: optionalEnv("PDS_INIT_REV", "2222222222222"),
@@ -111,6 +115,9 @@ const mutation = await expectJson("seed record", "POST", `/repos/${encodePath(re
   record,
 });
 
+const session = await ensureAccountSession();
+const writeAuthHeaders = { authorization: `Bearer ${session.accessJwt}` };
+
 const xrpcRkey = "xrpc-seed";
 const xrpcCreate = await expectJson(
   "XRPC createRecord",
@@ -137,6 +144,7 @@ const xrpcCreate = await expectJson(
       throw new Error(`unexpected createRecord response ${JSON.stringify(body)}`);
     }
   },
+  writeAuthHeaders,
 );
 
 const xrpcPut = await expectJson(
@@ -164,6 +172,7 @@ const xrpcPut = await expectJson(
       throw new Error(`unexpected putRecord response ${JSON.stringify(body)}`);
     }
   },
+  writeAuthHeaders,
 );
 
 const xrpcDelete = await expectJson(
@@ -180,6 +189,7 @@ const xrpcDelete = await expectJson(
       throw new Error(`unexpected deleteRecord response ${JSON.stringify(body)}`);
     }
   },
+  writeAuthHeaders,
 );
 
 let latestCommit = xrpcDelete.commit.cid;
@@ -196,7 +206,7 @@ const uploadBlob = await expectJson(
       throw new Error(`unexpected uploadBlob response ${JSON.stringify(body)}`);
     }
   },
-  { "content-type": "text/plain" },
+  { ...writeAuthHeaders, "content-type": "text/plain" },
 );
 const blobCid = uploadBlob.blob.ref?.$link;
 if (!blobCid) {
@@ -219,6 +229,7 @@ await expectJsonStatus(
     },
   },
   400,
+  writeAuthHeaders,
 );
 
 await expectJsonStatus(
@@ -236,6 +247,7 @@ await expectJsonStatus(
     },
   },
   400,
+  writeAuthHeaders,
 );
 
 const applyWrites = await expectJson(
@@ -290,6 +302,7 @@ const applyWrites = await expectJson(
       throw new Error(`applyWrites generated duplicate or invalid rkeys ${JSON.stringify(body)}`);
     }
   },
+  writeAuthHeaders,
 );
 latestCommit = applyWrites.commit.cid;
 latestRev = applyWrites.commit.rev;
@@ -395,13 +408,14 @@ const listBlobs = await expectJson(
 const missingBlobRefs = await expectJson(
   "list missing blobs",
   "GET",
-  "/xrpc/com.atproto.repo.listMissingBlobs",
+  `/xrpc/com.atproto.repo.listMissingBlobs?repo=${encodeQuery(did)}`,
   null,
   (body) => {
     if (!Array.isArray(body.blobs)) {
       throw new Error(`unexpected missing blob response ${JSON.stringify(body)}`);
     }
   },
+  writeAuthHeaders,
 );
 
 await expectBytes(
@@ -539,7 +553,7 @@ const importProbeBlob = await expectJson(
       throw new Error(`unexpected import probe uploadBlob response ${JSON.stringify(body)}`);
     }
   },
-  { "content-type": "text/plain" },
+  { ...writeAuthHeaders, "content-type": "text/plain" },
 );
 const importProbeBlobCid = importProbeBlob.blob.ref?.$link;
 if (!importProbeBlobCid) {
@@ -567,6 +581,7 @@ const importProbe = await expectJson(
       throw new Error(`unexpected import probe createRecord response ${JSON.stringify(body)}`);
     }
   },
+  writeAuthHeaders,
 );
 latestCommit = importProbe.commit.cid;
 latestRev = importProbe.commit.rev;
@@ -605,7 +620,7 @@ await expectStatus(
   "/xrpc/com.atproto.repo.importRepo",
   importSourceBytes,
   200,
-  { "content-type": "application/vnd.ipld.car" },
+  { ...writeAuthHeaders, "content-type": "application/vnd.ipld.car" },
 );
 
 const importedHead = await expectJson(
@@ -756,6 +771,73 @@ async function expectJson(label, method, path, body, validate = undefined, extra
   return parsed;
 }
 
+async function ensureAccountSession() {
+  const created = await maybeCreateAccount();
+  if (!created) {
+    await expectStatus(
+      "admin update seed account password",
+      "POST",
+      "/xrpc/com.atproto.admin.updateAccountPassword",
+      { did, password: config.accountPassword },
+      200,
+      { authorization: `Bearer ${config.adminToken}` },
+    );
+  }
+  return expectJson(
+    "seed create session",
+    "POST",
+    "/xrpc/com.atproto.server.createSession",
+    {
+      identifier: host,
+      password: config.accountPassword,
+    },
+    (body) => {
+      if (body.did !== did || body.handle !== host || !body.accessJwt || !body.refreshJwt) {
+        throw new Error(`unexpected seed createSession response ${JSON.stringify(body)}`);
+      }
+    },
+  );
+}
+
+async function maybeCreateAccount() {
+  const response = await request(
+    "POST",
+    "/xrpc/com.atproto.server.createAccount",
+    {
+      handle: host,
+      did,
+      password: config.accountPassword,
+    },
+    { authorization: `Bearer ${config.adminToken}` },
+  );
+  const text = await response.text();
+  let body = {};
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch (error) {
+    throw new Error(`createAccount returned non-JSON status=${response.status}: ${text}`, {
+      cause: error,
+    });
+  }
+  if (response.ok) {
+    if (body.did !== did || body.handle !== host || !body.accessJwt) {
+      throw new Error(`unexpected createAccount response ${JSON.stringify(body)}`);
+    }
+    return true;
+  }
+  const error = String(body.error ?? "");
+  if (
+    response.status === 400 &&
+    (error.includes("HandleNotAvailable") || error.includes("DidNotAvailable"))
+  ) {
+    return false;
+  }
+  if (response.status === 409 && error.includes("repo already initialized")) {
+    return false;
+  }
+  throw new Error(`createAccount failed status=${response.status}: ${JSON.stringify(body)}`);
+}
+
 async function expectText(label, method, path, body, validate = undefined) {
   const response = await request(method, path, body);
   const text = await response.text();
@@ -785,8 +867,8 @@ async function expectStatus(label, method, path, body, expectedStatus, extraHead
   return { status: response.status, body: text };
 }
 
-async function expectJsonStatus(label, method, path, body, expectedStatus) {
-  const response = await request(method, path, body);
+async function expectJsonStatus(label, method, path, body, expectedStatus, extraHeaders = {}) {
+  const response = await request(method, path, body, extraHeaders);
   const text = await response.text();
   let parsed;
   try {

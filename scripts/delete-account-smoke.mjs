@@ -113,6 +113,26 @@ await expectJson(
   },
 );
 
+await expectJson(
+  "repo write routes by body repo",
+  "POST",
+  "/xrpc/com.atproto.repo.createRecord",
+  {
+    repo: did,
+    collection: "app.gsv.deleteSmoke",
+    record: {
+      $type: "app.gsv.deleteSmoke",
+      text: `body-routed write smoke ${stamp}`,
+    },
+  },
+  (body) => {
+    if (typeof body.uri !== "string" || !body.uri.startsWith(`at://${did}/app.gsv.deleteSmoke/`)) {
+      throw new Error(`unexpected body-routed createRecord response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${created.accessJwt}` },
+);
+
 const invite = await expectJson(
   "create invite code",
   "POST",
