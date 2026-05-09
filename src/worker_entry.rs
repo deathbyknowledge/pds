@@ -35,7 +35,7 @@ use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
     DirectoryAccountRow, DirectoryActionTokenInput, DirectoryActionTokenRow,
     DirectoryCommitEventInput, DirectoryEventRow, DirectoryInviteCodeInput, DirectoryInviteCodeRow,
-    DirectoryOauthAuthorizationCodeInput, DirectoryOauthParRequestInput,
+    DirectoryInviteCodeUseRow, DirectoryOauthAuthorizationCodeInput, DirectoryOauthParRequestInput,
     DirectoryOauthParRequestRow, DirectoryRepoRow, DirectorySessionRow, RepoBlobRow,
     RepoCommitEventInput, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
 };
@@ -739,10 +739,14 @@ impl PdsDirectoryObject {
         req: &mut Request,
         url: &worker::Url,
     ) -> Result<Response, HttpError> {
-        require_admin_with_env(&self.env, req)?;
+        let admin_authorized = is_admin_authorized(&self.env, req)?;
         let mut body: XrpcCreateAccountRequest = req.json().await.map_err(HttpError::worker)?;
         body.handle = body.handle.to_ascii_lowercase();
         body.email = normalize_account_email(body.email);
+        body.invite_code = body
+            .invite_code
+            .map(|code| code.trim().to_string())
+            .filter(|code| !code.is_empty());
         let request_host = request_host(req)?;
         if body.plc_op.is_some() {
             return Err(HttpError::new(400, "PLC operations are not implemented"));
@@ -759,6 +763,12 @@ impl PdsDirectoryObject {
             .is_some()
         {
             return Err(HttpError::new(400, "HandleNotAvailable"));
+        }
+        if !admin_authorized && body.invite_code.is_none() {
+            return Err(HttpError::new(400, "InvalidInviteCode"));
+        }
+        if let Some(invite_code) = body.invite_code.as_deref() {
+            self.ensure_invite_code_usable(&store, invite_code)?;
         }
 
         let (did, repo_name, validate_did_document) = account_identity_for_creation(
@@ -830,6 +840,9 @@ impl PdsDirectoryObject {
             .append_account_event(&did, true, None)
             .map_err(HttpError::worker)?;
         self.broadcast_repo_event(&account_event)?;
+        if let Some(invite_code) = body.invite_code.as_deref() {
+            self.consume_invite_code(&store, invite_code, &did)?;
+        }
 
         let session = self.create_session_for_account(&account)?;
         store
@@ -1240,10 +1253,8 @@ impl PdsDirectoryObject {
         let codes = self
             .store()
             .list_invite_codes_for_account(&account.did, include_used)
-            .map_err(HttpError::worker)?
-            .iter()
-            .map(invite_code_json)
-            .collect::<Vec<_>>();
+            .map_err(HttpError::worker)?;
+        let codes = self.invite_code_values(&codes)?;
         json_response(200, &json!({ "codes": codes })).map_err(HttpError::worker)
     }
 
@@ -1317,7 +1328,8 @@ impl PdsDirectoryObject {
             .store()
             .list_invite_codes_for_account(&did, true)
             .map_err(HttpError::worker)?;
-        json_response(200, &account_view_json(&account, Some(&invites))).map_err(HttpError::worker)
+        let invites = self.invite_code_values(&invites)?;
+        json_response(200, &account_view_json(&account, Some(invites))).map_err(HttpError::worker)
     }
 
     fn xrpc_admin_get_account_infos(
@@ -1352,9 +1364,7 @@ impl PdsDirectoryObject {
             .store()
             .list_invite_codes(limit, cursor.as_deref())
             .map_err(HttpError::worker)?;
-        let mut body = json!({
-            "codes": codes.iter().map(invite_code_json).collect::<Vec<_>>(),
-        });
+        let mut body = json!({ "codes": self.invite_code_values(&codes)? });
         if let Some(cursor) = next_cursor {
             body["cursor"] = json!(cursor);
         }
@@ -2629,6 +2639,13 @@ impl PdsDirectoryObject {
         if !(1..=100).contains(&use_count) {
             return Err(HttpError::new(400, "InvalidUseCount"));
         }
+        let account = self.account_by_did(for_account)?;
+        if !account.active {
+            return Err(HttpError::new(403, "AccountTakedown"));
+        }
+        if account.invites_disabled {
+            return Err(HttpError::new(403, "InvitesDisabled"));
+        }
         let code = format!("gsv-{}", random_urlsafe_token::<INVITE_CODE_BYTES>()?);
         self.store()
             .insert_invite_code(&DirectoryInviteCodeInput {
@@ -2639,6 +2656,66 @@ impl PdsDirectoryObject {
             })
             .map_err(HttpError::worker)?;
         Ok(code)
+    }
+
+    fn ensure_invite_code_usable(
+        &self,
+        store: &SqlDirectoryStore,
+        code: &str,
+    ) -> Result<DirectoryInviteCodeRow, HttpError> {
+        let invite = store
+            .get_invite_code(code)
+            .map_err(HttpError::worker)?
+            .ok_or_else(|| HttpError::new(400, "InvalidInviteCode"))?;
+        if invite.disabled || invite.available <= 0 {
+            return Err(HttpError::new(400, "InvalidInviteCode"));
+        }
+        let Some(inviter) = store
+            .get_account_by_did(&invite.for_account)
+            .map_err(HttpError::worker)?
+        else {
+            return Err(HttpError::new(400, "InvalidInviteCode"));
+        };
+        if !inviter.active || inviter.invites_disabled {
+            return Err(HttpError::new(400, "InvalidInviteCode"));
+        }
+        Ok(invite)
+    }
+
+    fn consume_invite_code(
+        &self,
+        store: &SqlDirectoryStore,
+        code: &str,
+        used_by: &Did,
+    ) -> Result<(), HttpError> {
+        self.ensure_invite_code_usable(store, code)?;
+        store
+            .consume_invite_code(code, used_by)
+            .map_err(HttpError::worker)
+    }
+
+    fn invite_code_values(
+        &self,
+        codes: &[DirectoryInviteCodeRow],
+    ) -> Result<Vec<Value>, HttpError> {
+        let code_values = codes
+            .iter()
+            .map(|code| code.code.clone())
+            .collect::<Vec<_>>();
+        let uses_by_code = self
+            .store()
+            .list_invite_code_uses_for_codes(&code_values)
+            .map_err(HttpError::worker)?;
+        Ok(codes
+            .iter()
+            .map(|code| {
+                let uses = uses_by_code
+                    .get(&code.code)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                invite_code_json(code, uses)
+            })
+            .collect())
     }
 
     fn host_account_did(&self, req: &Request) -> Result<Did, HttpError> {
@@ -5280,6 +5357,8 @@ struct XrpcCreateAccountRequest {
     password: Option<String>,
     #[serde(default)]
     did: Option<String>,
+    #[serde(default, rename = "inviteCode", alias = "invite_code")]
+    invite_code: Option<String>,
     #[serde(default, rename = "plcOp")]
     plc_op: Option<Value>,
 }
@@ -7583,7 +7662,7 @@ fn directory_repo_json(row: DirectoryRepoRow) -> Value {
     })
 }
 
-fn invite_code_json(row: &DirectoryInviteCodeRow) -> Value {
+fn invite_code_json(row: &DirectoryInviteCodeRow, uses: &[DirectoryInviteCodeUseRow]) -> Value {
     json!({
         "code": row.code.clone(),
         "available": row.available,
@@ -7591,14 +7670,18 @@ fn invite_code_json(row: &DirectoryInviteCodeRow) -> Value {
         "forAccount": row.for_account.to_string(),
         "createdBy": row.created_by.to_string(),
         "createdAt": row.created_at.clone(),
-        "uses": [],
+        "uses": uses.iter().map(invite_code_use_json).collect::<Vec<_>>(),
     })
 }
 
-fn account_view_json(
-    account: &DirectoryAccountRow,
-    invites: Option<&[DirectoryInviteCodeRow]>,
-) -> Value {
+fn invite_code_use_json(row: &DirectoryInviteCodeUseRow) -> Value {
+    json!({
+        "usedBy": row.used_by.to_string(),
+        "usedAt": row.used_at.clone(),
+    })
+}
+
+fn account_view_json(account: &DirectoryAccountRow, invites: Option<Vec<Value>>) -> Value {
     let mut body = json!({
         "did": account.did.to_string(),
         "handle": account.handle.clone(),
@@ -7617,7 +7700,7 @@ fn account_view_json(
         body["deactivatedAt"] = json!(account.created_at.clone());
     }
     if let Some(invites) = invites {
-        body["invites"] = json!(invites.iter().map(invite_code_json).collect::<Vec<_>>());
+        body["invites"] = json!(invites);
     }
     body
 }
@@ -8200,12 +8283,19 @@ mod tests {
             created_by: account.did.clone(),
             created_at: "2026-01-01T00:00:00Z".to_string(),
         };
+        let invite_use = DirectoryInviteCodeUseRow {
+            code: invite.code.clone(),
+            used_by: Did::new("did:gsv:invited").unwrap(),
+            used_at: "2026-01-01T00:01:00Z".to_string(),
+        };
+        let invite = invite_code_json(&invite, &[invite_use]);
 
-        let view = account_view_json(&account, Some(&[invite]));
+        let view = account_view_json(&account, Some(vec![invite]));
         assert_eq!(view["did"], account.did.to_string());
         assert_eq!(view["invitesDisabled"], true);
         assert_eq!(view["inviteNote"], "maintenance");
         assert_eq!(view["invites"][0]["code"], "gsv-test");
+        assert_eq!(view["invites"][0]["uses"][0]["usedBy"], "did:gsv:invited");
 
         let status = subject_status_json(&account);
         assert_eq!(status["subject"]["did"], account.did.to_string());

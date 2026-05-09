@@ -12,6 +12,10 @@ const handle = `${id}.${config.handleSuffix.replace(/^\.+/, "")}`.toLowerCase();
 const did = `did:gsv:${id}`;
 const password = `delete-account-password-${stamp}`;
 const email = `delete-${stamp}@example.com`;
+const invitedId = `invited-${stamp}`;
+const invitedHandle = `${invitedId}.${config.handleSuffix.replace(/^\.+/, "")}`.toLowerCase();
+const invitedDid = `did:gsv:${invitedId}`;
+const invitedPassword = `invited-account-password-${stamp}`;
 
 const created = await expectJson(
   "create disposable account",
@@ -100,6 +104,24 @@ const invite = await expectJson(
 );
 
 await expectJson(
+  "create invited account",
+  "POST",
+  "/xrpc/com.atproto.server.createAccount",
+  {
+    handle: invitedHandle,
+    did: invitedDid,
+    password: invitedPassword,
+    email: `invited-${stamp}@example.com`,
+    inviteCode: invite.code,
+  },
+  (body) => {
+    if (body.did !== invitedDid || body.handle !== invitedHandle || !body.accessJwt) {
+      throw new Error(`unexpected invited createAccount response ${JSON.stringify(body)}`);
+    }
+  },
+);
+
+await expectJson(
   "get service auth",
   "GET",
   `/xrpc/com.atproto.server.getServiceAuth?aud=${encodeQuery("did:web:service.example.com")}&lxm=${encodeQuery("com.atproto.repo.getRecord")}`,
@@ -123,7 +145,8 @@ await expectJson(
   "/xrpc/com.atproto.server.getAccountInviteCodes?includeUsed=true",
   null,
   (body) => {
-    if (!Array.isArray(body.codes) || !body.codes.some((code) => code.code === invite.code)) {
+    const code = body.codes?.find((code) => code.code === invite.code);
+    if (!code || code.available !== 1 || code.uses?.[0]?.usedBy !== invitedDid) {
       throw new Error(`unexpected getAccountInviteCodes response ${JSON.stringify(body)}`);
     }
   },
@@ -136,7 +159,8 @@ await expectJson(
   `/xrpc/com.atproto.admin.getAccountInfo?did=${encodeQuery(did)}`,
   null,
   (body) => {
-    if (body.did !== did || body.handle !== handle || body.invites?.[0]?.code !== invite.code) {
+    const code = body.invites?.find((code) => code.code === invite.code);
+    if (body.did !== did || body.handle !== handle || !code || code.uses?.[0]?.usedBy !== invitedDid) {
       throw new Error(`unexpected admin getAccountInfo response ${JSON.stringify(body)}`);
     }
   },
@@ -235,6 +259,19 @@ await expectStatus(
   { authorization: `Bearer ${config.adminToken}` },
 );
 
+await expectStatus(
+  "disabled invite code rejects account creation",
+  "POST",
+  "/xrpc/com.atproto.server.createAccount",
+  {
+    handle: `rejected-${stamp}.${config.handleSuffix.replace(/^\.+/, "")}`.toLowerCase(),
+    did: `did:gsv:rejected-${stamp}`,
+    password: `rejected-account-password-${stamp}`,
+    inviteCode: invite.code,
+  },
+  400,
+);
+
 await expectJson(
   "admin send email",
   "POST",
@@ -284,6 +321,15 @@ await expectStatus(
     subject: { $type: "com.atproto.admin.defs#repoRef", did },
     deactivated: { applied: false },
   },
+  200,
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectStatus(
+  "admin delete invited account",
+  "POST",
+  "/xrpc/com.atproto.admin.deleteAccount",
+  { did: invitedDid },
   200,
   { authorization: `Bearer ${config.adminToken}` },
 );
@@ -395,6 +441,7 @@ console.log(
       baseUrl: config.baseUrl,
       handle,
       did,
+      invitedDid,
       reservedSigningKey: reservedKey.signingKey,
       inviteCode: invite.code,
     },

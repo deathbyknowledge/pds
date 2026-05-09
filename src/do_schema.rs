@@ -207,6 +207,22 @@ pub const CREATE_DIRECTORY_INVITE_CODES_CREATED_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_directory_invite_codes_created_at
      ON directory_invite_codes(created_at, code)";
 
+pub const CREATE_DIRECTORY_INVITE_CODE_USES: &str =
+    "CREATE TABLE IF NOT EXISTS directory_invite_code_uses (
+    code      TEXT NOT NULL,
+    used_by   TEXT NOT NULL,
+    used_at   INTEGER NOT NULL DEFAULT (unixepoch()),
+    PRIMARY KEY (code, used_by)
+)";
+
+pub const CREATE_DIRECTORY_INVITE_CODE_USES_CODE_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_invite_code_uses_code
+     ON directory_invite_code_uses(code, used_at)";
+
+pub const CREATE_DIRECTORY_INVITE_CODE_USES_USED_BY_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_invite_code_uses_used_by
+     ON directory_invite_code_uses(used_by, used_at)";
+
 pub const CREATE_DIRECTORY_ACTION_TOKENS: &str =
     "CREATE TABLE IF NOT EXISTS directory_action_tokens (
     token_digest TEXT PRIMARY KEY,
@@ -323,6 +339,9 @@ pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_INVITE_CODES,
     CREATE_DIRECTORY_INVITE_CODES_ACCOUNT_INDEX,
     CREATE_DIRECTORY_INVITE_CODES_CREATED_INDEX,
+    CREATE_DIRECTORY_INVITE_CODE_USES,
+    CREATE_DIRECTORY_INVITE_CODE_USES_CODE_INDEX,
+    CREATE_DIRECTORY_INVITE_CODE_USES_USED_BY_INDEX,
     CREATE_DIRECTORY_ACTION_TOKENS,
     CREATE_DIRECTORY_ACTION_TOKENS_DID_INDEX,
     CREATE_DIRECTORY_ACTION_TOKENS_EXPIRES_INDEX,
@@ -427,6 +446,8 @@ mod tests {
         assert!(joined.contains("client_auth_method TEXT NOT NULL DEFAULT 'none'"));
         assert!(joined.contains("directory_invite_codes"));
         assert!(joined.contains("available   INTEGER NOT NULL"));
+        assert!(joined.contains("directory_invite_code_uses"));
+        assert!(joined.contains("PRIMARY KEY (code, used_by)"));
         assert!(joined.contains("directory_action_tokens"));
         assert!(joined.contains("token_digest TEXT PRIMARY KEY"));
         assert!(joined.contains("idx_directory_action_tokens_did_purpose"));

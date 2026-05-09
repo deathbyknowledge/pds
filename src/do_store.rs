@@ -1,5 +1,7 @@
 //! Durable Object SQLite storage adapter.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use worker::{Error as WorkerError, SqlStorage, SqlStorageValue};
 
@@ -123,6 +125,13 @@ pub struct DirectoryInviteCodeRow {
     pub for_account: Did,
     pub created_by: Did,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryInviteCodeUseRow {
+    pub code: String,
+    pub used_by: Did,
+    pub used_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1130,6 +1139,40 @@ impl SqlDirectoryStore {
         Ok(())
     }
 
+    pub fn get_invite_code(&self, code: &str) -> worker::Result<Option<DirectoryInviteCodeRow>> {
+        let rows = self.sql.exec(
+            "SELECT code, available, disabled, for_account, created_by,
+                    strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+             FROM directory_invite_codes
+             WHERE code = ?
+             LIMIT 1",
+            vec![SqlStorageValue::from(code.to_string())],
+        )?;
+        rows.raw()
+            .next()
+            .map(|row| invite_code_from_values(row?))
+            .transpose()
+    }
+
+    pub fn consume_invite_code(&self, code: &str, used_by: &Did) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_invite_codes
+             SET available = available - 1
+             WHERE code = ? AND disabled = 0 AND available > 0",
+            vec![SqlStorageValue::from(code.to_string())],
+        )?;
+        self.sql.exec(
+            "INSERT INTO directory_invite_code_uses (code, used_by)
+             VALUES (?, ?)
+             ON CONFLICT(code, used_by) DO NOTHING",
+            vec![
+                SqlStorageValue::from(code.to_string()),
+                SqlStorageValue::from(used_by.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn list_invite_codes_for_account(
         &self,
         did: &Did,
@@ -1200,6 +1243,42 @@ impl SqlDirectoryStore {
             None
         };
         Ok((codes, next_cursor))
+    }
+
+    pub fn list_invite_code_uses_for_codes(
+        &self,
+        codes: &[String],
+    ) -> worker::Result<BTreeMap<String, Vec<DirectoryInviteCodeUseRow>>> {
+        let mut uses_by_code = BTreeMap::new();
+        if codes.is_empty() {
+            return Ok(uses_by_code);
+        }
+        let placeholders = std::iter::repeat("?")
+            .take(codes.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let params = codes
+            .iter()
+            .map(|code| SqlStorageValue::from(code.clone()))
+            .collect::<Vec<_>>();
+        let rows = self.sql.exec(
+            &format!(
+                "SELECT code, used_by,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', used_at, 'unixepoch') AS used_at
+                 FROM directory_invite_code_uses
+                 WHERE code IN ({placeholders})
+                 ORDER BY code ASC, used_at ASC, used_by ASC"
+            ),
+            params,
+        )?;
+        for row in rows.raw() {
+            let use_row = invite_code_use_from_values(row?)?;
+            uses_by_code
+                .entry(use_row.code.clone())
+                .or_insert_with(Vec::new)
+                .push(use_row);
+        }
+        Ok(uses_by_code)
     }
 
     pub fn disable_invite_codes(&self, codes: &[String], accounts: &[Did]) -> worker::Result<()> {
@@ -2559,6 +2638,20 @@ fn invite_code_from_values(values: Vec<SqlStorageValue>) -> worker::Result<Direc
         for_account,
         created_by,
         created_at,
+    })
+}
+
+fn invite_code_use_from_values(
+    values: Vec<SqlStorageValue>,
+) -> worker::Result<DirectoryInviteCodeUseRow> {
+    let mut values = values.into_iter();
+    let code = next_string(&mut values, "code")?;
+    let used_by = Did::new(next_string(&mut values, "used_by")?).map_err(worker_error)?;
+    let used_at = next_string(&mut values, "used_at")?;
+    Ok(DirectoryInviteCodeUseRow {
+        code,
+        used_by,
+        used_at,
     })
 }
 
