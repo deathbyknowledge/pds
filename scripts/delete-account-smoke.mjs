@@ -11,6 +11,7 @@ const id = `delete-${stamp}`;
 const handle = `${id}.${config.handleSuffix.replace(/^\.+/, "")}`.toLowerCase();
 const did = `did:gsv:${id}`;
 const password = `delete-account-password-${stamp}`;
+const email = `delete-${stamp}@example.com`;
 
 const created = await expectJson(
   "create disposable account",
@@ -20,7 +21,7 @@ const created = await expectJson(
     handle,
     did,
     password,
-    email: `delete-${stamp}@example.com`,
+    email,
   },
   (body) => {
     if (body.did !== did || body.handle !== handle || !body.accessJwt || !body.refreshJwt) {
@@ -67,6 +68,224 @@ const session = await expectJson(
       throw new Error(`unexpected createSession response ${JSON.stringify(body)}`);
     }
   },
+);
+
+const reservedKey = await expectJson(
+  "reserve signing key",
+  "POST",
+  "/xrpc/com.atproto.server.reserveSigningKey",
+  {},
+  (body) => {
+    if (typeof body.signingKey !== "string" || !body.signingKey.startsWith("z")) {
+      throw new Error(`unexpected reserveSigningKey response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+const invite = await expectJson(
+  "create invite code",
+  "POST",
+  "/xrpc/com.atproto.server.createInviteCode",
+  {
+    useCount: 2,
+    forAccount: did,
+  },
+  (body) => {
+    if (typeof body.code !== "string" || !body.code.startsWith("gsv-")) {
+      throw new Error(`unexpected createInviteCode response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectJson(
+  "get service auth",
+  "GET",
+  `/xrpc/com.atproto.server.getServiceAuth?aud=${encodeQuery("did:web:service.example.com")}&lxm=${encodeQuery("com.atproto.repo.getRecord")}`,
+  null,
+  (body) => {
+    const payload = decodeJwtPayload(body.token);
+    if (
+      payload.iss !== did ||
+      payload.aud !== "did:web:service.example.com" ||
+      payload.lxm !== "com.atproto.repo.getRecord"
+    ) {
+      throw new Error(`unexpected service auth payload ${JSON.stringify(payload)}`);
+    }
+  },
+  { authorization: `Bearer ${session.accessJwt}` },
+);
+
+await expectJson(
+  "get account invite codes",
+  "GET",
+  "/xrpc/com.atproto.server.getAccountInviteCodes?includeUsed=true",
+  null,
+  (body) => {
+    if (!Array.isArray(body.codes) || !body.codes.some((code) => code.code === invite.code)) {
+      throw new Error(`unexpected getAccountInviteCodes response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${session.accessJwt}` },
+);
+
+await expectJson(
+  "admin get account info",
+  "GET",
+  `/xrpc/com.atproto.admin.getAccountInfo?did=${encodeQuery(did)}`,
+  null,
+  (body) => {
+    if (body.did !== did || body.handle !== handle || body.invites?.[0]?.code !== invite.code) {
+      throw new Error(`unexpected admin getAccountInfo response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectJson(
+  "admin get account infos",
+  "GET",
+  `/xrpc/com.atproto.admin.getAccountInfos?dids=${encodeQuery(did)}`,
+  null,
+  (body) => {
+    if (!Array.isArray(body.infos) || body.infos[0]?.did !== did) {
+      throw new Error(`unexpected admin getAccountInfos response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectJson(
+  "admin search accounts",
+  "GET",
+  `/xrpc/com.atproto.admin.searchAccounts?email=${encodeQuery(email)}&limit=5`,
+  null,
+  (body) => {
+    if (!Array.isArray(body.accounts) || !body.accounts.some((account) => account.did === did)) {
+      throw new Error(`unexpected admin searchAccounts response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectJson(
+  "admin get invite codes",
+  "GET",
+  "/xrpc/com.atproto.admin.getInviteCodes?limit=20",
+  null,
+  (body) => {
+    if (!Array.isArray(body.codes) || !body.codes.some((code) => code.code === invite.code)) {
+      throw new Error(`unexpected admin getInviteCodes response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectJson(
+  "admin get subject status",
+  "GET",
+  `/xrpc/com.atproto.admin.getSubjectStatus?did=${encodeQuery(did)}`,
+  null,
+  (body) => {
+    if (body.subject?.did !== did || body.takedown?.applied !== false) {
+      throw new Error(`unexpected admin getSubjectStatus response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectStatus(
+  "admin disable account invites",
+  "POST",
+  "/xrpc/com.atproto.admin.disableAccountInvites",
+  { account: did, note: "smoke" },
+  200,
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectJson(
+  "admin account invites disabled",
+  "GET",
+  `/xrpc/com.atproto.admin.getAccountInfo?did=${encodeQuery(did)}`,
+  null,
+  (body) => {
+    if (body.invitesDisabled !== true || body.inviteNote !== "smoke") {
+      throw new Error(`unexpected disabled invites account response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectStatus(
+  "admin enable account invites",
+  "POST",
+  "/xrpc/com.atproto.admin.enableAccountInvites",
+  { account: did },
+  200,
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectStatus(
+  "admin disable invite codes",
+  "POST",
+  "/xrpc/com.atproto.admin.disableInviteCodes",
+  { codes: [invite.code] },
+  200,
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectJson(
+  "admin send email",
+  "POST",
+  "/xrpc/com.atproto.admin.sendEmail",
+  {
+    recipientDid: did,
+    senderDid: did,
+    content: "smoke",
+    subject: "Smoke",
+    comment: "delete-account-smoke",
+  },
+  (body) => {
+    if (body.sent !== false) {
+      throw new Error(`unexpected admin sendEmail response ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+const updatedEmail = `delete-updated-${stamp}@example.com`;
+await expectStatus(
+  "admin update account email",
+  "POST",
+  "/xrpc/com.atproto.admin.updateAccountEmail",
+  { account: did, email: updatedEmail },
+  200,
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectStatus(
+  "admin deactivate subject",
+  "POST",
+  "/xrpc/com.atproto.admin.updateSubjectStatus",
+  {
+    subject: { $type: "com.atproto.admin.defs#repoRef", did },
+    deactivated: { applied: true },
+  },
+  200,
+  { authorization: `Bearer ${config.adminToken}` },
+);
+
+await expectStatus(
+  "admin reactivate subject",
+  "POST",
+  "/xrpc/com.atproto.admin.updateSubjectStatus",
+  {
+    subject: { $type: "com.atproto.admin.defs#repoRef", did },
+    deactivated: { applied: false },
+  },
+  200,
+  { authorization: `Bearer ${config.adminToken}` },
 );
 
 const deletion = await expectJson(
@@ -176,6 +395,8 @@ console.log(
       baseUrl: config.baseUrl,
       handle,
       did,
+      reservedSigningKey: reservedKey.signingKey,
+      inviteCode: invite.code,
     },
     null,
     2,
@@ -239,4 +460,15 @@ function optionalEnv(name, fallback = undefined) {
 
 function encodeQuery(value) {
   return encodeURIComponent(value);
+}
+
+function decodeJwtPayload(token) {
+  if (typeof token !== "string") {
+    throw new Error(`JWT must be a string, got ${typeof token}`);
+  }
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    throw new Error(`JWT must have three parts, got ${parts.length}`);
+  }
+  return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
 }

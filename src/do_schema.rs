@@ -147,6 +147,8 @@ pub const CREATE_DIRECTORY_ACCOUNTS: &str = "CREATE TABLE IF NOT EXISTS director
     handle               TEXT NOT NULL UNIQUE,
     email                TEXT,
     email_confirmed      INTEGER NOT NULL DEFAULT 0,
+    invites_disabled     INTEGER NOT NULL DEFAULT 0,
+    invite_note          TEXT,
     password_hash        TEXT NOT NULL,
     repo_name            TEXT NOT NULL UNIQUE,
     public_key_multibase TEXT NOT NULL,
@@ -186,6 +188,24 @@ pub const CREATE_DIRECTORY_APP_PASSWORDS: &str =
     created_at    INTEGER NOT NULL DEFAULT (unixepoch()),
     PRIMARY KEY (did, name)
 )";
+
+pub const CREATE_DIRECTORY_INVITE_CODES: &str =
+    "CREATE TABLE IF NOT EXISTS directory_invite_codes (
+    code        TEXT PRIMARY KEY,
+    available   INTEGER NOT NULL,
+    disabled    INTEGER NOT NULL DEFAULT 0,
+    for_account TEXT NOT NULL,
+    created_by  TEXT NOT NULL,
+    created_at  INTEGER NOT NULL DEFAULT (unixepoch())
+)";
+
+pub const CREATE_DIRECTORY_INVITE_CODES_ACCOUNT_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_invite_codes_account
+     ON directory_invite_codes(for_account, created_at)";
+
+pub const CREATE_DIRECTORY_INVITE_CODES_CREATED_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_directory_invite_codes_created_at
+     ON directory_invite_codes(created_at, code)";
 
 pub const CREATE_DIRECTORY_ACTION_TOKENS: &str =
     "CREATE TABLE IF NOT EXISTS directory_action_tokens (
@@ -300,6 +320,9 @@ pub const DIRECTORY_SCHEMA_STATEMENTS: &[&str] = &[
     CREATE_DIRECTORY_SESSIONS,
     CREATE_DIRECTORY_SESSIONS_DID_INDEX,
     CREATE_DIRECTORY_APP_PASSWORDS,
+    CREATE_DIRECTORY_INVITE_CODES,
+    CREATE_DIRECTORY_INVITE_CODES_ACCOUNT_INDEX,
+    CREATE_DIRECTORY_INVITE_CODES_CREATED_INDEX,
     CREATE_DIRECTORY_ACTION_TOKENS,
     CREATE_DIRECTORY_ACTION_TOKENS_DID_INDEX,
     CREATE_DIRECTORY_ACTION_TOKENS_EXPIRES_INDEX,
@@ -398,9 +421,12 @@ mod tests {
         assert!(joined.contains("directory_accounts"));
         assert!(joined.contains("password_hash        TEXT NOT NULL"));
         assert!(joined.contains("email_confirmed      INTEGER NOT NULL DEFAULT 0"));
+        assert!(joined.contains("invites_disabled     INTEGER NOT NULL DEFAULT 0"));
         assert!(joined.contains("directory_sessions"));
         assert!(joined.contains("refresh_jti        TEXT NOT NULL UNIQUE"));
         assert!(joined.contains("client_auth_method TEXT NOT NULL DEFAULT 'none'"));
+        assert!(joined.contains("directory_invite_codes"));
+        assert!(joined.contains("available   INTEGER NOT NULL"));
         assert!(joined.contains("directory_action_tokens"));
         assert!(joined.contains("token_digest TEXT PRIMARY KEY"));
         assert!(joined.contains("idx_directory_action_tokens_did_purpose"));

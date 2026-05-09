@@ -61,6 +61,16 @@ impl RepoSigningKey {
         Ok(*self.signing_key()?.verifying_key())
     }
 
+    pub fn sign_sha256(&self, bytes: &[u8]) -> Result<Vec<u8>, IdentityError> {
+        let key = self.signing_key()?;
+        let digest = Sha256::digest(bytes);
+        let signature: Signature = key
+            .sign_prehash(&digest)
+            .map_err(|_| IdentityError::SigningFailed)?;
+        let signature = signature.normalize_s().unwrap_or(signature);
+        Ok(signature.to_bytes().to_vec())
+    }
+
     fn signing_key(&self) -> Result<SigningKey, IdentityError> {
         SigningKey::from_slice(&self.secret_key_bytes).map_err(|_| IdentityError::InvalidSigningKey)
     }
@@ -68,13 +78,8 @@ impl RepoSigningKey {
 
 impl CommitSigner for RepoSigningKey {
     fn sign_commit(&self, signable_bytes: &[u8]) -> Result<Vec<u8>, String> {
-        let key = self.signing_key().map_err(|error| error.to_string())?;
-        let digest = Sha256::digest(signable_bytes);
-        let signature: Signature = key
-            .sign_prehash(&digest)
-            .map_err(|_| IdentityError::SigningFailed.to_string())?;
-        let signature = signature.normalize_s().unwrap_or(signature);
-        Ok(signature.to_bytes().to_vec())
+        self.sign_sha256(signable_bytes)
+            .map_err(|error| error.to_string())
     }
 }
 

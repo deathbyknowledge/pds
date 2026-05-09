@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 pub mod atproto_resolver;
 pub mod auth;

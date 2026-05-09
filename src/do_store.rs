@@ -77,11 +77,14 @@ pub struct DirectoryAccountRow {
     pub handle: String,
     pub email: Option<String>,
     pub email_confirmed: bool,
+    pub invites_disabled: bool,
+    pub invite_note: Option<String>,
     pub password_hash: String,
     pub repo_name: String,
     pub public_key_multibase: String,
     pub active: bool,
     pub status: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +104,24 @@ pub struct DirectoryAppPasswordRow {
     pub name: String,
     pub password_hash: String,
     pub privileged: bool,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryInviteCodeInput {
+    pub code: String,
+    pub available: i64,
+    pub for_account: Did,
+    pub created_by: Did,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryInviteCodeRow {
+    pub code: String,
+    pub available: i64,
+    pub disabled: bool,
+    pub for_account: Did,
+    pub created_by: Did,
     pub created_at: String,
 }
 
@@ -829,6 +850,8 @@ impl SqlDirectoryStore {
             "ALTER TABLE directory_events ADD COLUMN blobs_json TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE directory_accounts ADD COLUMN email TEXT",
             "ALTER TABLE directory_accounts ADD COLUMN email_confirmed INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE directory_accounts ADD COLUMN invites_disabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE directory_accounts ADD COLUMN invite_note TEXT",
             "ALTER TABLE directory_accounts ADD COLUMN public_key_multibase TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE directory_accounts ADD COLUMN active INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE directory_accounts ADD COLUMN status TEXT",
@@ -855,15 +878,17 @@ impl SqlDirectoryStore {
     pub fn insert_account(&self, row: &DirectoryAccountRow) -> worker::Result<()> {
         self.sql.exec(
             "INSERT INTO directory_accounts (
-                did, handle, email, email_confirmed, password_hash,
-                repo_name, public_key_multibase, active, status
+                did, handle, email, email_confirmed, invites_disabled, invite_note,
+                password_hash, repo_name, public_key_multibase, active, status
              )
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             vec![
                 SqlStorageValue::from(row.did.to_string()),
                 SqlStorageValue::from(row.handle.clone()),
                 optional_text(row.email.clone()),
                 SqlStorageValue::from(if row.email_confirmed { 1_i64 } else { 0_i64 }),
+                SqlStorageValue::from(if row.invites_disabled { 1_i64 } else { 0_i64 }),
+                optional_text(row.invite_note.clone()),
                 SqlStorageValue::from(row.password_hash.clone()),
                 SqlStorageValue::from(row.repo_name.clone()),
                 SqlStorageValue::from(row.public_key_multibase.clone()),
@@ -881,8 +906,9 @@ impl SqlDirectoryStore {
         let rows: Vec<DirectoryAccountStorageRow> = self
             .sql
             .exec(
-                "SELECT did, handle, email, email_confirmed, password_hash,
-                        repo_name, public_key_multibase, active, status
+                "SELECT did, handle, email, email_confirmed, invites_disabled, invite_note, password_hash,
+                        repo_name, public_key_multibase, active, status,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
                  FROM directory_accounts
                  WHERE handle = ? OR did = ?
                  LIMIT 1",
@@ -906,8 +932,9 @@ impl SqlDirectoryStore {
         let rows: Vec<DirectoryAccountStorageRow> = self
             .sql
             .exec(
-                "SELECT did, handle, email, email_confirmed, password_hash,
-                        repo_name, public_key_multibase, active, status
+                "SELECT did, handle, email, email_confirmed, invites_disabled, invite_note, password_hash,
+                        repo_name, public_key_multibase, active, status,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
                  FROM directory_accounts
                  WHERE email = ?
                  LIMIT 1",
@@ -918,6 +945,88 @@ impl SqlDirectoryStore {
             .next()
             .map(directory_account_from_row)
             .transpose()
+    }
+
+    pub fn list_accounts_by_dids(&self, dids: &[Did]) -> worker::Result<Vec<DirectoryAccountRow>> {
+        let mut accounts = Vec::new();
+        for did in dids {
+            if let Some(account) = self.get_account_by_did(did)? {
+                accounts.push(account);
+            }
+        }
+        Ok(accounts)
+    }
+
+    pub fn search_accounts(
+        &self,
+        email: Option<&str>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> worker::Result<(Vec<DirectoryAccountRow>, Option<String>)> {
+        let query_limit = limit.saturating_add(1);
+        let rows: Vec<DirectoryAccountStorageRow> = match (email, cursor) {
+            (Some(email), Some(cursor)) => self.sql.exec(
+                "SELECT did, handle, email, email_confirmed, invites_disabled, invite_note, password_hash,
+                        repo_name, public_key_multibase, active, status,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_accounts
+                 WHERE email LIKE ? AND did > ?
+                 ORDER BY did ASC
+                 LIMIT ?",
+                vec![
+                    SqlStorageValue::from(format!("%{email}%")),
+                    SqlStorageValue::from(cursor.to_string()),
+                    SqlStorageValue::from(query_limit as i64),
+                ],
+            )?.to_array()?,
+            (Some(email), None) => self.sql.exec(
+                "SELECT did, handle, email, email_confirmed, invites_disabled, invite_note, password_hash,
+                        repo_name, public_key_multibase, active, status,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_accounts
+                 WHERE email LIKE ?
+                 ORDER BY did ASC
+                 LIMIT ?",
+                vec![
+                    SqlStorageValue::from(format!("%{email}%")),
+                    SqlStorageValue::from(query_limit as i64),
+                ],
+            )?.to_array()?,
+            (None, Some(cursor)) => self.sql.exec(
+                "SELECT did, handle, email, email_confirmed, invites_disabled, invite_note, password_hash,
+                        repo_name, public_key_multibase, active, status,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_accounts
+                 WHERE did > ?
+                 ORDER BY did ASC
+                 LIMIT ?",
+                vec![
+                    SqlStorageValue::from(cursor.to_string()),
+                    SqlStorageValue::from(query_limit as i64),
+                ],
+            )?.to_array()?,
+            (None, None) => self.sql.exec(
+                "SELECT did, handle, email, email_confirmed, invites_disabled, invite_note, password_hash,
+                        repo_name, public_key_multibase, active, status,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_accounts
+                 ORDER BY did ASC
+                 LIMIT ?",
+                vec![SqlStorageValue::from(query_limit as i64)],
+            )?.to_array()?,
+        };
+        let has_more = rows.len() > limit;
+        let accounts = rows
+            .into_iter()
+            .take(limit)
+            .map(directory_account_from_row)
+            .collect::<worker::Result<Vec<_>>>()?;
+        let next_cursor = if has_more {
+            accounts.last().map(|account| account.did.to_string())
+        } else {
+            None
+        };
+        Ok((accounts, next_cursor))
     }
 
     pub fn put_app_password(
@@ -1003,6 +1112,114 @@ impl SqlDirectoryStore {
             .next()
             .map(|row| row.created_at)
             .ok_or_else(|| worker_error(std::io::Error::other("app password not found")))
+    }
+
+    pub fn insert_invite_code(&self, row: &DirectoryInviteCodeInput) -> worker::Result<()> {
+        self.sql.exec(
+            "INSERT INTO directory_invite_codes (
+                code, available, for_account, created_by
+             )
+             VALUES (?, ?, ?, ?)",
+            vec![
+                SqlStorageValue::from(row.code.clone()),
+                SqlStorageValue::from(row.available),
+                SqlStorageValue::from(row.for_account.to_string()),
+                SqlStorageValue::from(row.created_by.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_invite_codes_for_account(
+        &self,
+        did: &Did,
+        include_used: bool,
+    ) -> worker::Result<Vec<DirectoryInviteCodeRow>> {
+        let rows = if include_used {
+            self.sql.exec(
+                "SELECT code, available, disabled, for_account, created_by,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_invite_codes
+                 WHERE for_account = ?
+                 ORDER BY created_at DESC, code ASC",
+                vec![SqlStorageValue::from(did.to_string())],
+            )?
+        } else {
+            self.sql.exec(
+                "SELECT code, available, disabled, for_account, created_by,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_invite_codes
+                 WHERE for_account = ? AND available > 0
+                 ORDER BY created_at DESC, code ASC",
+                vec![SqlStorageValue::from(did.to_string())],
+            )?
+        };
+        rows.raw()
+            .map(|row| invite_code_from_values(row?))
+            .collect()
+    }
+
+    pub fn list_invite_codes(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> worker::Result<(Vec<DirectoryInviteCodeRow>, Option<String>)> {
+        let query_limit = limit.saturating_add(1);
+        let rows = if let Some(cursor) = cursor {
+            self.sql.exec(
+                "SELECT code, available, disabled, for_account, created_by,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_invite_codes
+                 WHERE code > ?
+                 ORDER BY code ASC
+                 LIMIT ?",
+                vec![
+                    SqlStorageValue::from(cursor.to_string()),
+                    SqlStorageValue::from(query_limit as i64),
+                ],
+            )?
+        } else {
+            self.sql.exec(
+                "SELECT code, available, disabled, for_account, created_by,
+                        strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
+                 FROM directory_invite_codes
+                 ORDER BY code ASC
+                 LIMIT ?",
+                vec![SqlStorageValue::from(query_limit as i64)],
+            )?
+        };
+        let mut codes = Vec::new();
+        for row in rows.raw() {
+            codes.push(invite_code_from_values(row?)?);
+        }
+        let has_more = codes.len() > limit;
+        codes.truncate(limit);
+        let next_cursor = if has_more {
+            codes.last().map(|row| row.code.clone())
+        } else {
+            None
+        };
+        Ok((codes, next_cursor))
+    }
+
+    pub fn disable_invite_codes(&self, codes: &[String], accounts: &[Did]) -> worker::Result<()> {
+        for code in codes {
+            self.sql.exec(
+                "UPDATE directory_invite_codes
+                 SET disabled = 1
+                 WHERE code = ?",
+                vec![SqlStorageValue::from(code.clone())],
+            )?;
+        }
+        for account in accounts {
+            self.sql.exec(
+                "UPDATE directory_invite_codes
+                 SET disabled = 1
+                 WHERE for_account = ?",
+                vec![SqlStorageValue::from(account.to_string())],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn insert_action_token(&self, row: &DirectoryActionTokenInput) -> worker::Result<()> {
@@ -1154,6 +1371,25 @@ impl SqlDirectoryStore {
             vec![
                 SqlStorageValue::from(if active { 1_i64 } else { 0_i64 }),
                 optional_text(status.map(|value| value.to_string())),
+                SqlStorageValue::from(did.to_string()),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_account_invites_disabled(
+        &self,
+        did: &Did,
+        disabled: bool,
+        note: Option<&str>,
+    ) -> worker::Result<()> {
+        self.sql.exec(
+            "UPDATE directory_accounts
+             SET invites_disabled = ?, invite_note = ?, updated_at = unixepoch()
+             WHERE did = ?",
+            vec![
+                SqlStorageValue::from(if disabled { 1_i64 } else { 0_i64 }),
+                optional_text(note.map(|value| value.to_string())),
                 SqlStorageValue::from(did.to_string()),
             ],
         )?;
@@ -2011,11 +2247,14 @@ fn directory_account_from_row(
         handle: row.handle,
         email: row.email,
         email_confirmed: row.email_confirmed != 0,
+        invites_disabled: row.invites_disabled != 0,
+        invite_note: row.invite_note,
         password_hash: row.password_hash,
         repo_name: row.repo_name,
         public_key_multibase: row.public_key_multibase,
         active: row.active != 0,
         status: row.status,
+        created_at: row.created_at,
     })
 }
 
@@ -2127,11 +2366,14 @@ struct DirectoryAccountStorageRow {
     handle: String,
     email: Option<String>,
     email_confirmed: i64,
+    invites_disabled: i64,
+    invite_note: Option<String>,
     password_hash: String,
     repo_name: String,
     public_key_multibase: String,
     active: i64,
     status: Option<String>,
+    created_at: String,
 }
 
 #[derive(Deserialize)]
@@ -2298,6 +2540,24 @@ fn app_password_from_values(
         name,
         password_hash,
         privileged,
+        created_at,
+    })
+}
+
+fn invite_code_from_values(values: Vec<SqlStorageValue>) -> worker::Result<DirectoryInviteCodeRow> {
+    let mut values = values.into_iter();
+    let code = next_string(&mut values, "code")?;
+    let available = next_i64(&mut values, "available")?;
+    let disabled = next_i64(&mut values, "disabled")? != 0;
+    let for_account = Did::new(next_string(&mut values, "for_account")?).map_err(worker_error)?;
+    let created_by = Did::new(next_string(&mut values, "created_by")?).map_err(worker_error)?;
+    let created_at = next_string(&mut values, "created_at")?;
+    Ok(DirectoryInviteCodeRow {
+        code,
+        available,
+        disabled,
+        for_account,
+        created_by,
         created_at,
     })
 }

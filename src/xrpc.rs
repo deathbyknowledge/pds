@@ -21,9 +21,29 @@ pub const SERVER_DELETE_ACCOUNT: &str = "com.atproto.server.deleteAccount";
 pub const SERVER_DEACTIVATE_ACCOUNT: &str = "com.atproto.server.deactivateAccount";
 pub const SERVER_ACTIVATE_ACCOUNT: &str = "com.atproto.server.activateAccount";
 pub const SERVER_CHECK_ACCOUNT_STATUS: &str = "com.atproto.server.checkAccountStatus";
+pub const SERVER_GET_SERVICE_AUTH: &str = "com.atproto.server.getServiceAuth";
+pub const SERVER_RESERVE_SIGNING_KEY: &str = "com.atproto.server.reserveSigningKey";
+pub const SERVER_CREATE_INVITE_CODE: &str = "com.atproto.server.createInviteCode";
+pub const SERVER_CREATE_INVITE_CODES: &str = "com.atproto.server.createInviteCodes";
+pub const SERVER_GET_ACCOUNT_INVITE_CODES: &str = "com.atproto.server.getAccountInviteCodes";
 pub const SERVER_CREATE_APP_PASSWORD: &str = "com.atproto.server.createAppPassword";
 pub const SERVER_LIST_APP_PASSWORDS: &str = "com.atproto.server.listAppPasswords";
 pub const SERVER_REVOKE_APP_PASSWORD: &str = "com.atproto.server.revokeAppPassword";
+pub const ADMIN_DELETE_ACCOUNT: &str = "com.atproto.admin.deleteAccount";
+pub const ADMIN_DISABLE_ACCOUNT_INVITES: &str = "com.atproto.admin.disableAccountInvites";
+pub const ADMIN_DISABLE_INVITE_CODES: &str = "com.atproto.admin.disableInviteCodes";
+pub const ADMIN_ENABLE_ACCOUNT_INVITES: &str = "com.atproto.admin.enableAccountInvites";
+pub const ADMIN_GET_ACCOUNT_INFO: &str = "com.atproto.admin.getAccountInfo";
+pub const ADMIN_GET_ACCOUNT_INFOS: &str = "com.atproto.admin.getAccountInfos";
+pub const ADMIN_GET_INVITE_CODES: &str = "com.atproto.admin.getInviteCodes";
+pub const ADMIN_GET_SUBJECT_STATUS: &str = "com.atproto.admin.getSubjectStatus";
+pub const ADMIN_SEARCH_ACCOUNTS: &str = "com.atproto.admin.searchAccounts";
+pub const ADMIN_SEND_EMAIL: &str = "com.atproto.admin.sendEmail";
+pub const ADMIN_UPDATE_ACCOUNT_EMAIL: &str = "com.atproto.admin.updateAccountEmail";
+pub const ADMIN_UPDATE_ACCOUNT_HANDLE: &str = "com.atproto.admin.updateAccountHandle";
+pub const ADMIN_UPDATE_ACCOUNT_PASSWORD: &str = "com.atproto.admin.updateAccountPassword";
+pub const ADMIN_UPDATE_ACCOUNT_SIGNING_KEY: &str = "com.atproto.admin.updateAccountSigningKey";
+pub const ADMIN_UPDATE_SUBJECT_STATUS: &str = "com.atproto.admin.updateSubjectStatus";
 pub const IDENTITY_RESOLVE_HANDLE: &str = "com.atproto.identity.resolveHandle";
 pub const IDENTITY_RESOLVE_DID: &str = "com.atproto.identity.resolveDid";
 pub const IDENTITY_RESOLVE_IDENTITY: &str = "com.atproto.identity.resolveIdentity";
@@ -124,9 +144,29 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | SERVER_DEACTIVATE_ACCOUNT
         | SERVER_ACTIVATE_ACCOUNT
         | SERVER_CHECK_ACCOUNT_STATUS
+        | SERVER_GET_SERVICE_AUTH
+        | SERVER_RESERVE_SIGNING_KEY
+        | SERVER_CREATE_INVITE_CODE
+        | SERVER_CREATE_INVITE_CODES
+        | SERVER_GET_ACCOUNT_INVITE_CODES
         | SERVER_CREATE_APP_PASSWORD
         | SERVER_LIST_APP_PASSWORDS
         | SERVER_REVOKE_APP_PASSWORD
+        | ADMIN_DELETE_ACCOUNT
+        | ADMIN_DISABLE_ACCOUNT_INVITES
+        | ADMIN_DISABLE_INVITE_CODES
+        | ADMIN_ENABLE_ACCOUNT_INVITES
+        | ADMIN_GET_ACCOUNT_INFO
+        | ADMIN_GET_ACCOUNT_INFOS
+        | ADMIN_GET_INVITE_CODES
+        | ADMIN_GET_SUBJECT_STATUS
+        | ADMIN_SEARCH_ACCOUNTS
+        | ADMIN_SEND_EMAIL
+        | ADMIN_UPDATE_ACCOUNT_EMAIL
+        | ADMIN_UPDATE_ACCOUNT_HANDLE
+        | ADMIN_UPDATE_ACCOUNT_PASSWORD
+        | ADMIN_UPDATE_ACCOUNT_SIGNING_KEY
+        | ADMIN_UPDATE_SUBJECT_STATUS
         | IDENTITY_RESOLVE_HANDLE
         | IDENTITY_RESOLVE_IDENTITY
         | IDENTITY_UPDATE_HANDLE
@@ -339,9 +379,29 @@ mod tests {
             SERVER_DEACTIVATE_ACCOUNT,
             SERVER_ACTIVATE_ACCOUNT,
             SERVER_CHECK_ACCOUNT_STATUS,
+            SERVER_GET_SERVICE_AUTH,
+            SERVER_RESERVE_SIGNING_KEY,
+            SERVER_CREATE_INVITE_CODE,
+            SERVER_CREATE_INVITE_CODES,
+            SERVER_GET_ACCOUNT_INVITE_CODES,
             SERVER_CREATE_APP_PASSWORD,
             SERVER_LIST_APP_PASSWORDS,
             SERVER_REVOKE_APP_PASSWORD,
+            ADMIN_DELETE_ACCOUNT,
+            ADMIN_DISABLE_ACCOUNT_INVITES,
+            ADMIN_DISABLE_INVITE_CODES,
+            ADMIN_ENABLE_ACCOUNT_INVITES,
+            ADMIN_GET_ACCOUNT_INFO,
+            ADMIN_GET_ACCOUNT_INFOS,
+            ADMIN_GET_INVITE_CODES,
+            ADMIN_GET_SUBJECT_STATUS,
+            ADMIN_SEARCH_ACCOUNTS,
+            ADMIN_SEND_EMAIL,
+            ADMIN_UPDATE_ACCOUNT_EMAIL,
+            ADMIN_UPDATE_ACCOUNT_HANDLE,
+            ADMIN_UPDATE_ACCOUNT_PASSWORD,
+            ADMIN_UPDATE_ACCOUNT_SIGNING_KEY,
+            ADMIN_UPDATE_SUBJECT_STATUS,
             IDENTITY_RESOLVE_IDENTITY,
             IDENTITY_UPDATE_HANDLE,
             IDENTITY_REFRESH_IDENTITY,

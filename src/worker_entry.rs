@@ -9,7 +9,7 @@ use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
-use serde_json::{from_str, json, to_string, Value};
+use serde_json::{from_str, json, to_string, to_vec, Value};
 use sha2::{Digest, Sha256};
 use wasm_bindgen::{JsCast, JsValue};
 use worker::{
@@ -34,10 +34,10 @@ use crate::commit::{CommitBlock, Did, RepoRev};
 use crate::data_model::{Nsid, RecordKey, RepoPath};
 use crate::do_store::{
     DirectoryAccountRow, DirectoryActionTokenInput, DirectoryActionTokenRow,
-    DirectoryCommitEventInput, DirectoryEventRow, DirectoryOauthAuthorizationCodeInput,
-    DirectoryOauthParRequestInput, DirectoryOauthParRequestRow, DirectoryRepoRow,
-    DirectorySessionRow, RepoBlobRow, RepoCommitEventInput, RepoIdentityRow, RepoStateRow,
-    SqlDirectoryStore, SqlRepoStore,
+    DirectoryCommitEventInput, DirectoryEventRow, DirectoryInviteCodeInput, DirectoryInviteCodeRow,
+    DirectoryOauthAuthorizationCodeInput, DirectoryOauthParRequestInput,
+    DirectoryOauthParRequestRow, DirectoryRepoRow, DirectorySessionRow, RepoBlobRow,
+    RepoCommitEventInput, RepoIdentityRow, RepoStateRow, SqlDirectoryStore, SqlRepoStore,
 };
 use crate::dpop::{dpop_htu, verify_dpop_proof, DpopError, VerifiedDpopProof};
 use crate::identity::{IdentityError, RepoSigningKey};
@@ -62,16 +62,23 @@ use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 use crate::xrpc::{
     at_uri, optional_param, parse_get_blocks_params, parse_list_records_params,
     repo_object_name_from_identifier, required_param, route_xrpc_method, strong_ref,
-    IDENTITY_REFRESH_IDENTITY, IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE,
-    IDENTITY_RESOLVE_IDENTITY, IDENTITY_UPDATE_HANDLE, REPO_APPLY_WRITES, REPO_CREATE_RECORD,
-    REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
-    REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
-    SERVER_ACTIVATE_ACCOUNT, SERVER_CHANGE_PASSWORD, SERVER_CHECK_ACCOUNT_STATUS,
-    SERVER_CONFIRM_EMAIL, SERVER_CREATE_ACCOUNT, SERVER_CREATE_APP_PASSWORD, SERVER_CREATE_SESSION,
-    SERVER_DEACTIVATE_ACCOUNT, SERVER_DELETE_ACCOUNT, SERVER_DELETE_SESSION,
-    SERVER_DESCRIBE_SERVER, SERVER_GET_SESSION, SERVER_LIST_APP_PASSWORDS, SERVER_REFRESH_SESSION,
-    SERVER_REQUEST_ACCOUNT_DELETE, SERVER_REQUEST_EMAIL_CONFIRMATION, SERVER_REQUEST_EMAIL_UPDATE,
-    SERVER_REQUEST_PASSWORD_RESET, SERVER_RESET_PASSWORD, SERVER_REVOKE_APP_PASSWORD,
+    ADMIN_DELETE_ACCOUNT, ADMIN_DISABLE_ACCOUNT_INVITES, ADMIN_DISABLE_INVITE_CODES,
+    ADMIN_ENABLE_ACCOUNT_INVITES, ADMIN_GET_ACCOUNT_INFO, ADMIN_GET_ACCOUNT_INFOS,
+    ADMIN_GET_INVITE_CODES, ADMIN_GET_SUBJECT_STATUS, ADMIN_SEARCH_ACCOUNTS, ADMIN_SEND_EMAIL,
+    ADMIN_UPDATE_ACCOUNT_EMAIL, ADMIN_UPDATE_ACCOUNT_HANDLE, ADMIN_UPDATE_ACCOUNT_PASSWORD,
+    ADMIN_UPDATE_ACCOUNT_SIGNING_KEY, ADMIN_UPDATE_SUBJECT_STATUS, IDENTITY_REFRESH_IDENTITY,
+    IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE, IDENTITY_RESOLVE_IDENTITY,
+    IDENTITY_UPDATE_HANDLE, REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD,
+    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO, REPO_LIST_MISSING_BLOBS,
+    REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_ACTIVATE_ACCOUNT,
+    SERVER_CHANGE_PASSWORD, SERVER_CHECK_ACCOUNT_STATUS, SERVER_CONFIRM_EMAIL,
+    SERVER_CREATE_ACCOUNT, SERVER_CREATE_APP_PASSWORD, SERVER_CREATE_INVITE_CODE,
+    SERVER_CREATE_INVITE_CODES, SERVER_CREATE_SESSION, SERVER_DEACTIVATE_ACCOUNT,
+    SERVER_DELETE_ACCOUNT, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER,
+    SERVER_GET_ACCOUNT_INVITE_CODES, SERVER_GET_SERVICE_AUTH, SERVER_GET_SESSION,
+    SERVER_LIST_APP_PASSWORDS, SERVER_REFRESH_SESSION, SERVER_REQUEST_ACCOUNT_DELETE,
+    SERVER_REQUEST_EMAIL_CONFIRMATION, SERVER_REQUEST_EMAIL_UPDATE, SERVER_REQUEST_PASSWORD_RESET,
+    SERVER_RESERVE_SIGNING_KEY, SERVER_RESET_PASSWORD, SERVER_REVOKE_APP_PASSWORD,
     SERVER_UPDATE_EMAIL, SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT, SYNC_GET_HEAD,
     SYNC_GET_HOST_STATUS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
     SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS, SYNC_LIST_REPOS_BY_COLLECTION,
@@ -93,6 +100,7 @@ const PASSWORD_SALT_BYTES: usize = 16;
 const SESSION_ID_BYTES: usize = 24;
 const APP_PASSWORD_BYTES: usize = 18;
 const ACTION_TOKEN_BYTES: usize = 24;
+const INVITE_CODE_BYTES: usize = 12;
 const REPO_SIGNING_KEY_BYTES: usize = 32;
 const OAUTH_REQUEST_URI_BYTES: usize = 32;
 const OAUTH_DPOP_NONCE_BYTES: usize = 32;
@@ -265,6 +273,30 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcDeleteAccount": "POST /xrpc/com.atproto.server.deleteAccount",
                 "xrpcDeactivateAccount": "POST /xrpc/com.atproto.server.deactivateAccount",
                 "xrpcActivateAccount": "POST /xrpc/com.atproto.server.activateAccount",
+                "xrpcCheckAccountStatus": "GET /xrpc/com.atproto.server.checkAccountStatus",
+                "xrpcGetServiceAuth": "GET /xrpc/com.atproto.server.getServiceAuth?aud=:did",
+                "xrpcReserveSigningKey": "POST /xrpc/com.atproto.server.reserveSigningKey",
+                "xrpcCreateInviteCode": "POST /xrpc/com.atproto.server.createInviteCode",
+                "xrpcCreateInviteCodes": "POST /xrpc/com.atproto.server.createInviteCodes",
+                "xrpcGetAccountInviteCodes": "GET /xrpc/com.atproto.server.getAccountInviteCodes",
+                "xrpcCreateAppPassword": "POST /xrpc/com.atproto.server.createAppPassword",
+                "xrpcListAppPasswords": "GET /xrpc/com.atproto.server.listAppPasswords",
+                "xrpcRevokeAppPassword": "POST /xrpc/com.atproto.server.revokeAppPassword",
+                "xrpcAdminDeleteAccount": "POST /xrpc/com.atproto.admin.deleteAccount",
+                "xrpcAdminDisableAccountInvites": "POST /xrpc/com.atproto.admin.disableAccountInvites",
+                "xrpcAdminDisableInviteCodes": "POST /xrpc/com.atproto.admin.disableInviteCodes",
+                "xrpcAdminEnableAccountInvites": "POST /xrpc/com.atproto.admin.enableAccountInvites",
+                "xrpcAdminGetAccountInfo": "GET /xrpc/com.atproto.admin.getAccountInfo?did=:did",
+                "xrpcAdminGetAccountInfos": "GET /xrpc/com.atproto.admin.getAccountInfos?dids=:did",
+                "xrpcAdminGetInviteCodes": "GET /xrpc/com.atproto.admin.getInviteCodes",
+                "xrpcAdminGetSubjectStatus": "GET /xrpc/com.atproto.admin.getSubjectStatus?did=:did",
+                "xrpcAdminSearchAccounts": "GET /xrpc/com.atproto.admin.searchAccounts",
+                "xrpcAdminSendEmail": "POST /xrpc/com.atproto.admin.sendEmail",
+                "xrpcAdminUpdateAccountEmail": "POST /xrpc/com.atproto.admin.updateAccountEmail",
+                "xrpcAdminUpdateAccountHandle": "POST /xrpc/com.atproto.admin.updateAccountHandle",
+                "xrpcAdminUpdateAccountPassword": "POST /xrpc/com.atproto.admin.updateAccountPassword",
+                "xrpcAdminUpdateAccountSigningKey": "POST /xrpc/com.atproto.admin.updateAccountSigningKey",
+                "xrpcAdminUpdateSubjectStatus": "POST /xrpc/com.atproto.admin.updateSubjectStatus",
                 "xrpcDescribeRepo": "GET /xrpc/com.atproto.repo.describeRepo?repo=:repo",
                 "xrpcGetRecord": "GET /xrpc/com.atproto.repo.getRecord?repo=:repo&collection=:nsid&rkey=:rkey",
                 "xrpcListRecords": "GET /xrpc/com.atproto.repo.listRecords?repo=:repo&collection=:nsid",
@@ -465,6 +497,19 @@ impl PdsDirectoryObject {
                 (Method::Get, SERVER_CHECK_ACCOUNT_STATUS) => {
                     self.xrpc_check_account_status(req, &url).await
                 }
+                (Method::Get, SERVER_GET_SERVICE_AUTH) => {
+                    self.xrpc_get_service_auth(req, &url).await
+                }
+                (Method::Post, SERVER_RESERVE_SIGNING_KEY) => self.xrpc_reserve_signing_key(),
+                (Method::Post, SERVER_CREATE_INVITE_CODE) => {
+                    self.xrpc_create_invite_code(req).await
+                }
+                (Method::Post, SERVER_CREATE_INVITE_CODES) => {
+                    self.xrpc_create_invite_codes(req).await
+                }
+                (Method::Get, SERVER_GET_ACCOUNT_INVITE_CODES) => {
+                    self.xrpc_get_account_invite_codes(req, &url)
+                }
                 (Method::Post, SERVER_CREATE_APP_PASSWORD) => {
                     self.xrpc_create_app_password(req).await
                 }
@@ -477,6 +522,45 @@ impl PdsDirectoryObject {
                 (Method::Post, IDENTITY_UPDATE_HANDLE) => self.xrpc_update_handle(req, &url).await,
                 (Method::Post, IDENTITY_REFRESH_IDENTITY) => {
                     self.xrpc_refresh_identity(req, &url).await
+                }
+                (Method::Post, ADMIN_DELETE_ACCOUNT) => self.xrpc_admin_delete_account(req).await,
+                (Method::Post, ADMIN_DISABLE_ACCOUNT_INVITES) => {
+                    self.xrpc_admin_disable_account_invites(req).await
+                }
+                (Method::Post, ADMIN_DISABLE_INVITE_CODES) => {
+                    self.xrpc_admin_disable_invite_codes(req).await
+                }
+                (Method::Post, ADMIN_ENABLE_ACCOUNT_INVITES) => {
+                    self.xrpc_admin_enable_account_invites(req).await
+                }
+                (Method::Get, ADMIN_GET_ACCOUNT_INFO) => {
+                    self.xrpc_admin_get_account_info(req, &url)
+                }
+                (Method::Get, ADMIN_GET_ACCOUNT_INFOS) => {
+                    self.xrpc_admin_get_account_infos(req, &url)
+                }
+                (Method::Get, ADMIN_GET_INVITE_CODES) => {
+                    self.xrpc_admin_get_invite_codes(req, &url)
+                }
+                (Method::Get, ADMIN_GET_SUBJECT_STATUS) => {
+                    self.xrpc_admin_get_subject_status(req, &url)
+                }
+                (Method::Get, ADMIN_SEARCH_ACCOUNTS) => self.xrpc_admin_search_accounts(req, &url),
+                (Method::Post, ADMIN_SEND_EMAIL) => self.xrpc_admin_send_email(req).await,
+                (Method::Post, ADMIN_UPDATE_ACCOUNT_EMAIL) => {
+                    self.xrpc_admin_update_account_email(req).await
+                }
+                (Method::Post, ADMIN_UPDATE_ACCOUNT_HANDLE) => {
+                    self.xrpc_admin_update_account_handle(req, &url).await
+                }
+                (Method::Post, ADMIN_UPDATE_ACCOUNT_PASSWORD) => {
+                    self.xrpc_admin_update_account_password(req).await
+                }
+                (Method::Post, ADMIN_UPDATE_ACCOUNT_SIGNING_KEY) => {
+                    self.xrpc_admin_update_account_signing_key()
+                }
+                (Method::Post, ADMIN_UPDATE_SUBJECT_STATUS) => {
+                    self.xrpc_admin_update_subject_status(req).await
                 }
                 (
                     _,
@@ -497,6 +581,11 @@ impl PdsDirectoryObject {
                     | SERVER_DEACTIVATE_ACCOUNT
                     | SERVER_ACTIVATE_ACCOUNT
                     | SERVER_CHECK_ACCOUNT_STATUS
+                    | SERVER_GET_SERVICE_AUTH
+                    | SERVER_RESERVE_SIGNING_KEY
+                    | SERVER_CREATE_INVITE_CODE
+                    | SERVER_CREATE_INVITE_CODES
+                    | SERVER_GET_ACCOUNT_INVITE_CODES
                     | SERVER_CREATE_APP_PASSWORD
                     | SERVER_LIST_APP_PASSWORDS
                     | SERVER_REVOKE_APP_PASSWORD
@@ -504,6 +593,21 @@ impl PdsDirectoryObject {
                     | IDENTITY_RESOLVE_IDENTITY
                     | IDENTITY_UPDATE_HANDLE
                     | IDENTITY_REFRESH_IDENTITY
+                    | ADMIN_DELETE_ACCOUNT
+                    | ADMIN_DISABLE_ACCOUNT_INVITES
+                    | ADMIN_DISABLE_INVITE_CODES
+                    | ADMIN_ENABLE_ACCOUNT_INVITES
+                    | ADMIN_GET_ACCOUNT_INFO
+                    | ADMIN_GET_ACCOUNT_INFOS
+                    | ADMIN_GET_INVITE_CODES
+                    | ADMIN_GET_SUBJECT_STATUS
+                    | ADMIN_SEARCH_ACCOUNTS
+                    | ADMIN_SEND_EMAIL
+                    | ADMIN_UPDATE_ACCOUNT_EMAIL
+                    | ADMIN_UPDATE_ACCOUNT_HANDLE
+                    | ADMIN_UPDATE_ACCOUNT_PASSWORD
+                    | ADMIN_UPDATE_ACCOUNT_SIGNING_KEY
+                    | ADMIN_UPDATE_SUBJECT_STATUS
                     | SYNC_LIST_REPOS
                     | SYNC_LIST_REPOS_BY_COLLECTION
                     | SYNC_GET_HOST_STATUS
@@ -699,11 +803,14 @@ impl PdsDirectoryObject {
             handle: body.handle.clone(),
             email: body.email.clone(),
             email_confirmed: false,
+            invites_disabled: false,
+            invite_note: None,
             password_hash: hash_password(password, &salt),
             repo_name: repo_name.clone(),
             public_key_multibase: init.public_key_multibase.clone(),
             active: true,
             status: None,
+            created_at: current_datetime_string(),
         };
         store.insert_account(&account).map_err(HttpError::worker)?;
         let repo = DirectoryRepoRow {
@@ -1039,6 +1146,403 @@ impl PdsDirectoryObject {
             }),
         )
         .map_err(HttpError::worker)
+    }
+
+    async fn xrpc_get_service_auth(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        let params = query_pairs(url);
+        let aud = Did::new(required_param(&params, "aud").map_err(HttpError::xrpc)?)
+            .map_err(HttpError::bad_request)?;
+        let lxm = optional_param(&params, "lxm")
+            .filter(|value| !value.is_empty())
+            .map(|value| Nsid::new(value).map_err(HttpError::bad_request))
+            .transpose()?;
+        let now = current_unix_time();
+        let exp = match optional_param(&params, "exp").filter(|value| !value.is_empty()) {
+            Some(value) => value
+                .parse::<i64>()
+                .map_err(|_| HttpError::new(400, "BadExpiration"))?,
+            None => now.saturating_add(60),
+        };
+        if exp <= now || exp > now.saturating_add(60 * 60) {
+            return Err(HttpError::new(400, "BadExpiration"));
+        }
+        let token = self
+            .sign_account_service_auth(url, &account.repo_name, aud.as_str(), lxm.as_ref(), exp)
+            .await?;
+        json_response(200, &json!({ "token": token })).map_err(HttpError::worker)
+    }
+
+    fn xrpc_reserve_signing_key(&self) -> Result<Response, HttpError> {
+        let key_hex = generate_repo_signing_key_hex()?;
+        let key = RepoSigningKey::from_p256_hex(&key_hex).map_err(HttpError::identity)?;
+        json_response(
+            200,
+            &json!({
+                "signingKey": key.public_key_multibase().map_err(HttpError::identity)?,
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
+    async fn xrpc_create_invite_code(&self, req: &mut Request) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcCreateInviteCodeRequest = req.json().await.map_err(HttpError::worker)?;
+        let for_account = match body.for_account {
+            Some(did) => Did::new(did).map_err(HttpError::bad_request)?,
+            None => self.host_account_did(req)?,
+        };
+        let code = self.create_invite_code(&for_account, &for_account, body.use_count)?;
+        json_response(200, &json!({ "code": code })).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_create_invite_codes(&self, req: &mut Request) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcCreateInviteCodesRequest = req.json().await.map_err(HttpError::worker)?;
+        let code_count = body.code_count.unwrap_or(1).clamp(1, 100);
+        let accounts = if let Some(accounts) = body.for_accounts {
+            accounts
+                .into_iter()
+                .map(Did::new)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(HttpError::bad_request)?
+        } else {
+            vec![self.host_account_did(req)?]
+        };
+        let mut rows = Vec::new();
+        for account in accounts {
+            let mut codes = Vec::new();
+            for _ in 0..code_count {
+                codes.push(self.create_invite_code(&account, &account, body.use_count)?);
+            }
+            rows.push(json!({
+                "account": account.to_string(),
+                "codes": codes,
+            }));
+        }
+        json_response(200, &json!({ "codes": rows })).map_err(HttpError::worker)
+    }
+
+    fn xrpc_get_account_invite_codes(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims(&claims)?;
+        let params = query_pairs(url);
+        let include_used = bool_param(&params, "includeUsed", true)?;
+        let codes = self
+            .store()
+            .list_invite_codes_for_account(&account.did, include_used)
+            .map_err(HttpError::worker)?
+            .iter()
+            .map(invite_code_json)
+            .collect::<Vec<_>>();
+        json_response(200, &json!({ "codes": codes })).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_admin_delete_account(&self, req: &mut Request) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcAdminDidRequest = req.json().await.map_err(HttpError::worker)?;
+        let did = Did::new(body.did).map_err(HttpError::bad_request)?;
+        self.delete_account_as_admin(&did)?;
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_admin_disable_account_invites(
+        &self,
+        req: &mut Request,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcAdminAccountInvitesRequest = req.json().await.map_err(HttpError::worker)?;
+        let did = Did::new(body.account).map_err(HttpError::bad_request)?;
+        self.ensure_account_exists(&did)?;
+        self.store()
+            .set_account_invites_disabled(&did, true, body.note.as_deref())
+            .map_err(HttpError::worker)?;
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_admin_disable_invite_codes(
+        &self,
+        req: &mut Request,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcAdminDisableInviteCodesRequest =
+            req.json().await.map_err(HttpError::worker)?;
+        let accounts = body
+            .accounts
+            .unwrap_or_default()
+            .into_iter()
+            .map(Did::new)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(HttpError::bad_request)?;
+        self.store()
+            .disable_invite_codes(&body.codes.unwrap_or_default(), &accounts)
+            .map_err(HttpError::worker)?;
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_admin_enable_account_invites(
+        &self,
+        req: &mut Request,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcAdminAccountInvitesRequest = req.json().await.map_err(HttpError::worker)?;
+        let did = Did::new(body.account).map_err(HttpError::bad_request)?;
+        self.ensure_account_exists(&did)?;
+        self.store()
+            .set_account_invites_disabled(&did, false, body.note.as_deref())
+            .map_err(HttpError::worker)?;
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    fn xrpc_admin_get_account_info(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let params = query_pairs(url);
+        let did = Did::new(required_param(&params, "did").map_err(HttpError::xrpc)?)
+            .map_err(HttpError::bad_request)?;
+        let account = self.account_by_did(&did)?;
+        let invites = self
+            .store()
+            .list_invite_codes_for_account(&did, true)
+            .map_err(HttpError::worker)?;
+        json_response(200, &account_view_json(&account, Some(&invites))).map_err(HttpError::worker)
+    }
+
+    fn xrpc_admin_get_account_infos(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let params = query_pairs(url);
+        let dids = did_array_param(&params, "dids")?;
+        let accounts = self
+            .store()
+            .list_accounts_by_dids(&dids)
+            .map_err(HttpError::worker)?;
+        let infos = accounts
+            .iter()
+            .map(|account| account_view_json(account, None))
+            .collect::<Vec<_>>();
+        json_response(200, &json!({ "infos": infos })).map_err(HttpError::worker)
+    }
+
+    fn xrpc_admin_get_invite_codes(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let params = query_pairs(url);
+        let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 100, 500)?;
+        let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
+        let (codes, next_cursor) = self
+            .store()
+            .list_invite_codes(limit, cursor.as_deref())
+            .map_err(HttpError::worker)?;
+        let mut body = json!({
+            "codes": codes.iter().map(invite_code_json).collect::<Vec<_>>(),
+        });
+        if let Some(cursor) = next_cursor {
+            body["cursor"] = json!(cursor);
+        }
+        json_response(200, &body).map_err(HttpError::worker)
+    }
+
+    fn xrpc_admin_get_subject_status(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let params = query_pairs(url);
+        let Some(did) = optional_param(&params, "did").filter(|value| !value.is_empty()) else {
+            return Err(HttpError::new(
+                400,
+                "UnsupportedSubject: only account DID subjects are implemented",
+            ));
+        };
+        let did = Did::new(did).map_err(HttpError::bad_request)?;
+        let account = self.account_by_did(&did)?;
+        json_response(200, &subject_status_json(&account)).map_err(HttpError::worker)
+    }
+
+    fn xrpc_admin_search_accounts(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let params = query_pairs(url);
+        let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 50, 100)?;
+        let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
+        let email = optional_param(&params, "email")
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        let (accounts, next_cursor) = self
+            .store()
+            .search_accounts(email.as_deref(), limit, cursor.as_deref())
+            .map_err(HttpError::worker)?;
+        let mut body = json!({
+            "accounts": accounts.iter().map(|account| account_view_json(account, None)).collect::<Vec<_>>(),
+        });
+        if let Some(cursor) = next_cursor {
+            body["cursor"] = json!(cursor);
+        }
+        json_response(200, &body).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_admin_send_email(&self, req: &mut Request) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcAdminSendEmailRequest = req.json().await.map_err(HttpError::worker)?;
+        let recipient = Did::new(body.recipient_did).map_err(HttpError::bad_request)?;
+        let sender = Did::new(body.sender_did).map_err(HttpError::bad_request)?;
+        self.ensure_account_exists(&recipient)?;
+        let _ = (sender, body.content, body.subject, body.comment);
+        json_response(200, &json!({ "sent": false })).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_admin_update_account_email(
+        &self,
+        req: &mut Request,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcAdminUpdateAccountEmailRequest =
+            req.json().await.map_err(HttpError::worker)?;
+        let account = self.account_by_identifier(&body.account)?;
+        let email = normalize_required_email(&body.email)?;
+        self.store()
+            .update_account_email(&account.did, Some(&email), false)
+            .map_err(HttpError::worker)?;
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_admin_update_account_handle(
+        &self,
+        req: &mut Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let mut body: XrpcAdminUpdateAccountHandleRequest =
+            req.json().await.map_err(HttpError::worker)?;
+        body.handle = body.handle.to_ascii_lowercase();
+        validate_handle_syntax(&body.handle).map_err(HttpError::bad_request)?;
+        let request_host = request_host(req)?;
+        if body.handle != request_host
+            && !configured_account_handle_allowed(&self.env, &body.handle)
+        {
+            return Err(HttpError::new(
+                400,
+                format!(
+                    "UnsupportedDomain: `{}` is not the request host `{request_host}` and is not allowed by PDS_ALLOWED_ACCOUNT_HANDLES or PDS_ALLOWED_ACCOUNT_HANDLE_SUFFIXES",
+                    body.handle
+                ),
+            ));
+        }
+        let did = Did::new(body.did).map_err(HttpError::bad_request)?;
+        let mut account = self.account_by_did(&did)?;
+        if account.handle != body.handle {
+            let store = self.store();
+            if let Some(existing) = store
+                .get_account_by_identifier(&body.handle)
+                .map_err(HttpError::worker)?
+            {
+                if existing.did != did {
+                    return Err(HttpError::new(400, "HandleNotAvailable"));
+                }
+            }
+            store
+                .update_account_handle(&did, &body.handle)
+                .map_err(HttpError::worker)?;
+            store
+                .update_repo_handle(&did, &body.handle)
+                .map_err(HttpError::worker)?;
+            self.update_account_repo_identity(url, &account.repo_name, &body.handle)
+                .await?;
+            let event = store
+                .append_identity_event(&did, &body.handle)
+                .map_err(HttpError::worker)?;
+            self.broadcast_repo_event(&event)?;
+            account.handle = body.handle;
+        }
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_admin_update_account_password(
+        &self,
+        req: &mut Request,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcAdminUpdateAccountPasswordRequest =
+            req.json().await.map_err(HttpError::worker)?;
+        let did = Did::new(body.did).map_err(HttpError::bad_request)?;
+        self.ensure_account_exists(&did)?;
+        ensure_password_strength(&body.password)?;
+        let salt = random_bytes::<PASSWORD_SALT_BYTES>()?;
+        let store = self.store();
+        store
+            .update_account_password(&did, &hash_password(&body.password, &salt))
+            .map_err(HttpError::worker)?;
+        store
+            .delete_sessions_for_did(&did)
+            .map_err(HttpError::worker)?;
+        store
+            .delete_app_passwords_for_did(&did)
+            .map_err(HttpError::worker)?;
+        empty_response(200).map_err(HttpError::worker)
+    }
+
+    fn xrpc_admin_update_account_signing_key(&self) -> Result<Response, HttpError> {
+        Err(HttpError::new(
+            501,
+            "NotImplemented: signing key rotation requires private-key migration support",
+        ))
+    }
+
+    async fn xrpc_admin_update_subject_status(
+        &self,
+        req: &mut Request,
+    ) -> Result<Response, HttpError> {
+        require_admin_with_env(&self.env, req)?;
+        let body: XrpcAdminUpdateSubjectStatusRequest =
+            req.json().await.map_err(HttpError::worker)?;
+        let did = did_from_admin_subject(&body.subject)?;
+        self.ensure_account_exists(&did)?;
+        let takedown = body.takedown.as_ref().is_some_and(|status| status.applied);
+        let deactivated = body
+            .deactivated
+            .as_ref()
+            .is_some_and(|status| status.applied);
+        let _status_refs = (
+            body.takedown
+                .as_ref()
+                .and_then(|status| status.ref_value.as_deref()),
+            body.deactivated
+                .as_ref()
+                .and_then(|status| status.ref_value.as_deref()),
+        );
+        let (active, status) = if takedown {
+            (false, Some("takedown"))
+        } else if deactivated {
+            (false, Some("deactivated"))
+        } else {
+            (true, None)
+        };
+        self.set_account_active(&did, active, status)?;
+        let account = self.account_by_did(&did)?;
+        json_response(200, &subject_status_json(&account)).map_err(HttpError::worker)
     }
 
     async fn xrpc_create_app_password(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -2061,6 +2565,121 @@ impl PdsDirectoryObject {
         response.json().await.map_err(HttpError::worker)
     }
 
+    async fn sign_account_service_auth(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+        aud: &str,
+        lxm: Option<&Nsid>,
+        exp: i64,
+    ) -> Result<String, HttpError> {
+        let namespace = self
+            .env
+            .durable_object("REPO_OBJECTS")
+            .map_err(HttpError::worker)?;
+        let id = namespace
+            .id_from_name(repo_name)
+            .map_err(HttpError::worker)?;
+        let stub = id.get_stub().map_err(HttpError::worker)?;
+        let headers = Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(HttpError::worker)?;
+        headers
+            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
+            .map_err(HttpError::worker)?;
+        let mut init = RequestInit::new();
+        let mut body = json!({
+            "aud": aud,
+            "exp": exp,
+        });
+        if let Some(lxm) = lxm {
+            body["lxm"] = json!(lxm.as_str());
+        }
+        let body = to_string(&body).map_err(HttpError::worker)?;
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(JsValue::from_str(&body)));
+        let request = Request::new_with_init(
+            &format!("{}/repos/{}/service-auth", request_origin(url), repo_name),
+            &init,
+        )
+        .map_err(HttpError::worker)?;
+        let mut response = stub
+            .fetch_with_request(request)
+            .await
+            .map_err(HttpError::worker)?;
+        if !(200..=299).contains(&response.status_code()) {
+            let text = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(HttpError::new(
+                response.status_code(),
+                format!("failed to sign service auth token: {text}"),
+            ));
+        }
+        let body: ServiceAuthResponse = response.json().await.map_err(HttpError::worker)?;
+        Ok(body.token)
+    }
+
+    fn create_invite_code(
+        &self,
+        for_account: &Did,
+        created_by: &Did,
+        use_count: i64,
+    ) -> Result<String, HttpError> {
+        if !(1..=100).contains(&use_count) {
+            return Err(HttpError::new(400, "InvalidUseCount"));
+        }
+        let code = format!("gsv-{}", random_urlsafe_token::<INVITE_CODE_BYTES>()?);
+        self.store()
+            .insert_invite_code(&DirectoryInviteCodeInput {
+                code: code.clone(),
+                available: use_count,
+                for_account: for_account.clone(),
+                created_by: created_by.clone(),
+            })
+            .map_err(HttpError::worker)?;
+        Ok(code)
+    }
+
+    fn host_account_did(&self, req: &Request) -> Result<Did, HttpError> {
+        let host = request_host(req)?;
+        Did::new(format!("did:web:{host}")).map_err(HttpError::bad_request)
+    }
+
+    fn account_by_did(&self, did: &Did) -> Result<DirectoryAccountRow, HttpError> {
+        self.store()
+            .get_account_by_did(did)
+            .map_err(HttpError::worker)?
+            .ok_or_else(|| HttpError::new(404, "AccountNotFound"))
+    }
+
+    fn account_by_identifier(&self, identifier: &str) -> Result<DirectoryAccountRow, HttpError> {
+        let identifier = normalize_at_identifier(identifier);
+        self.store()
+            .get_account_by_identifier(&identifier)
+            .map_err(HttpError::worker)?
+            .ok_or_else(|| HttpError::new(404, "AccountNotFound"))
+    }
+
+    fn ensure_account_exists(&self, did: &Did) -> Result<(), HttpError> {
+        self.account_by_did(did).map(|_| ())
+    }
+
+    fn delete_account_as_admin(&self, did: &Did) -> Result<(), HttpError> {
+        let account = self.account_by_did(did)?;
+        let store = self.store();
+        store
+            .delete_sessions_for_did(&account.did)
+            .map_err(HttpError::worker)?;
+        store
+            .delete_app_passwords_for_did(&account.did)
+            .map_err(HttpError::worker)?;
+        store
+            .delete_action_tokens_for_did(&account.did)
+            .map_err(HttpError::worker)?;
+        self.set_account_active(&account.did, false, Some("deleted"))
+    }
+
     fn create_session_for_account(
         &self,
         account: &DirectoryAccountRow,
@@ -2486,6 +3105,7 @@ impl RepoObject {
             (Method::Post, "init") => self.init(req, &repo_name).await,
             (Method::Put, "identity") => self.update_identity(req).await,
             (Method::Post, "directory-sync") => self.sync_directory(req, &repo_name).await,
+            (Method::Post, "service-auth") => self.service_auth(req).await,
             (Method::Post, "lexicons") => self.put_lexicon(req, &repo_name).await,
             (Method::Get, "lexicons") => self.list_lexicons(req).await,
             (Method::Post, "records") => self.create_record(req, &repo_name).await,
@@ -2701,6 +3321,32 @@ impl RepoObject {
             }),
         )
         .map_err(HttpError::worker)
+    }
+
+    async fn service_auth(&self, req: &mut Request) -> Result<Response, HttpError> {
+        self.require_admin(req)?;
+        let body: ServiceAuthRequest = req.json().await.map_err(HttpError::worker)?;
+        let aud = Did::new(body.aud).map_err(HttpError::bad_request)?;
+        let lxm = body
+            .lxm
+            .map(Nsid::new)
+            .transpose()
+            .map_err(HttpError::bad_request)?;
+        if body.exp <= current_unix_time() {
+            return Err(HttpError::new(400, "BadExpiration"));
+        }
+
+        let state = self.repo_state()?;
+        let identity = self.repo_identity()?;
+        let signing_key = identity.signing_key().map_err(HttpError::identity)?;
+        let token = service_auth_jwt(
+            &signing_key,
+            state.did.as_str(),
+            aud.as_str(),
+            lxm.as_ref().map(Nsid::as_str),
+            body.exp,
+        )?;
+        json_response(200, &json!({ "token": token })).map_err(HttpError::worker)
     }
 
     async fn xrpc_describe_repo(&self, url: &worker::Url) -> Result<Response, HttpError> {
@@ -4694,6 +5340,24 @@ struct XrpcRefreshIdentityRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct XrpcCreateInviteCodeRequest {
+    #[serde(rename = "useCount", alias = "use_count")]
+    use_count: i64,
+    #[serde(default, rename = "forAccount", alias = "for_account")]
+    for_account: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcCreateInviteCodesRequest {
+    #[serde(rename = "useCount", alias = "use_count")]
+    use_count: i64,
+    #[serde(default, rename = "codeCount", alias = "code_count")]
+    code_count: Option<i64>,
+    #[serde(default, rename = "forAccounts", alias = "for_accounts")]
+    for_accounts: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct XrpcCreateAppPasswordRequest {
     name: String,
     #[serde(default)]
@@ -4703,6 +5367,86 @@ struct XrpcCreateAppPasswordRequest {
 #[derive(Debug, Deserialize)]
 struct XrpcRevokeAppPasswordRequest {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminDidRequest {
+    did: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminAccountInvitesRequest {
+    account: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminDisableInviteCodesRequest {
+    #[serde(default)]
+    codes: Option<Vec<String>>,
+    #[serde(default)]
+    accounts: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminSendEmailRequest {
+    #[serde(rename = "recipientDid", alias = "recipient_did")]
+    recipient_did: String,
+    content: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(rename = "senderDid", alias = "sender_did")]
+    sender_did: String,
+    #[serde(default)]
+    comment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminUpdateAccountEmailRequest {
+    account: String,
+    email: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminUpdateAccountHandleRequest {
+    did: String,
+    handle: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminUpdateAccountPasswordRequest {
+    did: String,
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminStatusAttrRequest {
+    applied: bool,
+    #[serde(default, rename = "ref")]
+    ref_value: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct XrpcAdminUpdateSubjectStatusRequest {
+    subject: Value,
+    #[serde(default)]
+    takedown: Option<XrpcAdminStatusAttrRequest>,
+    #[serde(default)]
+    deactivated: Option<XrpcAdminStatusAttrRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceAuthRequest {
+    aud: String,
+    exp: i64,
+    #[serde(default)]
+    lxm: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ServiceAuthResponse {
+    token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -6224,6 +6968,48 @@ fn identity_info_response_body(origin: &str, account: &DirectoryAccountRow) -> V
     })
 }
 
+fn did_from_admin_subject(subject: &Value) -> Result<Did, HttpError> {
+    let Some(did) = subject.get("did").and_then(Value::as_str) else {
+        return Err(HttpError::new(
+            400,
+            "UnsupportedSubject: only account DID subjects are implemented",
+        ));
+    };
+    Did::new(did.to_string()).map_err(HttpError::bad_request)
+}
+
+fn service_auth_jwt(
+    signing_key: &RepoSigningKey,
+    iss: &str,
+    aud: &str,
+    lxm: Option<&str>,
+    exp: i64,
+) -> Result<String, HttpError> {
+    let header = json!({
+        "typ": "JWT",
+        "alg": "ES256",
+        "kid": format!("{iss}#atproto"),
+    });
+    let mut payload = json!({
+        "iss": iss,
+        "aud": aud,
+        "exp": exp,
+    });
+    if let Some(lxm) = lxm {
+        payload["lxm"] = json!(lxm);
+    }
+    let header = BASE64_URL_SAFE_NO_PAD.encode(to_vec(&header).map_err(HttpError::worker)?);
+    let payload = BASE64_URL_SAFE_NO_PAD.encode(to_vec(&payload).map_err(HttpError::worker)?);
+    let signing_input = format!("{header}.{payload}");
+    let signature = signing_key
+        .sign_sha256(signing_input.as_bytes())
+        .map_err(HttpError::identity)?;
+    Ok(format!(
+        "{signing_input}.{}",
+        BASE64_URL_SAFE_NO_PAD.encode(signature)
+    ))
+}
+
 fn generate_repo_signing_key_hex() -> Result<String, HttpError> {
     for _ in 0..16 {
         let bytes = random_bytes::<REPO_SIGNING_KEY_BYTES>()?;
@@ -6296,6 +7082,13 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn current_unix_time() -> i64 {
     (worker::Date::now().as_millis() / 1000) as i64
+}
+
+fn current_datetime_string() -> String {
+    js_sys::Date::new_0()
+        .to_iso_string()
+        .as_string()
+        .unwrap_or_else(|| "1970-01-01T00:00:00.000Z".to_string())
 }
 
 fn generated_initial_repo_rev() -> Result<RepoRev, HttpError> {
@@ -6790,10 +7583,90 @@ fn directory_repo_json(row: DirectoryRepoRow) -> Value {
     })
 }
 
+fn invite_code_json(row: &DirectoryInviteCodeRow) -> Value {
+    json!({
+        "code": row.code.clone(),
+        "available": row.available,
+        "disabled": row.disabled,
+        "forAccount": row.for_account.to_string(),
+        "createdBy": row.created_by.to_string(),
+        "createdAt": row.created_at.clone(),
+        "uses": [],
+    })
+}
+
+fn account_view_json(
+    account: &DirectoryAccountRow,
+    invites: Option<&[DirectoryInviteCodeRow]>,
+) -> Value {
+    let mut body = json!({
+        "did": account.did.to_string(),
+        "handle": account.handle.clone(),
+        "email": account.email.clone(),
+        "relatedRecords": [],
+        "indexedAt": account.created_at.clone(),
+        "invitesDisabled": account.invites_disabled,
+    });
+    if account.email_confirmed {
+        body["emailConfirmedAt"] = json!(account.created_at.clone());
+    }
+    if let Some(note) = account.invite_note.as_deref() {
+        body["inviteNote"] = json!(note);
+    }
+    if !account.active {
+        body["deactivatedAt"] = json!(account.created_at.clone());
+    }
+    if let Some(invites) = invites {
+        body["invites"] = json!(invites.iter().map(invite_code_json).collect::<Vec<_>>());
+    }
+    body
+}
+
+fn subject_status_json(account: &DirectoryAccountRow) -> Value {
+    let mut body = json!({
+        "subject": {
+            "$type": "com.atproto.admin.defs#repoRef",
+            "did": account.did.to_string(),
+        },
+        "takedown": {
+            "applied": account.status.as_deref() == Some("takedown"),
+        },
+        "deactivated": {
+            "applied": !account.active && account.status.as_deref() != Some("takedown"),
+        },
+    });
+    if let Some(status) = account
+        .status
+        .as_deref()
+        .filter(|status| !status.is_empty())
+    {
+        body["status"] = json!(status);
+    }
+    body
+}
+
 fn query_pairs(url: &worker::Url) -> Vec<(String, String)> {
     url.query_pairs()
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
+}
+
+fn did_array_param(query: &[(String, String)], param: &'static str) -> Result<Vec<Did>, HttpError> {
+    let values = query
+        .iter()
+        .filter(|(key, _)| key == param)
+        .flat_map(|(_, value)| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| Did::new(value.to_string()).map_err(HttpError::bad_request))
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.is_empty() {
+        return Err(HttpError::new(
+            400,
+            format!("missing required param `{param}`"),
+        ));
+    }
+    Ok(values)
 }
 
 fn encode_query_component(value: &str) -> String {
@@ -6829,6 +7702,21 @@ fn parse_xrpc_limit(value: Option<&str>, default: usize, max: usize) -> Result<u
         ));
     }
     Ok(limit)
+}
+
+fn bool_param(query: &[(String, String)], param: &str, default: bool) -> Result<bool, HttpError> {
+    let Some(value) = optional_param(query, param) else {
+        return Ok(default);
+    };
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err(HttpError::new(
+            400,
+            format!("invalid boolean query parameter `{param}`"),
+        )),
+    }
 }
 
 fn request_origin(url: &worker::Url) -> String {
@@ -7267,11 +8155,14 @@ mod tests {
             handle: "gsv-pds.example.com".to_string(),
             email: None,
             email_confirmed: false,
+            invites_disabled: false,
+            invite_note: None,
             password_hash: "hash".to_string(),
             repo_name: "gsv-pds.example.com".to_string(),
             public_key_multibase: "zPublicKey".to_string(),
             active: true,
             status: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
         };
 
         let body = identity_info_response_body("https://gsv-pds.example.com", &account);
@@ -7283,6 +8174,75 @@ mod tests {
             body["didDoc"]["service"][0]["serviceEndpoint"],
             "https://gsv-pds.example.com"
         );
+    }
+
+    #[test]
+    fn builds_admin_account_and_subject_views() {
+        let account = DirectoryAccountRow {
+            did: Did::new("did:web:gsv-pds.example.com").unwrap(),
+            handle: "gsv-pds.example.com".to_string(),
+            email: Some("hank@example.com".to_string()),
+            email_confirmed: true,
+            invites_disabled: true,
+            invite_note: Some("maintenance".to_string()),
+            password_hash: "hash".to_string(),
+            repo_name: "gsv-pds.example.com".to_string(),
+            public_key_multibase: "zPublicKey".to_string(),
+            active: false,
+            status: Some("takedown".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let invite = DirectoryInviteCodeRow {
+            code: "gsv-test".to_string(),
+            available: 2,
+            disabled: false,
+            for_account: account.did.clone(),
+            created_by: account.did.clone(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+
+        let view = account_view_json(&account, Some(&[invite]));
+        assert_eq!(view["did"], account.did.to_string());
+        assert_eq!(view["invitesDisabled"], true);
+        assert_eq!(view["inviteNote"], "maintenance");
+        assert_eq!(view["invites"][0]["code"], "gsv-test");
+
+        let status = subject_status_json(&account);
+        assert_eq!(status["subject"]["did"], account.did.to_string());
+        assert_eq!(status["takedown"]["applied"], true);
+        assert_eq!(status["deactivated"]["applied"], false);
+    }
+
+    #[test]
+    fn builds_verifiable_service_auth_jwt() {
+        let key = RepoSigningKey::from_p256_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let token = service_auth_jwt(
+            &key,
+            "did:web:gsv-pds.example.com",
+            "did:web:service.example.com",
+            Some("com.atproto.repo.getRecord"),
+            1_776_722_400,
+        )
+        .unwrap();
+        let parts = token.split('.').collect::<Vec<_>>();
+        assert_eq!(parts.len(), 3);
+
+        let payload = BASE64_URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+        let payload: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(payload["iss"], "did:web:gsv-pds.example.com");
+        assert_eq!(payload["aud"], "did:web:service.example.com");
+        assert_eq!(payload["lxm"], "com.atproto.repo.getRecord");
+
+        let signature = BASE64_URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        crate::identity::verify_p256_signature(
+            &key.verifying_key().unwrap(),
+            format!("{}.{}", parts[0], parts[1]).as_bytes(),
+            &signature,
+        )
+        .unwrap();
     }
 
     #[test]
