@@ -7,7 +7,7 @@ use base64::engine::general_purpose::{
 };
 use base64::Engine as _;
 use futures_util::StreamExt;
-use serde::de::Deserializer;
+use serde::de::{DeserializeOwned, Deserializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{from_str, json, to_string, to_vec, Value};
 use sha2::{Digest, Sha256};
@@ -114,6 +114,14 @@ const ACTION_ACCOUNT_DELETE: &str = "account_delete";
 const ACTION_PASSWORD_RESET: &str = "password_reset";
 const ACTION_EMAIL_CONFIRMATION: &str = "email_confirmation";
 const ACTION_EMAIL_UPDATE: &str = "email_update";
+const INTERNAL_REPO_CONTROL_ROOT: &str = "_pds_internal";
+const INTERNAL_REPO_CONTROL_REPOS: &str = "repos";
+const INTERNAL_REPO_CONTROL_STATUS: &str = "status";
+const INTERNAL_REPO_CONTROL_INIT: &str = "init";
+const INTERNAL_REPO_CONTROL_IDENTITY: &str = "identity";
+const INTERNAL_REPO_CONTROL_SIGNING_KEY: &str = "signing-key";
+const INTERNAL_REPO_CONTROL_SERVICE_AUTH: &str = "service-auth";
+const INTERNAL_REPO_CONTROL_LEXICONS: &str = "lexicons";
 
 #[event(fetch)]
 async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<Response> {
@@ -858,7 +866,7 @@ impl PdsDirectoryObject {
         }
         let signing_key_hex = generate_repo_signing_key_hex()?;
         let init = match self
-            .initialize_account_repo(
+            .internal_initialize_account_repo(
                 url,
                 &repo_name,
                 did.as_str(),
@@ -1214,7 +1222,9 @@ impl PdsDirectoryObject {
     ) -> Result<Response, HttpError> {
         let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
         let account = self.account_for_claims_allow_inactive(&claims)?;
-        let status = self.account_repo_status(url, &account.repo_name).await?;
+        let status = self
+            .internal_account_repo_status(url, &account.repo_name)
+            .await?;
         json_response(
             200,
             &json!({
@@ -1257,7 +1267,13 @@ impl PdsDirectoryObject {
             return Err(HttpError::new(400, "BadExpiration"));
         }
         let token = self
-            .sign_account_service_auth(url, &account.repo_name, aud.as_str(), lxm.as_ref(), exp)
+            .internal_sign_account_service_auth(
+                url,
+                &account.repo_name,
+                aud.as_str(),
+                lxm.as_ref(),
+                exp,
+            )
             .await?;
         json_response(200, &json!({ "token": token })).map_err(HttpError::worker)
     }
@@ -1566,7 +1582,7 @@ impl PdsDirectoryObject {
             store
                 .update_repo_handle(&did, &body.handle)
                 .map_err(HttpError::worker)?;
-            self.update_account_repo_identity(url, &account.repo_name, &body.handle)
+            self.internal_update_account_repo_identity(url, &account.repo_name, &body.handle)
                 .await?;
             let event = store
                 .append_identity_event(&did, &body.handle)
@@ -1612,7 +1628,7 @@ impl PdsDirectoryObject {
         let did = Did::new(body.did).map_err(HttpError::bad_request)?;
         let account = self.account_by_did(&did)?;
         let reserved = self.take_reserved_signing_key(&did, &body.signing_key)?;
-        self.update_account_repo_signing_key(
+        self.internal_update_account_repo_signing_key(
             url,
             &account.repo_name,
             &reserved.signing_key_p256_hex,
@@ -1742,7 +1758,7 @@ impl PdsDirectoryObject {
             store
                 .update_repo_handle(&account.did, &body.handle)
                 .map_err(HttpError::worker)?;
-            self.update_account_repo_identity(url, &account.repo_name, &body.handle)
+            self.internal_update_account_repo_identity(url, &account.repo_name, &body.handle)
                 .await?;
             let event = store
                 .append_identity_event(&account.did, &body.handle)
@@ -2530,14 +2546,14 @@ impl PdsDirectoryObject {
         Ok(())
     }
 
-    async fn initialize_account_repo(
+    async fn fetch_internal_repo_control(
         &self,
         url: &worker::Url,
         repo_name: &str,
-        did: &str,
-        handle: &str,
-        signing_key_p256_hex: &str,
-    ) -> Result<InternalInitRepoResponse, HttpError> {
+        method: Method,
+        action: &str,
+        body: Option<&Value>,
+    ) -> Result<Response, HttpError> {
         let namespace = self
             .env
             .durable_object("REPO_OBJECTS")
@@ -2546,6 +2562,75 @@ impl PdsDirectoryObject {
             .id_from_name(repo_name)
             .map_err(HttpError::worker)?;
         let stub = id.get_stub().map_err(HttpError::worker)?;
+        let headers = Headers::new();
+        headers
+            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
+            .map_err(HttpError::worker)?;
+        if body.is_some() {
+            headers
+                .set("content-type", "application/json")
+                .map_err(HttpError::worker)?;
+        }
+        let mut init = RequestInit::new();
+        init.with_method(method).with_headers(headers);
+        if let Some(body) = body {
+            init.with_body(Some(JsValue::from_str(
+                &to_string(body).map_err(HttpError::worker)?,
+            )));
+        }
+        let request =
+            Request::new_with_init(&internal_repo_control_url(url, repo_name, action), &init)
+                .map_err(HttpError::worker)?;
+        stub.fetch_with_request(request)
+            .await
+            .map_err(HttpError::worker)
+    }
+
+    async fn internal_repo_control_response(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+        method: Method,
+        action: &str,
+        body: Option<&Value>,
+        failure_prefix: &str,
+    ) -> Result<Response, HttpError> {
+        let mut response = self
+            .fetch_internal_repo_control(url, repo_name, method, action, body)
+            .await?;
+        if !(200..=299).contains(&response.status_code()) {
+            let text = response.text().await.unwrap_or_else(|_| String::new());
+            return Err(HttpError::new(
+                response.status_code(),
+                format!("{failure_prefix}: {text}"),
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn internal_repo_control_json<T: DeserializeOwned>(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+        method: Method,
+        action: &str,
+        body: Option<&Value>,
+        failure_prefix: &str,
+    ) -> Result<T, HttpError> {
+        let mut response = self
+            .internal_repo_control_response(url, repo_name, method, action, body, failure_prefix)
+            .await?;
+        response.json().await.map_err(HttpError::worker)
+    }
+
+    async fn internal_initialize_account_repo(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+        did: &str,
+        handle: &str,
+        signing_key_p256_hex: &str,
+    ) -> Result<InternalInitRepoResponse, HttpError> {
         let body = json!({
             "did": did,
             "handle": handle,
@@ -2554,34 +2639,15 @@ impl PdsDirectoryObject {
             "reset": false,
             "notifyDirectory": false,
         });
-        let headers = Headers::new();
-        headers
-            .set("content-type", "application/json")
-            .map_err(HttpError::worker)?;
-        headers
-            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
-            .map_err(HttpError::worker)?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Post)
-            .with_headers(headers)
-            .with_body(Some(JsValue::from_str(&body.to_string())));
-        let request = Request::new_with_init(
-            &format!("{}/repos/{}/init", request_origin(url), repo_name),
-            &init,
+        self.internal_repo_control_json(
+            url,
+            repo_name,
+            Method::Post,
+            INTERNAL_REPO_CONTROL_INIT,
+            Some(&body),
+            "failed to initialize repo",
         )
-        .map_err(HttpError::worker)?;
-        let mut response = stub
-            .fetch_with_request(request)
-            .await
-            .map_err(HttpError::worker)?;
-        if !(200..=299).contains(&response.status_code()) {
-            let text = response.text().await.unwrap_or_else(|_| String::new());
-            return Err(HttpError::new(
-                response.status_code(),
-                format!("failed to initialize repo: {text}"),
-            ));
-        }
-        response.json().await.map_err(HttpError::worker)
+        .await
     }
 
     async fn recover_initialized_account_repo(
@@ -2591,140 +2657,65 @@ impl PdsDirectoryObject {
         expected_did: &str,
         expected_handle: &str,
     ) -> Result<InternalInitRepoResponse, HttpError> {
-        let status = self.account_repo_status(url, repo_name).await?;
+        let status = self.internal_account_repo_status(url, repo_name).await?;
         init_response_from_repo_status(status, expected_did, expected_handle)
     }
 
-    async fn update_account_repo_identity(
+    async fn internal_update_account_repo_identity(
         &self,
         url: &worker::Url,
         repo_name: &str,
         handle: &str,
     ) -> Result<(), HttpError> {
-        let namespace = self
-            .env
-            .durable_object("REPO_OBJECTS")
-            .map_err(HttpError::worker)?;
-        let id = namespace
-            .id_from_name(repo_name)
-            .map_err(HttpError::worker)?;
-        let stub = id.get_stub().map_err(HttpError::worker)?;
-        let headers = Headers::new();
-        headers
-            .set("content-type", "application/json")
-            .map_err(HttpError::worker)?;
-        headers
-            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
-            .map_err(HttpError::worker)?;
-        let mut init = RequestInit::new();
-        let body = to_string(&json!({ "handle": handle })).map_err(HttpError::worker)?;
-        init.with_method(Method::Put)
-            .with_headers(headers)
-            .with_body(Some(JsValue::from_str(&body)));
-        let request = Request::new_with_init(
-            &format!("{}/repos/{}/identity", request_origin(url), repo_name),
-            &init,
+        let body = json!({ "handle": handle });
+        self.internal_repo_control_response(
+            url,
+            repo_name,
+            Method::Put,
+            INTERNAL_REPO_CONTROL_IDENTITY,
+            Some(&body),
+            "failed to update repo identity",
         )
-        .map_err(HttpError::worker)?;
-        let mut response = stub
-            .fetch_with_request(request)
-            .await
-            .map_err(HttpError::worker)?;
-        if !(200..=299).contains(&response.status_code()) {
-            let text = response.text().await.unwrap_or_else(|_| String::new());
-            return Err(HttpError::new(
-                response.status_code(),
-                format!("failed to update repo identity: {text}"),
-            ));
-        }
+        .await?;
         Ok(())
     }
 
-    async fn update_account_repo_signing_key(
+    async fn internal_update_account_repo_signing_key(
         &self,
         url: &worker::Url,
         repo_name: &str,
         signing_key_p256_hex: &str,
     ) -> Result<(), HttpError> {
-        let namespace = self
-            .env
-            .durable_object("REPO_OBJECTS")
-            .map_err(HttpError::worker)?;
-        let id = namespace
-            .id_from_name(repo_name)
-            .map_err(HttpError::worker)?;
-        let stub = id.get_stub().map_err(HttpError::worker)?;
-        let headers = Headers::new();
-        headers
-            .set("content-type", "application/json")
-            .map_err(HttpError::worker)?;
-        headers
-            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
-            .map_err(HttpError::worker)?;
-        let body = to_string(&json!({ "signingKeyP256Hex": signing_key_p256_hex }))
-            .map_err(HttpError::worker)?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Put)
-            .with_headers(headers)
-            .with_body(Some(JsValue::from_str(&body)));
-        let request = Request::new_with_init(
-            &format!("{}/repos/{}/signing-key", request_origin(url), repo_name),
-            &init,
+        let body = json!({ "signingKeyP256Hex": signing_key_p256_hex });
+        self.internal_repo_control_response(
+            url,
+            repo_name,
+            Method::Put,
+            INTERNAL_REPO_CONTROL_SIGNING_KEY,
+            Some(&body),
+            "failed to update repo signing key",
         )
-        .map_err(HttpError::worker)?;
-        let mut response = stub
-            .fetch_with_request(request)
-            .await
-            .map_err(HttpError::worker)?;
-        if !(200..=299).contains(&response.status_code()) {
-            let text = response.text().await.unwrap_or_else(|_| String::new());
-            return Err(HttpError::new(
-                response.status_code(),
-                format!("failed to update repo signing key: {text}"),
-            ));
-        }
+        .await?;
         Ok(())
     }
 
-    async fn account_repo_status(
+    async fn internal_account_repo_status(
         &self,
         url: &worker::Url,
         repo_name: &str,
     ) -> Result<InternalRepoStatusResponse, HttpError> {
-        let namespace = self
-            .env
-            .durable_object("REPO_OBJECTS")
-            .map_err(HttpError::worker)?;
-        let id = namespace
-            .id_from_name(repo_name)
-            .map_err(HttpError::worker)?;
-        let stub = id.get_stub().map_err(HttpError::worker)?;
-        let headers = Headers::new();
-        headers
-            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
-            .map_err(HttpError::worker)?;
-        let mut init = RequestInit::new();
-        init.with_method(Method::Get).with_headers(headers);
-        let request = Request::new_with_init(
-            &format!("{}/repos/{}/status", request_origin(url), repo_name),
-            &init,
+        self.internal_repo_control_json(
+            url,
+            repo_name,
+            Method::Get,
+            INTERNAL_REPO_CONTROL_STATUS,
+            None,
+            "failed to read initialized repo status",
         )
-        .map_err(HttpError::worker)?;
-        let mut response = stub
-            .fetch_with_request(request)
-            .await
-            .map_err(HttpError::worker)?;
-        if !(200..=299).contains(&response.status_code()) {
-            let text = response.text().await.unwrap_or_else(|_| String::new());
-            return Err(HttpError::new(
-                response.status_code(),
-                format!("failed to read initialized repo status: {text}"),
-            ));
-        }
-        response.json().await.map_err(HttpError::worker)
+        .await
     }
 
-    async fn sign_account_service_auth(
+    async fn internal_sign_account_service_auth(
         &self,
         url: &worker::Url,
         repo_name: &str,
@@ -2732,22 +2723,6 @@ impl PdsDirectoryObject {
         lxm: Option<&Nsid>,
         exp: i64,
     ) -> Result<String, HttpError> {
-        let namespace = self
-            .env
-            .durable_object("REPO_OBJECTS")
-            .map_err(HttpError::worker)?;
-        let id = namespace
-            .id_from_name(repo_name)
-            .map_err(HttpError::worker)?;
-        let stub = id.get_stub().map_err(HttpError::worker)?;
-        let headers = Headers::new();
-        headers
-            .set("content-type", "application/json")
-            .map_err(HttpError::worker)?;
-        headers
-            .set("x-pds-admin-token", &admin_token_from_env(&self.env)?)
-            .map_err(HttpError::worker)?;
-        let mut init = RequestInit::new();
         let mut body = json!({
             "aud": aud,
             "exp": exp,
@@ -2755,27 +2730,16 @@ impl PdsDirectoryObject {
         if let Some(lxm) = lxm {
             body["lxm"] = json!(lxm.as_str());
         }
-        let body = to_string(&body).map_err(HttpError::worker)?;
-        init.with_method(Method::Post)
-            .with_headers(headers)
-            .with_body(Some(JsValue::from_str(&body)));
-        let request = Request::new_with_init(
-            &format!("{}/repos/{}/service-auth", request_origin(url), repo_name),
-            &init,
-        )
-        .map_err(HttpError::worker)?;
-        let mut response = stub
-            .fetch_with_request(request)
-            .await
-            .map_err(HttpError::worker)?;
-        if !(200..=299).contains(&response.status_code()) {
-            let text = response.text().await.unwrap_or_else(|_| String::new());
-            return Err(HttpError::new(
-                response.status_code(),
-                format!("failed to sign service auth token: {text}"),
-            ));
-        }
-        let body: ServiceAuthResponse = response.json().await.map_err(HttpError::worker)?;
+        let body: ServiceAuthResponse = self
+            .internal_repo_control_json(
+                url,
+                repo_name,
+                Method::Post,
+                INTERNAL_REPO_CONTROL_SERVICE_AUTH,
+                Some(&body),
+                "failed to sign service auth token",
+            )
+            .await?;
         Ok(body.token)
     }
 
@@ -3354,19 +3318,24 @@ impl RepoObject {
             return self.handle_xrpc(req, parts[1], &url).await;
         }
 
-        let repo_name = parts.get(1).copied().unwrap_or("").to_string();
-        let action = parts.get(2).copied().unwrap_or("");
-
-        match (req.method(), action) {
-            (Method::Get, "status") => self.status(),
-            (Method::Post, "init") => self.init(req, &repo_name).await,
-            (Method::Put, "identity") => self.update_identity(req).await,
-            (Method::Put, "signing-key") => self.update_signing_key(req).await,
-            (Method::Post, "service-auth") => self.service_auth(req).await,
-            (Method::Post, "lexicons") => self.put_lexicon(req, &repo_name).await,
-            (Method::Get, "lexicons") => self.list_lexicons(req).await,
-            _ => Err(HttpError::new(404, "not found")),
+        if let Some((repo_name, action)) = internal_repo_control_parts(&parts) {
+            return match (req.method(), action) {
+                (Method::Get, INTERNAL_REPO_CONTROL_STATUS) => self.status(),
+                (Method::Post, INTERNAL_REPO_CONTROL_INIT) => self.init(req, repo_name).await,
+                (Method::Put, INTERNAL_REPO_CONTROL_IDENTITY) => self.update_identity(req).await,
+                (Method::Put, INTERNAL_REPO_CONTROL_SIGNING_KEY) => {
+                    self.update_signing_key(req).await
+                }
+                (Method::Post, INTERNAL_REPO_CONTROL_SERVICE_AUTH) => self.service_auth(req).await,
+                (Method::Post, INTERNAL_REPO_CONTROL_LEXICONS) => {
+                    self.put_lexicon(req, repo_name).await
+                }
+                (Method::Get, INTERNAL_REPO_CONTROL_LEXICONS) => self.list_lexicons(req).await,
+                _ => Err(HttpError::new(404, "not found")),
+            };
         }
+
+        Err(HttpError::new(404, "not found"))
     }
 
     fn store(&self) -> SqlRepoStore {
@@ -7733,6 +7702,30 @@ fn encode_query_component(value: &str) -> String {
     ::url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
+fn internal_repo_control_url(url: &worker::Url, repo_name: &str, action: &str) -> String {
+    format!(
+        "{}/{}/{}/{}/{}",
+        request_origin(url),
+        INTERNAL_REPO_CONTROL_ROOT,
+        INTERNAL_REPO_CONTROL_REPOS,
+        encode_query_component(repo_name),
+        action,
+    )
+}
+
+fn internal_repo_control_parts<'a>(parts: &'a [&'a str]) -> Option<(&'a str, &'a str)> {
+    if parts.len() == 4
+        && parts[0] == INTERNAL_REPO_CONTROL_ROOT
+        && parts[1] == INTERNAL_REPO_CONTROL_REPOS
+        && !parts[2].is_empty()
+        && !parts[3].is_empty()
+    {
+        Some((parts[2], parts[3]))
+    } else {
+        None
+    }
+}
+
 fn request_host(req: &Request) -> Result<String, HttpError> {
     req.url()
         .map_err(HttpError::worker)?
@@ -8321,6 +8314,26 @@ mod tests {
         assert_eq!(
             normalize_at_identifier("did:web:MiXeD.example.com"),
             "did:web:MiXeD.example.com"
+        );
+    }
+
+    #[test]
+    fn parses_only_internal_repo_control_paths() {
+        assert_eq!(
+            internal_repo_control_parts(&["_pds_internal", "repos", "alice", "init"]),
+            Some(("alice", "init"))
+        );
+        assert_eq!(
+            internal_repo_control_parts(&["repos", "alice", "init"]),
+            None
+        );
+        assert_eq!(
+            internal_repo_control_parts(&["_pds_internal", "repos", "alice"]),
+            None
+        );
+        assert_eq!(
+            internal_repo_control_parts(&["_pds_internal", "repos", "alice", "init", "extra"]),
+            None
         );
     }
 

@@ -42,6 +42,14 @@ await expectJsonStatus(
   404,
 );
 
+await expectJsonStatus(
+  "internal repo control route is not public",
+  "GET",
+  `/_pds_internal/repos/${encodeURIComponent(repo)}/status`,
+  null,
+  404,
+);
+
 const session = await ensureAccountSession();
 const writeAuthHeaders = { authorization: `Bearer ${session.accessJwt}` };
 
