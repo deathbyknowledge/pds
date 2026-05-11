@@ -1,5 +1,5 @@
 use std::error::Error;
-use std::io::{self, Read};
+use std::io::{self, Cursor, Read};
 
 use base64::{
     engine::general_purpose::{
@@ -35,6 +35,7 @@ type AnyError = Box<dyn Error + Send + Sync + 'static>;
 enum FixtureRequest {
     Generate(GenerateRequest),
     Finalize(FinalizeRequest),
+    DecodeSubscribeReposFrames(DecodeSubscribeReposFramesRequest),
 }
 
 #[derive(Debug, Deserialize)]
@@ -59,6 +60,12 @@ struct FinalizeRequest {
     reserved_signing_key: String,
     server_rotation_key_p256_hex: String,
     exp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DecodeSubscribeReposFramesRequest {
+    frames_base64: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -91,6 +98,73 @@ struct FinalizedFixture {
     server_rotation_did_key: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct SubscribeReposHeader {
+    op: i64,
+    #[serde(rename = "t")]
+    kind: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribeReposCommitFrame {
+    seq: i64,
+    rebase: bool,
+    #[serde(rename = "tooBig")]
+    too_big: bool,
+    repo: String,
+    commit: pds::cid::Cid,
+    rev: String,
+    since: Option<String>,
+    #[serde(default, rename = "prevData")]
+    prev_data: Option<pds::cid::Cid>,
+    #[serde(with = "serde_bytes")]
+    blocks: Vec<u8>,
+    ops: Vec<SubscribeReposOpFrame>,
+    blobs: Vec<pds::cid::Cid>,
+    time: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribeReposSyncFrame {
+    seq: i64,
+    did: String,
+    #[serde(with = "serde_bytes")]
+    blocks: Vec<u8>,
+    rev: String,
+    time: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribeReposIdentityFrame {
+    seq: i64,
+    did: String,
+    handle: Option<String>,
+    time: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribeReposAccountFrame {
+    seq: i64,
+    did: String,
+    active: bool,
+    status: Option<String>,
+    time: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribeReposInfoFrame {
+    name: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribeReposOpFrame {
+    action: String,
+    path: String,
+    cid: Option<pds::cid::Cid>,
+    prev: Option<pds::cid::Cid>,
+}
+
 fn main() -> Result<(), AnyError> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -98,6 +172,9 @@ fn main() -> Result<(), AnyError> {
     let output = match request {
         FixtureRequest::Generate(request) => serde_json::to_value(generate_fixture(request)?)?,
         FixtureRequest::Finalize(request) => serde_json::to_value(finalize_fixture(request)?)?,
+        FixtureRequest::DecodeSubscribeReposFrames(request) => {
+            serde_json::to_value(decode_subscribe_repos_frames(request)?)?
+        }
     };
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
@@ -207,6 +284,104 @@ fn finalize_fixture(request: FinalizeRequest) -> Result<FinalizedFixture, AnyErr
         plc_op,
         service_auth,
         server_rotation_did_key,
+    })
+}
+
+fn decode_subscribe_repos_frames(
+    request: DecodeSubscribeReposFramesRequest,
+) -> Result<Vec<Value>, AnyError> {
+    request
+        .frames_base64
+        .iter()
+        .map(|frame| decode_subscribe_repos_frame(frame))
+        .collect()
+}
+
+fn decode_subscribe_repos_frame(frame_base64: &str) -> Result<Value, AnyError> {
+    let frame = BASE64_STANDARD.decode(frame_base64)?;
+    let mut cursor = Cursor::new(frame);
+    let header: SubscribeReposHeader = serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
+    if header.op != 1 {
+        return Err(format!("unsupported subscribeRepos op {}", header.op).into());
+    }
+    let body = match header.kind.as_str() {
+        "#commit" => {
+            let body: SubscribeReposCommitFrame =
+                serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
+            json!({
+                "kind": header.kind,
+                "seq": body.seq,
+                "rebase": body.rebase,
+                "tooBig": body.too_big,
+                "repo": body.repo,
+                "commit": body.commit.to_string(),
+                "rev": body.rev,
+                "since": body.since,
+                "prevData": body.prev_data.map(|cid| cid.to_string()),
+                "blocksBase64": BASE64_STANDARD.encode(body.blocks),
+                "ops": body.ops.into_iter().map(subscribe_repo_op_json).collect::<Vec<_>>(),
+                "blobs": body.blobs.into_iter().map(|cid| cid.to_string()).collect::<Vec<_>>(),
+                "time": body.time,
+            })
+        }
+        "#sync" => {
+            let body: SubscribeReposSyncFrame =
+                serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
+            json!({
+                "kind": header.kind,
+                "seq": body.seq,
+                "did": body.did,
+                "blocksBase64": BASE64_STANDARD.encode(body.blocks),
+                "rev": body.rev,
+                "time": body.time,
+            })
+        }
+        "#identity" => {
+            let body: SubscribeReposIdentityFrame =
+                serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
+            json!({
+                "kind": header.kind,
+                "seq": body.seq,
+                "did": body.did,
+                "handle": body.handle,
+                "time": body.time,
+            })
+        }
+        "#account" => {
+            let body: SubscribeReposAccountFrame =
+                serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
+            json!({
+                "kind": header.kind,
+                "seq": body.seq,
+                "did": body.did,
+                "active": body.active,
+                "status": body.status,
+                "time": body.time,
+            })
+        }
+        "#info" => {
+            let body: SubscribeReposInfoFrame =
+                serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
+            json!({
+                "kind": header.kind,
+                "name": body.name,
+                "message": body.message,
+            })
+        }
+        other => return Err(format!("unsupported subscribeRepos frame kind `{other}`").into()),
+    };
+    if cursor.position() != cursor.get_ref().len() as u64 {
+        return Err("subscribeRepos frame had trailing bytes".into());
+    }
+    Ok(body)
+}
+
+fn subscribe_repo_op_json(op: SubscribeReposOpFrame) -> Value {
+    json!({
+        "action": op.action,
+        "path": op.path,
+        "cid": op.cid.map(|cid| cid.to_string()),
+        "prev": op.prev.map(|cid| cid.to_string()),
     })
 }
 
@@ -365,5 +540,34 @@ mod tests {
             &did_doc,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn decodes_subscribe_repos_account_frames() {
+        let mut frame = pds::cbor::encode_dag_cbor(&json!({
+            "op": 1,
+            "t": "#account",
+        }))
+        .unwrap();
+        frame.extend(
+            pds::cbor::encode_dag_cbor(&json!({
+                "seq": 42,
+                "did": "did:plc:abc123",
+                "active": false,
+                "status": "deactivated",
+                "time": "2026-05-11T00:00:00.000Z",
+            }))
+            .unwrap(),
+        );
+        let decoded = decode_subscribe_repos_frames(DecodeSubscribeReposFramesRequest {
+            frames_base64: vec![BASE64_STANDARD.encode(frame)],
+        })
+        .unwrap();
+
+        assert_eq!(decoded[0]["kind"], "#account");
+        assert_eq!(decoded[0]["seq"], 42);
+        assert_eq!(decoded[0]["did"], "did:plc:abc123");
+        assert_eq!(decoded[0]["active"], false);
+        assert_eq!(decoded[0]["status"], "deactivated");
     }
 }
