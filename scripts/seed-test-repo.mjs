@@ -50,6 +50,14 @@ await expectJsonStatus(
   404,
 );
 
+await expectJsonStatus(
+  "internal directory control route is not public",
+  "GET",
+  "/_pds_internal/directory/status",
+  null,
+  404,
+);
+
 const session = await ensureAccountSession();
 const writeAuthHeaders = { authorization: `Bearer ${session.accessJwt}` };
 

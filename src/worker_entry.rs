@@ -122,6 +122,11 @@ const INTERNAL_REPO_CONTROL_IDENTITY: &str = "identity";
 const INTERNAL_REPO_CONTROL_SIGNING_KEY: &str = "signing-key";
 const INTERNAL_REPO_CONTROL_SERVICE_AUTH: &str = "service-auth";
 const INTERNAL_REPO_CONTROL_LEXICONS: &str = "lexicons";
+const INTERNAL_DIRECTORY_CONTROL_DIRECTORY: &str = "directory";
+const INTERNAL_DIRECTORY_CONTROL_STATUS: &str = "status";
+const INTERNAL_DIRECTORY_CONTROL_ACCOUNTS: &str = "accounts";
+const INTERNAL_DIRECTORY_CONTROL_REPOS: &str = "repos";
+const INTERNAL_DIRECTORY_CONTROL_UPSERT: &str = "upsert";
 
 #[event(fetch)]
 async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<Response> {
@@ -696,19 +701,32 @@ impl PdsDirectoryObject {
             };
         }
 
-        match (req.method(), url.path()) {
-            (Method::Get, "/directory/status") => self.status(),
-            (Method::Get, "/directory/accounts/status") => self.account_status(&url),
-            (Method::Post, "/directory/repos/upsert") => self.upsert_repo(req).await,
-            _ => Err(HttpError::new(404, "not found")),
+        let parts = url
+            .path()
+            .trim_start_matches('/')
+            .split('/')
+            .collect::<Vec<_>>();
+        if let Some(action) = internal_directory_control_action(&parts) {
+            return match (req.method(), action) {
+                (Method::Get, InternalDirectoryControlAction::Status) => self.internal_status(),
+                (Method::Get, InternalDirectoryControlAction::AccountStatus) => {
+                    self.internal_account_status(&url)
+                }
+                (Method::Post, InternalDirectoryControlAction::RepoUpsert) => {
+                    self.internal_upsert_repo(req).await
+                }
+                _ => Err(HttpError::new(404, "not found")),
+            };
         }
+
+        Err(HttpError::new(404, "not found"))
     }
 
     fn store(&self) -> SqlDirectoryStore {
         SqlDirectoryStore::new(self.sql.clone())
     }
 
-    fn status(&self) -> Result<Response, HttpError> {
+    fn internal_status(&self) -> Result<Response, HttpError> {
         let store = self.store();
         json_response(
             200,
@@ -721,7 +739,7 @@ impl PdsDirectoryObject {
         .map_err(HttpError::worker)
     }
 
-    fn account_status(&self, url: &worker::Url) -> Result<Response, HttpError> {
+    fn internal_account_status(&self, url: &worker::Url) -> Result<Response, HttpError> {
         let params = query_pairs(url);
         let did = Did::new(required_param(&params, "did").map_err(HttpError::xrpc)?)
             .map_err(HttpError::bad_request)?;
@@ -2460,7 +2478,7 @@ impl PdsDirectoryObject {
         Response::from_websocket(pair.client).map_err(HttpError::worker)
     }
 
-    async fn upsert_repo(&self, req: &mut Request) -> Result<Response, HttpError> {
+    async fn internal_upsert_repo(&self, req: &mut Request) -> Result<Response, HttpError> {
         let body: DirectoryUpsertRepoRequest = req.json().await.map_err(HttpError::worker)?;
         let records = body.records.map(validate_repo_paths).transpose()?;
         let row = DirectoryRepoRow {
@@ -3801,12 +3819,9 @@ impl RepoObject {
         let Some(host) = url.host_str() else {
             return Ok(None);
         };
-        let path = format!(
-            "/directory/accounts/status?did={}",
-            encode_query_component(did)
-        );
+        let path = internal_directory_account_status_path(did);
         let mut response =
-            fetch_directory_request(&self.env, host, Method::Get, &path, None).await?;
+            fetch_internal_directory_request(&self.env, host, Method::Get, &path, None).await?;
         let status = response.status_code();
         if status == 404 {
             return Ok(None);
@@ -4830,12 +4845,10 @@ impl RepoObject {
         request_host: &str,
         did: &Did,
     ) -> Result<(), HttpError> {
-        let path = format!(
-            "/directory/accounts/status?did={}",
-            encode_query_component(did.as_str())
-        );
+        let path = internal_directory_account_status_path(did.as_str());
         let mut response =
-            fetch_directory_request(&self.env, request_host, Method::Get, &path, None).await?;
+            fetch_internal_directory_request(&self.env, request_host, Method::Get, &path, None)
+                .await?;
         let status = response.status_code();
         if status == 404 {
             return Err(HttpError::new(403, "AccountTakedown"));
@@ -4894,14 +4907,10 @@ impl RepoObject {
                 "blobs": event.blobs,
             });
         }
-        let mut response = fetch_directory_json(
-            &self.env,
-            request_host,
-            Method::Post,
-            "/directory/repos/upsert",
-            &body,
-        )
-        .await?;
+        let path = internal_directory_repo_upsert_path();
+        let mut response =
+            fetch_internal_directory_json(&self.env, request_host, Method::Post, &path, &body)
+                .await?;
         let status = response.status_code();
         if !(200..300).contains(&status) {
             let message = response
@@ -7500,17 +7509,17 @@ fn did_document(
     })
 }
 
-async fn fetch_directory_json(
+async fn fetch_internal_directory_json(
     env: &Env,
     directory_name: &str,
     method: Method,
     path: &str,
     body: &Value,
 ) -> Result<Response, HttpError> {
-    fetch_directory_request(env, directory_name, method, path, Some(body)).await
+    fetch_internal_directory_request(env, directory_name, method, path, Some(body)).await
 }
 
-async fn fetch_directory_request(
+async fn fetch_internal_directory_request(
     env: &Env,
     directory_name: &str,
     method: Method,
@@ -7723,6 +7732,63 @@ fn internal_repo_control_parts<'a>(parts: &'a [&'a str]) -> Option<(&'a str, &'a
         Some((parts[2], parts[3]))
     } else {
         None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InternalDirectoryControlAction {
+    Status,
+    AccountStatus,
+    RepoUpsert,
+}
+
+fn internal_directory_account_status_path(did: &str) -> String {
+    format!(
+        "/{}/{}/{}/{}?did={}",
+        INTERNAL_REPO_CONTROL_ROOT,
+        INTERNAL_DIRECTORY_CONTROL_DIRECTORY,
+        INTERNAL_DIRECTORY_CONTROL_ACCOUNTS,
+        INTERNAL_DIRECTORY_CONTROL_STATUS,
+        encode_query_component(did),
+    )
+}
+
+fn internal_directory_repo_upsert_path() -> String {
+    format!(
+        "/{}/{}/{}/{}",
+        INTERNAL_REPO_CONTROL_ROOT,
+        INTERNAL_DIRECTORY_CONTROL_DIRECTORY,
+        INTERNAL_DIRECTORY_CONTROL_REPOS,
+        INTERNAL_DIRECTORY_CONTROL_UPSERT,
+    )
+}
+
+fn internal_directory_control_action(parts: &[&str]) -> Option<InternalDirectoryControlAction> {
+    match parts {
+        [root, directory, status]
+            if *root == INTERNAL_REPO_CONTROL_ROOT
+                && *directory == INTERNAL_DIRECTORY_CONTROL_DIRECTORY
+                && *status == INTERNAL_DIRECTORY_CONTROL_STATUS =>
+        {
+            Some(InternalDirectoryControlAction::Status)
+        }
+        [root, directory, accounts, status]
+            if *root == INTERNAL_REPO_CONTROL_ROOT
+                && *directory == INTERNAL_DIRECTORY_CONTROL_DIRECTORY
+                && *accounts == INTERNAL_DIRECTORY_CONTROL_ACCOUNTS
+                && *status == INTERNAL_DIRECTORY_CONTROL_STATUS =>
+        {
+            Some(InternalDirectoryControlAction::AccountStatus)
+        }
+        [root, directory, repos, upsert]
+            if *root == INTERNAL_REPO_CONTROL_ROOT
+                && *directory == INTERNAL_DIRECTORY_CONTROL_DIRECTORY
+                && *repos == INTERNAL_DIRECTORY_CONTROL_REPOS
+                && *upsert == INTERNAL_DIRECTORY_CONTROL_UPSERT =>
+        {
+            Some(InternalDirectoryControlAction::RepoUpsert)
+        }
+        _ => None,
     }
 }
 
@@ -8333,6 +8399,35 @@ mod tests {
         );
         assert_eq!(
             internal_repo_control_parts(&["_pds_internal", "repos", "alice", "init", "extra"]),
+            None
+        );
+    }
+
+    #[test]
+    fn parses_only_internal_directory_control_paths() {
+        assert_eq!(
+            internal_directory_control_action(&["_pds_internal", "directory", "status"]),
+            Some(InternalDirectoryControlAction::Status)
+        );
+        assert_eq!(
+            internal_directory_control_action(&[
+                "_pds_internal",
+                "directory",
+                "accounts",
+                "status"
+            ]),
+            Some(InternalDirectoryControlAction::AccountStatus)
+        );
+        assert_eq!(
+            internal_directory_control_action(&["_pds_internal", "directory", "repos", "upsert"]),
+            Some(InternalDirectoryControlAction::RepoUpsert)
+        );
+        assert_eq!(
+            internal_directory_control_action(&["directory", "status"]),
+            None
+        );
+        assert_eq!(
+            internal_directory_control_action(&["_pds_internal", "directory", "repos"]),
             None
         );
     }
