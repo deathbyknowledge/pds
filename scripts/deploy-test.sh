@@ -56,8 +56,9 @@ if [[ -n "${PDS_BASE_URL:-}" ]]; then
     npm run smoke:firehose
     npm run smoke:firehose:cursor
     npm run smoke:firehose:oversize
+    npm run smoke:client
   else
-    echo "Skipping smoke:plc-account, smoke:migration, smoke:firehose, smoke:firehose:cursor, and smoke:firehose:oversize; set PDS_PLC_ROTATION_KEY_P256_HEX to enable did:plc account creation, migration, and firehose tests."
+    echo "Skipping smoke:plc-account, smoke:migration, smoke:firehose, smoke:firehose:cursor, smoke:firehose:oversize, and smoke:client; set PDS_PLC_ROTATION_KEY_P256_HEX to enable did:plc account creation, migration, firehose, and official client tests."
   fi
   if [[ -n "${OAUTH_CONFIDENTIAL_CLIENT_ID:-}" && -n "${OAUTH_CONFIDENTIAL_CLIENT_PRIVATE_KEY_JWK:-}" ]]; then
     npm run smoke:oauth:confidential
@@ -86,7 +87,8 @@ Optional did:plc account smoke:
   npm run smoke:migration && \
   npm run smoke:firehose && \
   npm run smoke:firehose:cursor && \
-  npm run smoke:firehose:oversize
+  npm run smoke:firehose:oversize && \
+  npm run smoke:client
 
 Optional confidential OAuth smoke:
   OAUTH_CONFIDENTIAL_CLIENT_ID=https://client.example.com/client.json \

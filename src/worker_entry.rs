@@ -4107,14 +4107,13 @@ impl RepoObject {
             }));
         }
 
-        json_response(
-            200,
-            &json!({
-                "records": records,
-                "cursor": next_cursor,
-            }),
-        )
-        .map_err(HttpError::worker)
+        let mut body = json!({
+            "records": records,
+        });
+        if let Some(cursor) = next_cursor {
+            body["cursor"] = json!(cursor);
+        }
+        json_response(200, &body).map_err(HttpError::worker)
     }
 
     fn xrpc_get_latest_commit(&self, url: &worker::Url) -> Result<Response, HttpError> {
