@@ -52,8 +52,9 @@ if [[ -n "${PDS_BASE_URL:-}" ]]; then
   npm run smoke:lexicon
   if [[ -n "${PDS_PLC_ROTATION_KEY_P256_HEX:-}" ]]; then
     npm run smoke:plc-account
+    npm run smoke:migration
   else
-    echo "Skipping smoke:plc-account; set PDS_PLC_ROTATION_KEY_P256_HEX to enable did:plc account creation."
+    echo "Skipping smoke:plc-account and smoke:migration; set PDS_PLC_ROTATION_KEY_P256_HEX to enable did:plc account creation and migration."
   fi
   if [[ -n "${OAUTH_CONFIDENTIAL_CLIENT_ID:-}" && -n "${OAUTH_CONFIDENTIAL_CLIENT_PRIVATE_KEY_JWK:-}" ]]; then
     npm run smoke:oauth:confidential
@@ -78,7 +79,8 @@ Run remote smokes with:
 
 Optional did:plc account smoke:
   PDS_PLC_ROTATION_KEY_P256_HEX=<server-rotation-p256-hex> \
-  npm run smoke:plc-account
+  npm run smoke:plc-account && \
+  npm run smoke:migration
 
 Optional confidential OAuth smoke:
   OAUTH_CONFIDENTIAL_CLIENT_ID=https://client.example.com/client.json \

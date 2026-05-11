@@ -12,6 +12,7 @@ base64 = "0.22"
 bs58 = "0.5.1"
 cid = "0.11.3"
 futures-core = "0.3"
+futures-executor = "0.3"
 futures-util = "0.3"
 hmac = "0.12"
 k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "alloc"] }
@@ -25,9 +26,6 @@ sha2 = "0.10"
 slices-lexicon = "0.3.1"
 thiserror = "2"
 url = "2"
-
-[dev-dependencies]
-futures-executor = "0.3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"
