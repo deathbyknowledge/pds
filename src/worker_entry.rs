@@ -63,6 +63,7 @@ use crate::repo_import::{
     diff_imported_records, extract_record_blob_refs as extract_import_record_blob_refs,
     validate_imported_repo, ImportRepoOp, RepoImportError,
 };
+use crate::service_auth::verify_service_auth_jwt;
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
 use crate::xrpc::{
     at_uri, optional_param, parse_get_blocks_params, parse_list_records_params,
@@ -586,7 +587,9 @@ impl PdsDirectoryObject {
                 (Method::Post, SERVER_DEACTIVATE_ACCOUNT) => {
                     self.xrpc_deactivate_account(req).await
                 }
-                (Method::Post, SERVER_ACTIVATE_ACCOUNT) => self.xrpc_activate_account(req, &url),
+                (Method::Post, SERVER_ACTIVATE_ACCOUNT) => {
+                    self.xrpc_activate_account(req, &url).await
+                }
                 (Method::Get, SERVER_CHECK_ACCOUNT_STATUS) => {
                     self.xrpc_check_account_status(req, &url).await
                 }
@@ -876,8 +879,34 @@ impl PdsDirectoryObject {
             .map(|key| key.trim().to_string())
             .filter(|key| !key.is_empty());
         let request_host = request_host(req)?;
-        if body.plc_op.is_some() {
-            return Err(HttpError::new(400, "Unsupported input: `plcOp`"));
+        let request_origin = request_origin(url);
+        let importing_existing_identity = body
+            .did
+            .as_deref()
+            .is_some_and(is_supported_account_import_did);
+        if body.plc_op.is_some()
+            && !body
+                .did
+                .as_deref()
+                .is_some_and(|did| did.starts_with("did:plc:"))
+        {
+            return Err(HttpError::new(
+                400,
+                "InvalidDid: `plcOp` requires an existing did:plc account",
+            ));
+        }
+        if importing_existing_identity {
+            let did = body.did.as_deref().unwrap_or_default();
+            let service_did = self.host_account_did(req)?;
+            verify_create_account_service_auth(
+                req,
+                did,
+                service_did.as_str(),
+                SERVER_CREATE_ACCOUNT,
+                current_unix_time(),
+                &self.env,
+            )
+            .await?;
         }
         let password = body
             .password
@@ -898,30 +927,78 @@ impl PdsDirectoryObject {
         if let Some(invite_code) = body.invite_code.as_deref() {
             self.ensure_invite_code_usable(&store, invite_code)?;
         }
+        if importing_existing_identity {
+            let did = Did::new(body.did.as_deref().unwrap_or_default().to_string())
+                .map_err(HttpError::bad_request)?;
+            if store
+                .get_account_by_did(&did)
+                .map_err(HttpError::worker)?
+                .is_some()
+            {
+                return Err(HttpError::new(400, "DidNotAvailable"));
+            }
+        }
 
-        let signing_key_hex = generate_repo_signing_key_hex()?;
-        let signing_key =
-            RepoSigningKey::from_p256_hex(&signing_key_hex).map_err(HttpError::identity)?;
-        let public_key_multibase = signing_key
-            .public_key_multibase()
-            .map_err(HttpError::identity)?;
+        let reserved_signing_key = if importing_existing_identity {
+            match (body.did.as_deref(), body.plc_op.as_ref()) {
+                (Some(did), Some(operation)) => {
+                    let did = Did::new(did.to_string()).map_err(HttpError::bad_request)?;
+                    let signing_key = plc_operation_atproto_signing_key(operation)?;
+                    Some(self.lookup_reserved_signing_key(&did, &signing_key)?)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (signing_key_hex, public_key_multibase) =
+            if let Some(reserved) = reserved_signing_key.as_ref() {
+                (
+                    reserved.signing_key_p256_hex.clone(),
+                    reserved.public_key_multibase.clone(),
+                )
+            } else {
+                let signing_key_hex = generate_repo_signing_key_hex()?;
+                let signing_key =
+                    RepoSigningKey::from_p256_hex(&signing_key_hex).map_err(HttpError::identity)?;
+                let public_key_multibase = signing_key
+                    .public_key_multibase()
+                    .map_err(HttpError::identity)?;
+                (signing_key_hex, public_key_multibase)
+            };
+        RepoSigningKey::from_p256_hex(&signing_key_hex).map_err(HttpError::identity)?;
         let signing_did_key = did_key_from_public_key_multibase(&public_key_multibase)?;
-        let identity = account_identity_for_creation(
-            &self.env,
-            &body.handle,
-            body.did.as_deref(),
-            body.recovery_key.as_deref(),
-            &request_host,
-            &request_origin(url),
-            &signing_did_key,
-        )
-        .await?;
+        let identity = if importing_existing_identity {
+            account_identity_for_import(
+                &self.env,
+                &body.handle,
+                body.did.as_deref().unwrap_or_default(),
+                body.recovery_key.as_deref(),
+                body.plc_op.clone(),
+                &request_origin,
+                &public_key_multibase,
+            )?
+        } else {
+            account_identity_for_creation(
+                &self.env,
+                &body.handle,
+                body.did.as_deref(),
+                body.recovery_key.as_deref(),
+                &request_host,
+                &request_origin,
+                &signing_did_key,
+            )
+            .await?
+        };
         if store
             .get_account_by_did(&identity.did)
             .map_err(HttpError::worker)?
             .is_some()
         {
             return Err(HttpError::new(400, "DidNotAvailable"));
+        }
+        if let Some(reserved) = reserved_signing_key.as_ref() {
+            self.consume_reserved_signing_key(&identity.did, &reserved.signing_key)?;
         }
         let init = match self
             .internal_initialize_account_repo(
@@ -957,7 +1034,7 @@ impl PdsDirectoryObject {
             validate_plc_account_did_document(
                 &body.handle,
                 identity.did.as_str(),
-                &request_origin(url),
+                &request_origin,
                 &public_key_multibase,
                 &self.env,
             )
@@ -977,8 +1054,8 @@ impl PdsDirectoryObject {
             password_hash: hash_password(password, &salt),
             repo_name: identity.repo_name.clone(),
             public_key_multibase: init.public_key_multibase.clone(),
-            active: true,
-            status: None,
+            active: !identity.deactivated,
+            status: identity.deactivated.then(|| "deactivated".to_string()),
             created_at: current_datetime_string(),
         };
         store.insert_account(&account).map_err(HttpError::worker)?;
@@ -988,17 +1065,26 @@ impl PdsDirectoryObject {
             repo_name: identity.repo_name,
             head: parse_cid(&init.latest_commit).map_err(HttpError::bad_request)?,
             rev: RepoRev::new(init.latest_rev).map_err(HttpError::bad_request)?,
-            active: true,
+            active: !identity.deactivated,
         };
         store.upsert_repo(&repo).map_err(HttpError::worker)?;
-        let identity_event = store
-            .append_identity_event(&identity.did, &body.handle)
-            .map_err(HttpError::worker)?;
-        self.broadcast_repo_event(&identity_event)?;
-        let account_event = store
-            .append_account_event(&identity.did, true, None)
-            .map_err(HttpError::worker)?;
-        self.broadcast_repo_event(&account_event)?;
+        if !identity.deactivated || identity.plc_operation.is_some() {
+            let identity_event = store
+                .append_identity_event(&identity.did, &body.handle)
+                .map_err(HttpError::worker)?;
+            self.broadcast_repo_event(&identity_event)?;
+        }
+        if !identity.deactivated {
+            let account_event = store
+                .append_account_event(&identity.did, true, None)
+                .map_err(HttpError::worker)?;
+            self.broadcast_repo_event(&account_event)?;
+        } else if identity.plc_operation.is_some() {
+            let account_event = store
+                .append_account_event(&identity.did, false, Some("deactivated"))
+                .map_err(HttpError::worker)?;
+            self.broadcast_repo_event(&account_event)?;
+        }
         if let Some(invite_code) = body.invite_code.as_deref() {
             self.consume_invite_code(&store, invite_code, &identity.did)?;
         }
@@ -1030,9 +1116,7 @@ impl PdsDirectoryObject {
         if !self.verify_account_or_app_password(&account, &body.password)? {
             return Err(HttpError::new(401, "invalid identifier or password"));
         }
-        if !account.active {
-            return Err(HttpError::new(403, "AccountTakedown"));
-        }
+        ensure_account_authentication_allowed(&account)?;
 
         let session = self.create_session_for_account(&account)?;
         self.store()
@@ -1044,7 +1128,7 @@ impl PdsDirectoryObject {
 
     fn xrpc_get_session(&self, req: &Request, url: &worker::Url) -> Result<Response, HttpError> {
         let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
-        let account = self.account_for_claims(&claims)?;
+        let account = self.account_for_claims_allow_deactivated(&claims)?;
         json_response(200, &session_response(url, &account, None)).map_err(HttpError::worker)
     }
 
@@ -1064,7 +1148,7 @@ impl PdsDirectoryObject {
         if !session.active || session.refresh_jti != claims.jti {
             return Err(HttpError::new(401, "InvalidToken"));
         }
-        let account = self.account_for_claims(&claims)?;
+        let account = self.account_for_claims_allow_deactivated(&claims)?;
         let refreshed = self.create_session_for_account(&account)?;
         self.store()
             .rotate_session_refresh(&session.session_id, &refreshed.row.refresh_jti)
@@ -1276,7 +1360,7 @@ impl PdsDirectoryObject {
         empty_response(200).map_err(HttpError::worker)
     }
 
-    fn xrpc_activate_account(
+    async fn xrpc_activate_account(
         &self,
         req: &Request,
         url: &worker::Url,
@@ -1285,6 +1369,28 @@ impl PdsDirectoryObject {
         let account = self.account_for_claims_allow_inactive(&claims)?;
         if account.status.as_deref() == Some("deleted") {
             return Err(HttpError::new(403, "AccountDeleted"));
+        }
+        if !account.active && is_identity_did(account.did.as_str()) {
+            let status = self
+                .internal_account_repo_status(url, &account.repo_name)
+                .await?;
+            let public_key_multibase = status
+                .public_key_multibase
+                .as_deref()
+                .unwrap_or(account.public_key_multibase.as_str());
+            validate_hosted_account_did_document(
+                &account.handle,
+                account.did.as_str(),
+                &request_origin(url),
+                public_key_multibase,
+                &self.env,
+            )
+            .await?;
+            if public_key_multibase != account.public_key_multibase {
+                self.store()
+                    .update_account_public_key(&account.did, public_key_multibase)
+                    .map_err(HttpError::worker)?;
+            }
         }
         self.set_account_active(&account.did, true, None)?;
         let account = self
@@ -3063,6 +3169,16 @@ impl PdsDirectoryObject {
         did: &Did,
         signing_key: &str,
     ) -> Result<DirectoryReservedSigningKeyRow, HttpError> {
+        let reserved = self.lookup_reserved_signing_key(did, signing_key)?;
+        self.consume_reserved_signing_key(did, &reserved.signing_key)?;
+        Ok(reserved)
+    }
+
+    fn lookup_reserved_signing_key(
+        &self,
+        did: &Did,
+        signing_key: &str,
+    ) -> Result<DirectoryReservedSigningKeyRow, HttpError> {
         let signing_key = normalize_did_key(signing_key)?;
         let reserved = self
             .store()
@@ -3083,10 +3199,15 @@ impl PdsDirectoryObject {
         if public_key_multibase != reserved.public_key_multibase {
             return Err(HttpError::new(400, "InvalidSigningKey"));
         }
+        Ok(reserved)
+    }
+
+    fn consume_reserved_signing_key(&self, did: &Did, signing_key: &str) -> Result<(), HttpError> {
+        let signing_key = normalize_did_key(signing_key)?;
         self.store()
             .consume_reserved_signing_key(&signing_key, did)
             .map_err(HttpError::worker)?;
-        Ok(reserved)
+        Ok(())
     }
 
     fn create_session_for_account(
@@ -3251,6 +3372,15 @@ impl PdsDirectoryObject {
         if !account.active {
             return Err(HttpError::new(403, "AccountTakedown"));
         }
+        Ok(account)
+    }
+
+    fn account_for_claims_allow_deactivated(
+        &self,
+        claims: &crate::auth::TokenClaims,
+    ) -> Result<DirectoryAccountRow, HttpError> {
+        let account = self.account_for_claims_allow_inactive(claims)?;
+        ensure_account_authentication_allowed(&account)?;
         Ok(account)
     }
 
@@ -4063,7 +4193,7 @@ impl RepoObject {
         let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
         let state = self.repo_state()?;
         ensure_repo_identifier(&state, &self.repo_identity()?, &repo)?;
-        self.require_repo_write_auth(req, &state.did).await?;
+        self.require_repo_maintenance_auth(req, &state.did).await?;
         let (refs, next_cursor) = self
             .store()
             .list_missing_blob_refs(limit, cursor.as_deref())
@@ -4228,6 +4358,7 @@ impl RepoObject {
                 repo_name,
                 &identity,
                 &state,
+                true,
                 None,
                 Some(&event),
             )
@@ -4347,6 +4478,7 @@ impl RepoObject {
             &identity.handle,
             &identity,
             &state,
+            true,
             None,
             Some(&event),
         )
@@ -4421,6 +4553,7 @@ impl RepoObject {
             &identity.handle,
             &identity,
             &state,
+            true,
             None,
             Some(&event),
         )
@@ -4488,6 +4621,7 @@ impl RepoObject {
             &identity.handle,
             &identity,
             &state,
+            true,
             None,
             Some(&event),
         )
@@ -4643,6 +4777,7 @@ impl RepoObject {
             &identity.handle,
             &identity,
             &state,
+            true,
             None,
             Some(&event),
         )
@@ -4655,7 +4790,8 @@ impl RepoObject {
     async fn xrpc_import_repo(&self, req: &mut Request) -> Result<Response, HttpError> {
         let request_host = request_host(req)?;
         let (previous_state, identity, mut existing_repo) = self.open_repo_with_identity()?;
-        self.require_repo_write_auth(req, &previous_state.did)
+        let account_status = self
+            .require_repo_maintenance_auth(req, &previous_state.did)
             .await?;
         ensure_import_repo_content_type(req)?;
         let content_length = request_content_length(req)?
@@ -4721,13 +4857,15 @@ impl RepoObject {
             .await?;
         self.persist_commit_event(&store, &state, &event)
             .map_err(HttpError::worker)?;
+        let event = account_status.active.then_some(&event);
         self.notify_directory(
             &request_host,
             &identity.handle,
             &identity,
             &state,
+            account_status.active,
             Some(&record_paths),
-            Some(&event),
+            event,
         )
         .await?;
 
@@ -4736,7 +4874,7 @@ impl RepoObject {
 
     async fn xrpc_upload_blob(&self, req: &mut Request) -> Result<Response, HttpError> {
         let state = self.repo_state()?;
-        self.require_repo_write_auth(req, &state.did).await?;
+        self.require_repo_maintenance_auth(req, &state.did).await?;
         self.purge_expired_unreferenced_blobs(&self.store(), current_unix_time())
             .await?;
         let mime_type = req
@@ -4853,46 +4991,70 @@ impl RepoObject {
     }
 
     async fn require_repo_write_auth(&self, req: &Request, did: &Did) -> Result<(), HttpError> {
-        if is_admin_authorized(&self.env, req)? {
-            return Ok(());
-        }
-        let presented = authorization_token(req)?;
-        let claims = verify_token(
-            &token_secret_from_env(&self.env)?,
-            &presented.token,
-            ACCESS_SCOPE,
-            current_unix_time(),
-        )
-        .map_err(HttpError::auth)?;
-        if let Some(jkt) = claims.dpop_jkt.as_deref() {
-            if presented.scheme != AuthScheme::Dpop {
-                return Err(HttpError::new(
-                    401,
-                    "DPoP-bound token requires DPoP authorization",
-                ));
-            }
-            verify_request_dpop(
-                req,
-                Some(jkt),
-                claims.dpop_nonce.as_deref(),
-                Some(&presented.token),
+        self.require_repo_auth(req, did, false).await.map(|_| ())
+    }
+
+    async fn require_repo_maintenance_auth(
+        &self,
+        req: &Request,
+        did: &Did,
+    ) -> Result<InternalAccountStatusResponse, HttpError> {
+        self.require_repo_auth(req, did, true).await
+    }
+
+    async fn require_repo_auth(
+        &self,
+        req: &Request,
+        did: &Did,
+        allow_deactivated: bool,
+    ) -> Result<InternalAccountStatusResponse, HttpError> {
+        let admin_authorized = is_admin_authorized(&self.env, req)?;
+        if !admin_authorized {
+            let presented = authorization_token(req)?;
+            let claims = verify_token(
+                &token_secret_from_env(&self.env)?,
+                &presented.token,
+                ACCESS_SCOPE,
+                current_unix_time(),
             )
-            .map_err(|error| HttpError::new(401, error.to_string()))?;
-        }
-        if claims.sub != did.as_str() {
-            return Err(HttpError::new(403, "token does not match repo DID"));
+            .map_err(HttpError::auth)?;
+            if let Some(jkt) = claims.dpop_jkt.as_deref() {
+                if presented.scheme != AuthScheme::Dpop {
+                    return Err(HttpError::new(
+                        401,
+                        "DPoP-bound token requires DPoP authorization",
+                    ));
+                }
+                verify_request_dpop(
+                    req,
+                    Some(jkt),
+                    claims.dpop_nonce.as_deref(),
+                    Some(&presented.token),
+                )
+                .map_err(|error| HttpError::new(401, error.to_string()))?;
+            }
+            if claims.sub != did.as_str() {
+                return Err(HttpError::new(403, "token does not match repo DID"));
+            }
         }
 
         let request_host = request_host(req)?;
-        self.ensure_directory_account_active(&request_host, did)
-            .await
+        let account_status = self.directory_account_status(&request_host, did).await?;
+        if account_status.active
+            || (allow_deactivated && account_status.status.as_deref() == Some("deactivated"))
+            || admin_authorized
+        {
+            Ok(account_status)
+        } else {
+            Err(HttpError::new(403, "AccountTakedown"))
+        }
     }
 
-    async fn ensure_directory_account_active(
+    async fn directory_account_status(
         &self,
         request_host: &str,
         did: &Did,
-    ) -> Result<(), HttpError> {
+    ) -> Result<InternalAccountStatusResponse, HttpError> {
         let path = internal_directory_account_status_path(did.as_str());
         let mut response =
             fetch_internal_directory_request(&self.env, request_host, Method::Get, &path, None)
@@ -4915,11 +5077,7 @@ impl RepoObject {
             .json::<InternalAccountStatusResponse>()
             .await
             .map_err(HttpError::worker)?;
-        if account_status.active {
-            Ok(())
-        } else {
-            Err(HttpError::new(403, "AccountTakedown"))
-        }
+        Ok(account_status)
     }
 
     async fn notify_directory(
@@ -4928,6 +5086,7 @@ impl RepoObject {
         repo_name: &str,
         identity: &RepoIdentityRow,
         state: &RepoStateRow,
+        active: bool,
         records: Option<&[RepoPath]>,
         event: Option<&DirectoryCommitEventPayload>,
     ) -> Result<(), HttpError> {
@@ -4937,7 +5096,7 @@ impl RepoObject {
             "repoName": repo_name,
             "head": state.latest_commit.to_string(),
             "rev": state.latest_rev.to_string(),
-            "active": true,
+            "active": active,
         });
         if let Some(records) = records {
             body["records"] = json!(records
@@ -6330,6 +6489,16 @@ fn ensure_import_repo_size_limit(byte_len: u64) -> Result<(), HttpError> {
     }
 }
 
+fn ensure_account_authentication_allowed(account: &DirectoryAccountRow) -> Result<(), HttpError> {
+    if account.active || account.status.as_deref() == Some("deactivated") {
+        Ok(())
+    } else if account.status.as_deref() == Some("deleted") {
+        Err(HttpError::new(403, "AccountDeleted"))
+    } else {
+        Err(HttpError::new(403, "AccountTakedown"))
+    }
+}
+
 fn ensure_blob_size_limit(byte_len: u64) -> Result<(), HttpError> {
     if byte_len > MAX_BLOB_BYTES as u64 {
         Err(HttpError::new(
@@ -6568,6 +6737,14 @@ async fn fetch_did_document(did: &str) -> Result<Value, HttpError> {
     let doc = fetch_json_url(&url).await?;
     ensure_did_document_id(&doc, did).map_err(HttpError::bad_request)?;
     Ok(doc)
+}
+
+async fn fetch_did_document_with_env(did: &str, env: &Env) -> Result<Value, HttpError> {
+    if did.starts_with("did:plc:") {
+        fetch_plc_did_document(did, env).await
+    } else {
+        fetch_did_document(did).await
+    }
 }
 
 async fn fetch_plc_did_document(did: &str, env: &Env) -> Result<Value, HttpError> {
@@ -6875,6 +7052,42 @@ async fn validate_plc_account_did_document(
     Ok(())
 }
 
+async fn validate_hosted_account_did_document(
+    handle: &str,
+    did: &str,
+    origin: &str,
+    public_key_multibase: &str,
+    env: &Env,
+) -> Result<(), HttpError> {
+    let doc = fetch_did_document_with_env(did, env).await?;
+    if !did_document_claims_handle(&doc, handle) {
+        return Err(HttpError::new(
+            400,
+            format!("HandleMismatch: DID document `{did}` does not claim at://{handle}"),
+        ));
+    }
+    if did_document_pds_endpoint(&doc).as_deref() != Some(origin.trim_end_matches('/')) {
+        return Err(HttpError::new(
+            400,
+            format!("InvalidDidDocument: DID document `{did}` does not point at this PDS"),
+        ));
+    }
+    let expected_signing_key = did_key_from_public_key_multibase(public_key_multibase)?;
+    if !did_document_has_verification_method(&doc, "atproto", &expected_signing_key) {
+        return Err(HttpError::new(
+            400,
+            format!(
+                "InvalidDidDocument: DID document `{did}` does not publish the repo signing key"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn is_identity_did(did: &str) -> bool {
+    did.starts_with("did:plc:") || did.starts_with("did:web:")
+}
+
 async fn account_identity_for_creation(
     env: &Env,
     handle: &str,
@@ -6915,6 +7128,7 @@ async fn account_identity_for_creation(
                 did,
                 validate_did_document: false,
                 plc_operation: Some(created.operation),
+                deactivated: false,
             });
         }
         let did = Did::new(format!("did:web:{handle}")).map_err(HttpError::bad_request)?;
@@ -6924,6 +7138,7 @@ async fn account_identity_for_creation(
             did,
             validate_did_document: true,
             plc_operation: None,
+            deactivated: false,
         });
     };
 
@@ -6949,7 +7164,62 @@ async fn account_identity_for_creation(
         repo_name,
         validate_did_document: false,
         plc_operation: None,
+        deactivated: false,
     })
+}
+
+fn account_identity_for_import(
+    env: &Env,
+    handle: &str,
+    requested_did: &str,
+    requested_recovery_key: Option<&str>,
+    plc_operation: Option<Value>,
+    pds_origin: &str,
+    public_key_multibase: &str,
+) -> Result<AccountCreationIdentity, HttpError> {
+    validate_handle_syntax(handle).map_err(HttpError::bad_request)?;
+    if requested_recovery_key.is_some() {
+        return Err(HttpError::new(
+            400,
+            "Unsupported input: `recoveryKey` is only supported for locally-created did:plc accounts",
+        ));
+    }
+    let did = Did::new(requested_did.to_string()).map_err(HttpError::bad_request)?;
+    if !is_supported_account_import_did(did.as_str()) {
+        return Err(HttpError::new(
+            400,
+            "UnsupportedDid: imported accounts require did:plc or did:web",
+        ));
+    }
+    if let Some(operation) = plc_operation.as_ref() {
+        ensure_plc_did(&did)?;
+        let Some(server_rotation_key) = plc_rotation_did_key_from_env(env)? else {
+            return Err(HttpError::new(501, "PLC rotation key is not configured"));
+        };
+        validate_submitted_plc_operation(
+            operation,
+            pds_origin,
+            handle,
+            public_key_multibase,
+            &server_rotation_key,
+        )
+        .map_err(HttpError::plc)?;
+    }
+    let repo_name = repo_object_name_from_identifier(did.as_str());
+    if repo_name.is_empty() {
+        return Err(HttpError::new(400, "InvalidDid"));
+    }
+    Ok(AccountCreationIdentity {
+        did,
+        repo_name,
+        validate_did_document: false,
+        plc_operation,
+        deactivated: true,
+    })
+}
+
+fn is_supported_account_import_did(did: &str) -> bool {
+    did.starts_with("did:plc:") || did.starts_with("did:web:")
 }
 
 struct AccountCreationIdentity {
@@ -6957,6 +7227,7 @@ struct AccountCreationIdentity {
     repo_name: String,
     validate_did_document: bool,
     plc_operation: Option<Value>,
+    deactivated: bool,
 }
 
 fn validate_local_account_handle_for_creation(
@@ -7214,6 +7485,30 @@ async fn submit_plc_operation(did: &str, operation: &Value, env: &Env) -> Result
     Ok(())
 }
 
+async fn verify_create_account_service_auth(
+    req: &Request,
+    expected_iss: &str,
+    expected_aud: &str,
+    expected_lxm: &str,
+    now: i64,
+    env: &Env,
+) -> Result<(), HttpError> {
+    let presented = authorization_token(req)?;
+    if presented.scheme != AuthScheme::Bearer {
+        return Err(HttpError::new(401, "service auth requires a bearer token"));
+    }
+    let did_doc = fetch_did_document_with_env(expected_iss, env).await?;
+    verify_service_auth_jwt(
+        &presented.token,
+        expected_iss,
+        expected_aud,
+        expected_lxm,
+        now,
+        &did_doc,
+    )
+    .map_err(|error| HttpError::new(401, error.to_string()))
+}
+
 fn plc_directory_url(env: &Env) -> String {
     env.var("PDS_PLC_DIRECTORY_URL")
         .ok()
@@ -7261,6 +7556,17 @@ fn normalize_did_key(signing_key: &str) -> Result<String, HttpError> {
     }
     validate_public_key_multibase(signing_key)?;
     Ok(format!("did:key:{signing_key}"))
+}
+
+fn plc_operation_atproto_signing_key(operation: &Value) -> Result<String, HttpError> {
+    operation
+        .get("verificationMethods")
+        .and_then(Value::as_object)
+        .and_then(|methods| methods.get("atproto"))
+        .and_then(Value::as_str)
+        .map(normalize_did_key)
+        .transpose()?
+        .ok_or_else(|| HttpError::new(400, "InvalidSigningKey"))
 }
 
 fn public_key_multibase_from_did_key(signing_key: &str) -> Result<String, HttpError> {
@@ -8669,6 +8975,127 @@ mod tests {
             &signature,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn verifies_service_auth_jwt_against_did_document() {
+        let key = RepoSigningKey::from_p256_hex(
+            "0000000000000000000000000000000000000000000000000000000000000001",
+        )
+        .unwrap();
+        let public_key = key.public_key_multibase().unwrap();
+        let doc = did_document(
+            "did:web:gsv-pds.example.com",
+            "gsv-pds.example.com",
+            &public_key,
+            "https://old-pds.example.com",
+        );
+        let token = service_auth_jwt(
+            &key,
+            "did:web:gsv-pds.example.com",
+            "did:web:new-pds.example.com",
+            Some(SERVER_CREATE_ACCOUNT),
+            1_776_722_400,
+        )
+        .unwrap();
+
+        verify_service_auth_jwt(
+            &token,
+            "did:web:gsv-pds.example.com",
+            "did:web:new-pds.example.com",
+            SERVER_CREATE_ACCOUNT,
+            1_776_722_300,
+            &doc,
+        )
+        .unwrap();
+        assert!(verify_service_auth_jwt(
+            &token,
+            "did:web:gsv-pds.example.com",
+            "did:web:other-pds.example.com",
+            SERVER_CREATE_ACCOUNT,
+            1_776_722_300,
+            &doc,
+        )
+        .is_err());
+        assert!(verify_service_auth_jwt(
+            &token,
+            "did:web:gsv-pds.example.com",
+            "did:web:new-pds.example.com",
+            "com.atproto.repo.getRecord",
+            1_776_722_300,
+            &doc,
+        )
+        .is_err());
+        assert!(verify_service_auth_jwt(
+            &token,
+            "did:web:gsv-pds.example.com",
+            "did:web:new-pds.example.com",
+            SERVER_CREATE_ACCOUNT,
+            1_776_722_401,
+            &doc,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verifies_es256k_service_auth_jwt_against_did_document() {
+        use k256::ecdsa::signature::hazmat::PrehashSigner;
+
+        let key = k256::ecdsa::SigningKey::from_slice(&[2_u8; REPO_SIGNING_KEY_BYTES]).unwrap();
+        let public_key = key.verifying_key().to_encoded_point(true);
+        let mut multikey = Vec::with_capacity(2 + public_key.as_bytes().len());
+        multikey.extend_from_slice(&[0xe7, 0x01]);
+        multikey.extend_from_slice(public_key.as_bytes());
+        let public_key_multibase = format!("z{}", bs58::encode(multikey).into_string());
+        let doc = did_document(
+            "did:web:es256k.example.com",
+            "es256k.example.com",
+            &public_key_multibase,
+            "https://old-pds.example.com",
+        );
+        let header =
+            BASE64_URL_SAFE_NO_PAD.encode(to_vec(&json!({"typ": "JWT", "alg": "ES256K"})).unwrap());
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(
+            to_vec(&json!({
+                "iss": "did:web:es256k.example.com",
+                "aud": "did:web:new-pds.example.com",
+                "exp": 1_776_722_400_i64,
+                "lxm": SERVER_CREATE_ACCOUNT,
+            }))
+            .unwrap(),
+        );
+        let signing_input = format!("{header}.{payload}");
+        let digest = Sha256::digest(signing_input.as_bytes());
+        let signature: k256::ecdsa::Signature = key.sign_prehash(&digest).unwrap();
+        let token = format!(
+            "{signing_input}.{}",
+            BASE64_URL_SAFE_NO_PAD.encode(signature.to_bytes())
+        );
+
+        verify_service_auth_jwt(
+            &token,
+            "did:web:es256k.example.com",
+            "did:web:new-pds.example.com",
+            SERVER_CREATE_ACCOUNT,
+            1_776_722_300,
+            &doc,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn extracts_plc_operation_atproto_signing_key() {
+        let key = "did:key:zDnaerDaTF5BXEavCrfRZEk316dpbLsfPDZ3WJ5hRTPFU2169";
+        assert_eq!(
+            plc_operation_atproto_signing_key(&json!({
+                "verificationMethods": {
+                    "atproto": key,
+                },
+            }))
+            .unwrap(),
+            key
+        );
+        assert!(plc_operation_atproto_signing_key(&json!({})).is_err());
     }
 
     #[test]

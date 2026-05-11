@@ -19,6 +19,7 @@ pub mod plc;
 pub mod repo;
 pub mod repo_import;
 pub mod service;
+pub mod service_auth;
 pub mod storage;
 pub mod xrpc;
 

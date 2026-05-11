@@ -834,7 +834,7 @@ async function expectDeactivateActivate(session) {
     );
     deactivated = true;
 
-    await expectStatus(
+    await expectJson(
       "inactive create session",
       "POST",
       "/xrpc/com.atproto.server.createSession",
@@ -842,15 +842,23 @@ async function expectDeactivateActivate(session) {
         identifier: handle,
         password: config.password,
       },
-      403,
+      (body) => {
+        if (body.did !== session.did || body.active !== false || body.status !== "deactivated") {
+          throw new Error(`unexpected inactive createSession response ${JSON.stringify(body)}`);
+        }
+      },
     );
 
-    await expectStatus(
+    await expectJson(
       "inactive get session",
       "GET",
       "/xrpc/com.atproto.server.getSession",
       null,
-      403,
+      (body) => {
+        if (body.did !== session.did || body.active !== false || body.status !== "deactivated") {
+          throw new Error(`unexpected inactive getSession response ${JSON.stringify(body)}`);
+        }
+      },
       { authorization: `Bearer ${session.accessJwt}` },
     );
 

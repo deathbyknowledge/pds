@@ -246,6 +246,19 @@ pub fn did_document_pds_endpoint(doc: &Value) -> Option<String> {
         .map(|endpoint| endpoint.trim_end_matches('/').to_string())
 }
 
+pub fn did_document_public_key_multibase(doc: &Value, fragment: &str) -> Option<String> {
+    doc.get("verificationMethod")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|method| {
+            method.get("id").and_then(Value::as_str).is_some_and(|id| {
+                id == format!("#{fragment}") || id.ends_with(&format!("#{fragment}"))
+            })
+        })
+        .and_then(|method| method.get("publicKeyMultibase").and_then(Value::as_str))
+        .map(ToString::to_string)
+}
+
 pub fn ensure_did_document_id(doc: &Value, did: &str) -> Result<(), ResolverError> {
     if did_document_has_id(doc, did) {
         Ok(())
@@ -376,6 +389,12 @@ mod tests {
                 "id": "#atproto_pds",
                 "type": "AtprotoPersonalDataServer",
                 "serviceEndpoint": "https://pds.example.com/"
+            }],
+            "verificationMethod": [{
+                "id": "did:web:example.com#atproto",
+                "type": "Multikey",
+                "controller": "did:web:example.com",
+                "publicKeyMultibase": "zDnaep6nVw4hkSuHnNTRmH5Wd6s2NN9UFLjssSJWvo8DqX6tf"
             }]
         });
 
@@ -384,6 +403,10 @@ mod tests {
         assert_eq!(
             did_document_pds_endpoint(&doc),
             Some("https://pds.example.com".to_string())
+        );
+        assert_eq!(
+            did_document_public_key_multibase(&doc, "atproto").as_deref(),
+            Some("zDnaep6nVw4hkSuHnNTRmH5Wd6s2NN9UFLjssSJWvo8DqX6tf")
         );
     }
 }

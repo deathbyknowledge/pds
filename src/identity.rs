@@ -1,5 +1,6 @@
 //! Repository signing identity helpers.
 
+use k256::ecdsa::{Signature as K256Signature, VerifyingKey as K256VerifyingKey};
 use p256::ecdsa::{
     signature::hazmat::{PrehashSigner, PrehashVerifier},
     Signature, SigningKey, VerifyingKey,
@@ -12,6 +13,7 @@ use crate::commit::CommitSigner;
 const P256_SECRET_KEY_LEN: usize = 32;
 const P256_SIGNATURE_LEN: usize = 64;
 const P256_PUB_MULTICODEC_VARINT: [u8; 2] = [0x80, 0x24];
+const SECP256K1_PUB_MULTICODEC_VARINT: [u8; 2] = [0xe7, 0x01];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoSigningKey {
@@ -28,6 +30,9 @@ pub enum IdentityError {
 
     #[error("invalid P-256 public key")]
     InvalidPublicKey,
+
+    #[error("unsupported public key algorithm")]
+    UnsupportedKeyAlgorithm,
 
     #[error("invalid P-256 signature")]
     InvalidSignature,
@@ -96,6 +101,29 @@ pub fn public_key_multibase(verifying_key: &VerifyingKey) -> Result<String, Iden
     Ok(format!("z{}", bs58::encode(multikey).into_string()))
 }
 
+pub fn verifying_key_from_public_key_multibase(
+    public_key_multibase: &str,
+) -> Result<VerifyingKey, IdentityError> {
+    let decoded = decode_public_key_multibase(public_key_multibase, &P256_PUB_MULTICODEC_VARINT)?;
+    VerifyingKey::from_sec1_bytes(&decoded).map_err(|_| IdentityError::InvalidPublicKey)
+}
+
+fn decode_public_key_multibase(
+    public_key_multibase: &str,
+    prefix: &[u8],
+) -> Result<Vec<u8>, IdentityError> {
+    let Some(encoded) = public_key_multibase.strip_prefix('z') else {
+        return Err(IdentityError::InvalidPublicKey);
+    };
+    let decoded = bs58::decode(encoded)
+        .into_vec()
+        .map_err(|_| IdentityError::InvalidPublicKey)?;
+    if decoded.len() != prefix.len() + 33 || !decoded.starts_with(prefix) {
+        return Err(IdentityError::InvalidPublicKey);
+    }
+    Ok(decoded[prefix.len()..].to_vec())
+}
+
 pub fn verify_p256_signature(
     verifying_key: &VerifyingKey,
     signable_bytes: &[u8],
@@ -106,6 +134,46 @@ pub fn verify_p256_signature(
     }
     let signature =
         Signature::from_slice(signature_bytes).map_err(|_| IdentityError::InvalidSignature)?;
+    let digest = Sha256::digest(signable_bytes);
+    verifying_key
+        .verify_prehash(&digest, &signature)
+        .map_err(|_| IdentityError::VerificationFailed)
+}
+
+pub fn verify_multibase_signature(
+    public_key_multibase: &str,
+    jwt_alg: &str,
+    signable_bytes: &[u8],
+    signature_bytes: &[u8],
+) -> Result<(), IdentityError> {
+    match jwt_alg {
+        "ES256" => {
+            let verifying_key = verifying_key_from_public_key_multibase(public_key_multibase)?;
+            verify_p256_signature(&verifying_key, signable_bytes, signature_bytes)
+        }
+        "ES256K" => {
+            let public_key = decode_public_key_multibase(
+                public_key_multibase,
+                &SECP256K1_PUB_MULTICODEC_VARINT,
+            )?;
+            verify_secp256k1_signature(&public_key, signable_bytes, signature_bytes)
+        }
+        _ => Err(IdentityError::UnsupportedKeyAlgorithm),
+    }
+}
+
+fn verify_secp256k1_signature(
+    public_key: &[u8],
+    signable_bytes: &[u8],
+    signature_bytes: &[u8],
+) -> Result<(), IdentityError> {
+    if signature_bytes.len() != P256_SIGNATURE_LEN {
+        return Err(IdentityError::InvalidSignature);
+    }
+    let verifying_key = K256VerifyingKey::from_sec1_bytes(public_key)
+        .map_err(|_| IdentityError::InvalidPublicKey)?;
+    let signature =
+        K256Signature::from_slice(signature_bytes).map_err(|_| IdentityError::InvalidSignature)?;
     let digest = Sha256::digest(signable_bytes);
     verifying_key
         .verify_prehash(&digest, &signature)
@@ -189,6 +257,20 @@ mod tests {
     }
 
     #[test]
+    fn decodes_p256_public_key_multibase() {
+        let key = RepoSigningKey::from_p256_hex(TEST_KEY_HEX).unwrap();
+        let public_key = key.public_key_multibase().unwrap();
+
+        let decoded = verifying_key_from_public_key_multibase(&public_key).unwrap();
+        assert_eq!(
+            public_key_multibase(&decoded).unwrap(),
+            key.public_key_multibase().unwrap()
+        );
+        assert!(verifying_key_from_public_key_multibase("not-multibase").is_err());
+        assert!(verifying_key_from_public_key_multibase("zbad").is_err());
+    }
+
+    #[test]
     fn signs_and_verifies_commit_signable_bytes() {
         let key = RepoSigningKey::from_p256_hex(TEST_KEY_HEX).unwrap();
         let unsigned = UnsignedCommit::new(
@@ -210,5 +292,51 @@ mod tests {
         let block = signed.encode_block().unwrap();
         let decoded: SignedCommit = decode_dag_cbor(&block.bytes).unwrap();
         assert_eq!(decoded.sig, signed.sig);
+    }
+
+    #[test]
+    fn verifies_p256_and_secp256k1_multibase_signatures() {
+        let p256_key = RepoSigningKey::from_p256_hex(TEST_KEY_HEX).unwrap();
+        let bytes = b"service-jwt-input";
+        let p256_signature = p256_key.sign_sha256(bytes).unwrap();
+        verify_multibase_signature(
+            &p256_key.public_key_multibase().unwrap(),
+            "ES256",
+            bytes,
+            &p256_signature,
+        )
+        .unwrap();
+
+        let secp_key = k256::ecdsa::SigningKey::from_slice(&[1_u8; P256_SECRET_KEY_LEN]).unwrap();
+        let digest = Sha256::digest(bytes);
+        let secp_signature: K256Signature = secp_key.sign_prehash(&digest).unwrap();
+        let public_key = secp_key.verifying_key().to_encoded_point(true);
+        let mut multikey =
+            Vec::with_capacity(SECP256K1_PUB_MULTICODEC_VARINT.len() + public_key.as_bytes().len());
+        multikey.extend_from_slice(&SECP256K1_PUB_MULTICODEC_VARINT);
+        multikey.extend_from_slice(public_key.as_bytes());
+        let public_key_multibase = format!("z{}", bs58::encode(multikey).into_string());
+        verify_multibase_signature(
+            &public_key_multibase,
+            "ES256K",
+            bytes,
+            &secp_signature.to_bytes(),
+        )
+        .unwrap();
+
+        assert!(verify_multibase_signature(
+            &public_key_multibase,
+            "ES256",
+            bytes,
+            &secp_signature.to_bytes(),
+        )
+        .is_err());
+        assert!(verify_multibase_signature(
+            &public_key_multibase,
+            "unsupported",
+            bytes,
+            &secp_signature.to_bytes(),
+        )
+        .is_err());
     }
 }

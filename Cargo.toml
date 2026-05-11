@@ -14,6 +14,7 @@ cid = "0.11.3"
 futures-core = "0.3"
 futures-util = "0.3"
 hmac = "0.12"
+k256 = { version = "0.13.4", default-features = false, features = ["ecdsa", "alloc"] }
 pbkdf2 = "0.12"
 p256 = { version = "0.13.2", default-features = false, features = ["ecdsa", "alloc"] }
 serde = { version = "1", features = ["derive"] }
