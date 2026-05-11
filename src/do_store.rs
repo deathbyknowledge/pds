@@ -519,19 +519,6 @@ impl SqlRepoStore {
         Ok(())
     }
 
-    pub fn list_lexicon_nsids(&self) -> worker::Result<Vec<String>> {
-        #[derive(Deserialize)]
-        struct Row {
-            nsid: String,
-        }
-
-        let rows: Vec<Row> = self
-            .sql
-            .exec("SELECT nsid FROM repo_lexicons ORDER BY nsid ASC", None)?
-            .to_array()?;
-        Ok(rows.into_iter().map(|row| row.nsid).collect())
-    }
-
     pub fn list_lexicons(&self) -> worker::Result<Vec<(String, String)>> {
         #[derive(Deserialize)]
         struct Row {

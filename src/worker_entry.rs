@@ -121,7 +121,6 @@ const INTERNAL_REPO_CONTROL_INIT: &str = "init";
 const INTERNAL_REPO_CONTROL_IDENTITY: &str = "identity";
 const INTERNAL_REPO_CONTROL_SIGNING_KEY: &str = "signing-key";
 const INTERNAL_REPO_CONTROL_SERVICE_AUTH: &str = "service-auth";
-const INTERNAL_REPO_CONTROL_LEXICONS: &str = "lexicons";
 const INTERNAL_DIRECTORY_CONTROL_DIRECTORY: &str = "directory";
 const INTERNAL_DIRECTORY_CONTROL_STATUS: &str = "status";
 const INTERNAL_DIRECTORY_CONTROL_ACCOUNTS: &str = "accounts";
@@ -2569,7 +2568,7 @@ impl PdsDirectoryObject {
         url: &worker::Url,
         repo_name: &str,
         method: Method,
-        action: &str,
+        action: InternalRepoControlAction,
         body: Option<&Value>,
     ) -> Result<Response, HttpError> {
         let namespace = self
@@ -2609,7 +2608,7 @@ impl PdsDirectoryObject {
         url: &worker::Url,
         repo_name: &str,
         method: Method,
-        action: &str,
+        action: InternalRepoControlAction,
         body: Option<&Value>,
         failure_prefix: &str,
     ) -> Result<Response, HttpError> {
@@ -2631,7 +2630,7 @@ impl PdsDirectoryObject {
         url: &worker::Url,
         repo_name: &str,
         method: Method,
-        action: &str,
+        action: InternalRepoControlAction,
         body: Option<&Value>,
         failure_prefix: &str,
     ) -> Result<T, HttpError> {
@@ -2661,7 +2660,7 @@ impl PdsDirectoryObject {
             url,
             repo_name,
             Method::Post,
-            INTERNAL_REPO_CONTROL_INIT,
+            InternalRepoControlAction::Init,
             Some(&body),
             "failed to initialize repo",
         )
@@ -2690,7 +2689,7 @@ impl PdsDirectoryObject {
             url,
             repo_name,
             Method::Put,
-            INTERNAL_REPO_CONTROL_IDENTITY,
+            InternalRepoControlAction::Identity,
             Some(&body),
             "failed to update repo identity",
         )
@@ -2709,7 +2708,7 @@ impl PdsDirectoryObject {
             url,
             repo_name,
             Method::Put,
-            INTERNAL_REPO_CONTROL_SIGNING_KEY,
+            InternalRepoControlAction::SigningKey,
             Some(&body),
             "failed to update repo signing key",
         )
@@ -2726,7 +2725,7 @@ impl PdsDirectoryObject {
             url,
             repo_name,
             Method::Get,
-            INTERNAL_REPO_CONTROL_STATUS,
+            InternalRepoControlAction::Status,
             None,
             "failed to read initialized repo status",
         )
@@ -2753,7 +2752,7 @@ impl PdsDirectoryObject {
                 url,
                 repo_name,
                 Method::Post,
-                INTERNAL_REPO_CONTROL_SERVICE_AUTH,
+                InternalRepoControlAction::ServiceAuth,
                 Some(&body),
                 "failed to sign service auth token",
             )
@@ -3338,17 +3337,17 @@ impl RepoObject {
 
         if let Some((repo_name, action)) = internal_repo_control_parts(&parts) {
             return match (req.method(), action) {
-                (Method::Get, INTERNAL_REPO_CONTROL_STATUS) => self.status(),
-                (Method::Post, INTERNAL_REPO_CONTROL_INIT) => self.init(req, repo_name).await,
-                (Method::Put, INTERNAL_REPO_CONTROL_IDENTITY) => self.update_identity(req).await,
-                (Method::Put, INTERNAL_REPO_CONTROL_SIGNING_KEY) => {
+                (Method::Get, InternalRepoControlAction::Status) => self.status(),
+                (Method::Post, InternalRepoControlAction::Init) => self.init(req, repo_name).await,
+                (Method::Put, InternalRepoControlAction::Identity) => {
+                    self.update_identity(req).await
+                }
+                (Method::Put, InternalRepoControlAction::SigningKey) => {
                     self.update_signing_key(req).await
                 }
-                (Method::Post, INTERNAL_REPO_CONTROL_SERVICE_AUTH) => self.service_auth(req).await,
-                (Method::Post, INTERNAL_REPO_CONTROL_LEXICONS) => {
-                    self.put_lexicon(req, repo_name).await
+                (Method::Post, InternalRepoControlAction::ServiceAuth) => {
+                    self.service_auth(req).await
                 }
-                (Method::Get, INTERNAL_REPO_CONTROL_LEXICONS) => self.list_lexicons(req).await,
                 _ => Err(HttpError::new(404, "not found")),
             };
         }
@@ -4118,135 +4117,6 @@ impl RepoObject {
             }),
         )
         .map_err(HttpError::worker)
-    }
-
-    async fn put_lexicon(&self, req: &mut Request, repo_name: &str) -> Result<Response, HttpError> {
-        self.require_admin(req)?;
-        let request_host = request_host(req)?;
-        let body: Value = req.json().await.map_err(HttpError::worker)?;
-        let submitted = submitted_lexicon_from_body(body)?;
-        let lexicon = lexicon::normalize_schema_record(&submitted.lexicon)
-            .map_err(|error| HttpError::new(400, error.to_string()))?;
-        lexicon::validate_lexicon_schema(&lexicon)
-            .map_err(|error| HttpError::new(400, error.to_string()))?;
-        let nsid = lexicon::schema_id(&lexicon)
-            .ok_or_else(|| HttpError::new(400, "Lexicon document must contain string `id`"))?;
-        let lexicon_json = to_string(&lexicon).map_err(HttpError::worker)?;
-        self.store()
-            .put_lexicon(nsid, &lexicon_json, "admin")
-            .map_err(HttpError::worker)?;
-
-        let mut body = json!({
-            "id": nsid,
-            "stored": true,
-            "published": false,
-        });
-        if submitted.publish {
-            let published = self
-                .publish_lexicon_record(&request_host, &repo_name, nsid, &lexicon)
-                .await?;
-            body["published"] = json!(true);
-            body["uri"] = json!(published.uri);
-            body["cid"] = json!(published.cid);
-            body["commit"] = json!({
-                "cid": published.commit_cid,
-                "rev": published.commit_rev,
-                "changed": published.changed,
-            });
-        }
-
-        json_response(200, &body).map_err(HttpError::worker)
-    }
-
-    async fn list_lexicons(&self, req: &Request) -> Result<Response, HttpError> {
-        self.require_admin(req)?;
-        let nsids = self
-            .store()
-            .list_lexicon_nsids()
-            .map_err(HttpError::worker)?;
-        json_response(200, &json!({ "lexicons": nsids })).map_err(HttpError::worker)
-    }
-
-    async fn publish_lexicon_record(
-        &self,
-        request_host: &str,
-        repo_name: &str,
-        nsid: &str,
-        lexicon: &Value,
-    ) -> Result<PublishedLexiconRecord, HttpError> {
-        let path = RepoPath::new(
-            Nsid::new(lexicon::LEXICON_SCHEMA_COLLECTION).map_err(HttpError::bad_request)?,
-            RecordKey::new(nsid).map_err(HttpError::bad_request)?,
-        );
-        let record = lexicon::published_schema_record(lexicon)
-            .map_err(|error| HttpError::new(400, error.to_string()))?;
-        let (previous_state, identity, signing_key, mut repo) =
-            self.open_repo_for_write_with_state()?;
-        let existing = repo
-            .get_record::<Value>(&path)
-            .await
-            .map_err(HttpError::repo)?;
-        if let Some(existing) = existing.as_ref().filter(|stored| stored.record == record) {
-            return Ok(PublishedLexiconRecord {
-                uri: at_uri(
-                    previous_state.did.as_str(),
-                    path.collection.as_str(),
-                    path.rkey.as_str(),
-                ),
-                cid: existing.cid.to_string(),
-                commit_cid: previous_state.latest_commit.to_string(),
-                commit_rev: previous_state.latest_rev.to_string(),
-                changed: false,
-            });
-        }
-
-        let rev = generated_repo_rev(&previous_state.latest_commit)?;
-        let mutation = if existing.is_some() {
-            repo.update_record(path.clone(), &record, rev, &signing_key)
-                .await
-        } else {
-            repo.create_record(path.clone(), &record, rev, &signing_key)
-                .await
-        }
-        .map_err(HttpError::repo)?;
-        let event = self
-            .commit_event_payload(
-                &mut repo,
-                &mutation,
-                Some(previous_state.latest_rev.clone()),
-                Vec::new(),
-            )
-            .await?;
-        let state = self
-            .persist_mutation(repo.storage(), &mutation)
-            .map_err(HttpError::worker)?;
-        self.persist_commit_event(repo.storage(), &state, &event)
-            .map_err(HttpError::worker)?;
-        let record_paths = [path.clone()];
-        self.notify_directory(
-            request_host,
-            repo_name,
-            &identity,
-            &state,
-            Some(&record_paths),
-            Some(&event),
-        )
-        .await?;
-        let record_cid = mutation
-            .record_cid
-            .ok_or_else(|| HttpError::new(500, "Lexicon publication is missing record cid"))?;
-
-        Ok(PublishedLexiconRecord {
-            uri: at_uri(
-                state.did.as_str(),
-                path.collection.as_str(),
-                path.rkey.as_str(),
-            ),
-            cid: record_cid.to_string(),
-            commit_cid: state.latest_commit.to_string(),
-            commit_rev: state.latest_rev.to_string(),
-            changed: true,
-        })
     }
 
     async fn xrpc_create_record(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -5531,19 +5401,6 @@ struct CreatedOAuthSession {
     dpop_nonce: String,
 }
 
-struct SubmittedLexicon {
-    lexicon: Value,
-    publish: bool,
-}
-
-struct PublishedLexiconRecord {
-    uri: String,
-    cid: String,
-    commit_cid: String,
-    commit_rev: String,
-    changed: bool,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OAuthClientAuthBinding {
     method: OAuthClientAuthMethod,
@@ -6399,32 +6256,6 @@ fn extra_lexicons_from_env(env: &Env) -> Result<Vec<Value>, HttpError> {
             "PDS_LEXICONS_JSON must be a Lexicon JSON object or array",
         )),
     }
-}
-
-fn submitted_lexicon_from_body(body: Value) -> Result<SubmittedLexicon, HttpError> {
-    if body.get("lexicon").is_some() && body.get("id").is_some() && body.get("defs").is_some() {
-        return Ok(SubmittedLexicon {
-            lexicon: body,
-            publish: true,
-        });
-    }
-
-    let publish = body.get("publish").and_then(Value::as_bool).unwrap_or(true);
-    let lexicon = body
-        .get("schema")
-        .or_else(|| {
-            body.get("lexicon")
-                .filter(|value| value.get("id").is_some() && value.get("defs").is_some())
-        })
-        .cloned()
-        .filter(Value::is_object)
-        .ok_or_else(|| {
-            HttpError::new(
-                400,
-                "request body must be a Lexicon JSON document or {\"schema\": {...}, \"publish\": bool}",
-            )
-        })?;
-    Ok(SubmittedLexicon { lexicon, publish })
 }
 
 async fn fetch_published_lexicon(env: &Env, collection: &str) -> Result<Option<Value>, HttpError> {
@@ -7711,25 +7542,62 @@ fn encode_query_component(value: &str) -> String {
     ::url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-fn internal_repo_control_url(url: &worker::Url, repo_name: &str, action: &str) -> String {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InternalRepoControlAction {
+    Status,
+    Init,
+    Identity,
+    SigningKey,
+    ServiceAuth,
+}
+
+impl InternalRepoControlAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => INTERNAL_REPO_CONTROL_STATUS,
+            Self::Init => INTERNAL_REPO_CONTROL_INIT,
+            Self::Identity => INTERNAL_REPO_CONTROL_IDENTITY,
+            Self::SigningKey => INTERNAL_REPO_CONTROL_SIGNING_KEY,
+            Self::ServiceAuth => INTERNAL_REPO_CONTROL_SERVICE_AUTH,
+        }
+    }
+
+    fn from_str(value: &str) -> Option<Self> {
+        match value {
+            INTERNAL_REPO_CONTROL_STATUS => Some(Self::Status),
+            INTERNAL_REPO_CONTROL_INIT => Some(Self::Init),
+            INTERNAL_REPO_CONTROL_IDENTITY => Some(Self::Identity),
+            INTERNAL_REPO_CONTROL_SIGNING_KEY => Some(Self::SigningKey),
+            INTERNAL_REPO_CONTROL_SERVICE_AUTH => Some(Self::ServiceAuth),
+            _ => None,
+        }
+    }
+}
+
+fn internal_repo_control_url(
+    url: &worker::Url,
+    repo_name: &str,
+    action: InternalRepoControlAction,
+) -> String {
     format!(
         "{}/{}/{}/{}/{}",
         request_origin(url),
         INTERNAL_REPO_CONTROL_ROOT,
         INTERNAL_REPO_CONTROL_REPOS,
         encode_query_component(repo_name),
-        action,
+        action.as_str(),
     )
 }
 
-fn internal_repo_control_parts<'a>(parts: &'a [&'a str]) -> Option<(&'a str, &'a str)> {
+fn internal_repo_control_parts<'a>(
+    parts: &'a [&'a str],
+) -> Option<(&'a str, InternalRepoControlAction)> {
     if parts.len() == 4
         && parts[0] == INTERNAL_REPO_CONTROL_ROOT
         && parts[1] == INTERNAL_REPO_CONTROL_REPOS
         && !parts[2].is_empty()
-        && !parts[3].is_empty()
     {
-        Some((parts[2], parts[3]))
+        Some((parts[2], InternalRepoControlAction::from_str(parts[3])?))
     } else {
         None
     }
@@ -8387,7 +8255,7 @@ mod tests {
     fn parses_only_internal_repo_control_paths() {
         assert_eq!(
             internal_repo_control_parts(&["_pds_internal", "repos", "alice", "init"]),
-            Some(("alice", "init"))
+            Some(("alice", InternalRepoControlAction::Init))
         );
         assert_eq!(
             internal_repo_control_parts(&["repos", "alice", "init"]),
@@ -8399,6 +8267,10 @@ mod tests {
         );
         assert_eq!(
             internal_repo_control_parts(&["_pds_internal", "repos", "alice", "init", "extra"]),
+            None
+        );
+        assert_eq!(
+            internal_repo_control_parts(&["_pds_internal", "repos", "alice", "lexicons"]),
             None
         );
     }
