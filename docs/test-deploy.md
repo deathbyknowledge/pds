@@ -67,6 +67,21 @@ npm run smoke:account
 initial account creation, then logs in with the password and writes a record with
 the returned access token. Email is optional and not used by the smoke.
 
+To exercise a full did:plc account creation and PLC update flow, configure a
+persistent server rotation key first:
+
+```bash
+export PDS_PLC_ROTATION_KEY_P256_HEX="<64 hex chars>"
+npm run deploy:test
+PDS_BASE_URL="https://<your-worker-host>" \
+PDS_ADMIN_TOKEN="<same-token-used-for-deploy>" \
+npm run smoke:plc-account
+```
+
+The PLC smoke creates a real did:plc account, resolves its DID document, signs
+and submits a PLC update operation, writes an account record, and prints a PDSls
+link for the new did:plc repo.
+
 Useful optional variables:
 
 - `PDS_HANDLE`: handle to publish in the DID document, defaults to the base URL
@@ -81,12 +96,15 @@ Useful optional variables:
 - `PDS_ACCOUNT_PASSWORD`: password for `smoke:account`, defaults to a local-only
   test value.
 - `PDS_PLC_ROTATION_KEY_P256_HEX`: P-256 private key used to sign did:plc
-  update operations. Without it, PLC signing/submission returns 501.
+  genesis and update operations. Without it, newly-created accounts default to
+  did:web and PLC signing/submission returns 501.
 - `PDS_PLC_RECOVERY_DID_KEY` or `PDS_PLC_RECOVERY_DID_KEYS`: optional did:key
   recovery keys to include before the server rotation key in recommended PLC
   credentials. Use comma-separated values for `PDS_PLC_RECOVERY_DID_KEYS`.
 - `PDS_PLC_DIRECTORY_URL`: optional PLC directory base URL, defaults to
   `https://plc.directory`.
+- `PDS_PLC_ACCOUNT_HANDLE`: optional handle for `smoke:plc-account`, defaults to
+  a new `plc-<timestamp>.gsv.dev` handle.
 
 ## Local Smoke
 

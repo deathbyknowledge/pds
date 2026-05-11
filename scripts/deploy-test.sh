@@ -38,9 +38,9 @@ set workers_dev = true or pass a config that enables a public route.
 MSG
 fi
 
-printf '%s' "$PDS_ADMIN_TOKEN" | npx wrangler secret put PDS_ADMIN_TOKEN
+printf '%s\n' "$PDS_ADMIN_TOKEN" | npx wrangler secret put PDS_ADMIN_TOKEN
 if [[ -n "${PDS_PLC_ROTATION_KEY_P256_HEX:-}" ]]; then
-  printf '%s' "$PDS_PLC_ROTATION_KEY_P256_HEX" | npx wrangler secret put PDS_PLC_ROTATION_KEY_P256_HEX
+  printf '%s\n' "$PDS_PLC_ROTATION_KEY_P256_HEX" | npx wrangler secret put PDS_PLC_ROTATION_KEY_P256_HEX
 fi
 npx wrangler deploy "$@"
 
@@ -50,6 +50,11 @@ if [[ -n "${PDS_BASE_URL:-}" ]]; then
   npm run smoke:delete-account
   npm run smoke:public
   npm run smoke:lexicon
+  if [[ -n "${PDS_PLC_ROTATION_KEY_P256_HEX:-}" ]]; then
+    npm run smoke:plc-account
+  else
+    echo "Skipping smoke:plc-account; set PDS_PLC_ROTATION_KEY_P256_HEX to enable did:plc account creation."
+  fi
   if [[ -n "${OAUTH_CONFIDENTIAL_CLIENT_ID:-}" && -n "${OAUTH_CONFIDENTIAL_CLIENT_PRIVATE_KEY_JWK:-}" ]]; then
     npm run smoke:oauth:confidential
   else
@@ -70,6 +75,10 @@ Run remote smokes with:
   npm run smoke:delete-account && \
   npm run smoke:public && \
   npm run smoke:lexicon
+
+Optional did:plc account smoke:
+  PDS_PLC_ROTATION_KEY_P256_HEX=<server-rotation-p256-hex> \
+  npm run smoke:plc-account
 
 Optional confidential OAuth smoke:
   OAUTH_CONFIDENTIAL_CLIENT_ID=https://client.example.com/client.json \

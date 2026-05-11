@@ -3,6 +3,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL_SAFE_NO_PAD, Engine};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::cbor::{encode_dag_cbor, CborError};
@@ -35,6 +36,11 @@ pub struct SignPlcOperationRequest {
     pub services: Option<Value>,
 }
 
+pub struct CreatedPlcOperation {
+    pub did: String,
+    pub operation: Value,
+}
+
 pub fn recommended_did_credentials_body(
     origin: &str,
     handle: &str,
@@ -57,6 +63,40 @@ pub fn recommended_did_credentials_body(
         body["rotationKeys"] = json!(rotation_keys);
     }
     Ok(body)
+}
+
+pub fn create_plc_operation(
+    handle: &str,
+    pds_origin: &str,
+    signing_key: &str,
+    rotation_keys: &[String],
+    rotation_signing_key: &RepoSigningKey,
+) -> Result<CreatedPlcOperation, PlcError> {
+    if rotation_keys.is_empty() || rotation_keys.len() > 5 {
+        return bad_request("InvalidRotationKeys");
+    }
+    validate_did_key_syntax(signing_key)?;
+    for key in rotation_keys {
+        validate_rotation_did_key(key)?;
+    }
+    let unsigned = json!({
+        "type": "plc_operation",
+        "rotationKeys": rotation_keys,
+        "verificationMethods": {
+            "atproto": signing_key,
+        },
+        "alsoKnownAs": [ensure_at_uri(handle)],
+        "services": {
+            "atproto_pds": {
+                "type": "AtprotoPersonalDataServer",
+                "endpoint": ensure_http_url(pds_origin),
+            },
+        },
+        "prev": null,
+    });
+    let operation = sign_operation(unsigned, rotation_signing_key)?;
+    let did = did_for_create_operation(&operation)?;
+    Ok(CreatedPlcOperation { did, operation })
 }
 
 pub fn did_key_from_public_key_multibase(public_key_multibase: &str) -> Result<String, PlcError> {
@@ -90,7 +130,7 @@ pub fn sign_plc_update_operation(
         match body.rotation_keys {
             Some(keys) => {
                 for key in &keys {
-                    validate_did_key_syntax(key)?;
+                    validate_rotation_did_key(key)?;
                 }
                 json!(keys)
             }
@@ -123,15 +163,7 @@ pub fn sign_plc_update_operation(
     );
 
     let unsigned = Value::Object(unsigned);
-    validate_plc_operation_data(&unsigned)?;
-    let signing_bytes = encode_dag_cbor(&unsigned)?;
-    let sig = BASE64_URL_SAFE_NO_PAD.encode(rotation_key.sign_sha256(&signing_bytes)?);
-    let mut signed = unsigned
-        .as_object()
-        .ok_or_else(|| PlcError::BadRequest("InvalidOperation".to_string()))?
-        .clone();
-    signed.insert("sig".to_string(), json!(sig));
-    Ok(Value::Object(signed))
+    sign_operation(unsigned, rotation_key)
 }
 
 pub fn validate_submitted_plc_operation(
@@ -179,19 +211,18 @@ pub fn validate_submitted_plc_operation(
 }
 
 pub fn validate_did_key_syntax(value: &str) -> Result<(), PlcError> {
-    if value
-        .strip_prefix("did:key:z")
-        .is_some_and(|key| !key.is_empty())
-    {
-        Ok(())
-    } else {
-        bad_request("InvalidDidKey")
-    }
+    decode_did_key_multibase(value).map(|_| ())
 }
 
 pub fn plc_operation_cid(operation: &Value) -> Result<Cid, PlcError> {
     let bytes = encode_dag_cbor(operation)?;
     Ok(dag_cbor_cid(&bytes))
+}
+
+pub fn did_for_create_operation(operation: &Value) -> Result<String, PlcError> {
+    let bytes = encode_dag_cbor(operation)?;
+    let digest = Sha256::digest(&bytes);
+    Ok(format!("did:plc:{}", &base32_lower_no_pad(&digest)[..24]))
 }
 
 fn normalize_plc_operation(op: &Value) -> Result<Value, PlcError> {
@@ -240,13 +271,20 @@ fn validate_plc_operation_data(operation: &Value) -> Result<(), PlcError> {
         return bad_request("InvalidRotationKeys");
     }
     for key in &rotation_keys {
-        validate_did_key_syntax(key)?;
+        validate_rotation_did_key(key)?;
     }
-    if !operation
+    let verification_methods = operation
         .get("verificationMethods")
-        .is_some_and(Value::is_object)
-    {
+        .and_then(Value::as_object)
+        .ok_or_else(|| PlcError::BadRequest("InvalidVerificationMethods".to_string()))?;
+    if verification_methods.is_empty() {
         return bad_request("InvalidVerificationMethods");
+    }
+    for key in verification_methods.values() {
+        let Some(key) = key.as_str() else {
+            return bad_request("InvalidVerificationMethods");
+        };
+        validate_did_key_syntax(key)?;
     }
     required_string_array(operation, "alsoKnownAs")?;
     if !operation.get("services").is_some_and(Value::is_object) {
@@ -267,6 +305,18 @@ fn ensure_json_object_value(value: Value) -> Result<Value, PlcError> {
     } else {
         bad_request("expected JSON object")
     }
+}
+
+fn sign_operation(unsigned: Value, signing_key: &RepoSigningKey) -> Result<Value, PlcError> {
+    validate_plc_operation_data(&unsigned)?;
+    let signing_bytes = encode_dag_cbor(&unsigned)?;
+    let sig = BASE64_URL_SAFE_NO_PAD.encode(signing_key.sign_sha256(&signing_bytes)?);
+    let mut signed = unsigned
+        .as_object()
+        .ok_or_else(|| PlcError::BadRequest("InvalidOperation".to_string()))?
+        .clone();
+    signed.insert("sig".to_string(), json!(sig));
+    Ok(Value::Object(signed))
 }
 
 fn required_string_field<'a>(value: &'a Value, field: &str) -> Result<&'a str, PlcError> {
@@ -307,6 +357,55 @@ fn validate_public_key_multibase(public_key_multibase: &str) -> Result<(), PlcEr
     }
 }
 
+fn validate_rotation_did_key(value: &str) -> Result<(), PlcError> {
+    let multikey = decode_did_key_multibase(value)?;
+    if (multikey.len() == 35 && multikey.starts_with(&[0x80, 0x24]))
+        || (multikey.len() == 35 && multikey.starts_with(&[0xe7, 0x01]))
+    {
+        Ok(())
+    } else {
+        bad_request("InvalidDidKey")
+    }
+}
+
+fn decode_did_key_multibase(value: &str) -> Result<Vec<u8>, PlcError> {
+    let Some(multibase) = value.strip_prefix("did:key:") else {
+        return bad_request("InvalidDidKey");
+    };
+    let Some(base58btc) = multibase.strip_prefix('z') else {
+        return bad_request("InvalidDidKey");
+    };
+    let decoded = bs58::decode(base58btc)
+        .into_vec()
+        .map_err(|_| PlcError::BadRequest("InvalidDidKey".to_string()))?;
+    if decoded.is_empty() {
+        bad_request("InvalidDidKey")
+    } else {
+        Ok(decoded)
+    }
+}
+
+fn base32_lower_no_pad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+    let mut out = String::with_capacity((bytes.len() * 8).div_ceil(5));
+    let mut buffer = 0_u16;
+    let mut bits = 0_u8;
+    for byte in bytes {
+        buffer = (buffer << 8) | u16::from(*byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            let index = ((buffer >> bits) & 0b11111) as usize;
+            out.push(ALPHABET[index] as char);
+        }
+    }
+    if bits > 0 {
+        let index = ((buffer << (5 - bits)) & 0b11111) as usize;
+        out.push(ALPHABET[index] as char);
+    }
+    out
+}
+
 fn ensure_at_uri(value: &str) -> String {
     if value.starts_with("at://") {
         value.to_string()
@@ -340,6 +439,59 @@ mod tests {
     use super::*;
     use crate::cbor::encode_dag_cbor;
     use crate::identity::verify_p256_signature;
+
+    #[test]
+    fn creates_plc_genesis_operations() {
+        let rotation_key = test_signing_key();
+        let rotation_did_key =
+            did_key_from_public_key_multibase(&rotation_key.public_key_multibase().unwrap())
+                .unwrap();
+        let repo_key = RepoSigningKey::from_p256_hex(
+            "0000000000000000000000000000000000000000000000000000000000000002",
+        )
+        .unwrap();
+        let repo_did_key =
+            did_key_from_public_key_multibase(&repo_key.public_key_multibase().unwrap()).unwrap();
+
+        let created = create_plc_operation(
+            "alice.example.com",
+            "https://pds.example.com",
+            &repo_did_key,
+            std::slice::from_ref(&rotation_did_key),
+            &rotation_key,
+        )
+        .unwrap();
+
+        assert!(created.did.starts_with("did:plc:"));
+        assert_eq!(created.did.len(), 32);
+        assert_eq!(created.operation["type"], "plc_operation");
+        assert_eq!(created.operation["prev"], Value::Null);
+        assert_eq!(created.operation["rotationKeys"][0], rotation_did_key);
+        assert_eq!(
+            created.operation["verificationMethods"]["atproto"],
+            repo_did_key
+        );
+        assert_eq!(
+            created.operation["alsoKnownAs"][0],
+            "at://alice.example.com"
+        );
+        assert_eq!(
+            created.operation["services"]["atproto_pds"]["endpoint"],
+            "https://pds.example.com"
+        );
+        assert_eq!(
+            did_for_create_operation(&created.operation).unwrap(),
+            created.did
+        );
+
+        let sig = created.operation["sig"].as_str().unwrap();
+        let mut unsigned = created.operation.as_object().unwrap().clone();
+        unsigned.remove("sig");
+        let unsigned = Value::Object(unsigned);
+        let bytes = encode_dag_cbor(&unsigned).unwrap();
+        let signature = BASE64_URL_SAFE_NO_PAD.decode(sig).unwrap();
+        verify_p256_signature(&rotation_key.verifying_key().unwrap(), &bytes, &signature).unwrap();
+    }
 
     #[test]
     fn builds_recommended_did_credentials() {

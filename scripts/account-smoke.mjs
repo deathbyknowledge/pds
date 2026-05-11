@@ -25,7 +25,7 @@ let session = await expectJson("create session", "POST", "/xrpc/com.atproto.serv
   password: config.password,
 });
 
-if (session.did !== `did:web:${handle}` || session.handle !== handle || !session.accessJwt || !session.refreshJwt) {
+if (!session.did?.startsWith("did:") || session.handle !== handle || !session.accessJwt || !session.refreshJwt) {
   throw new Error(`unexpected createSession response ${JSON.stringify(session)}`);
 }
 
@@ -140,14 +140,16 @@ await expectJson(
   },
 );
 
-await expectStatus(
-  "sign PLC operation rejects did:web",
-  "POST",
-  "/xrpc/com.atproto.identity.signPlcOperation",
-  { token: "unused" },
-  400,
-  { authorization: `Bearer ${session.accessJwt}` },
-);
+if (!session.did.startsWith("did:plc:")) {
+  await expectStatus(
+    "sign PLC operation rejects non-PLC DID",
+    "POST",
+    "/xrpc/com.atproto.identity.signPlcOperation",
+    { token: "unused" },
+    400,
+    { authorization: `Bearer ${session.accessJwt}` },
+  );
+}
 
 await expectStatus(
   "update handle no-op",
@@ -1123,7 +1125,7 @@ async function expectOAuthTokenExchange(par) {
         !body.refresh_token ||
         body.token_type !== "DPoP" ||
         body.expires_in !== 900 ||
-        body.sub !== `did:web:${handle}` ||
+        body.sub !== session.did ||
         !String(body.scope ?? "").split(/\s+/).includes("atproto")
       ) {
         throw new Error(`unexpected OAuth token response ${JSON.stringify(body)}`);
@@ -1163,7 +1165,7 @@ async function expectOAuthRefresh(clientId, refreshToken, dpopNonce) {
       refresh_token: refreshToken,
     }).toString(),
     (body, response) => {
-      if (!body.access_token || !body.refresh_token || body.token_type !== "DPoP" || body.sub !== `did:web:${handle}`) {
+      if (!body.access_token || !body.refresh_token || body.token_type !== "DPoP" || body.sub !== session.did) {
         throw new Error(`unexpected OAuth refresh response ${JSON.stringify(body)}`);
       }
       if (!response.headers.get("dpop-nonce")) {

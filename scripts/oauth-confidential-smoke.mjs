@@ -41,7 +41,7 @@ const session = await expectJson("create session", "POST", "/xrpc/com.atproto.se
   identifier: handle,
   password: config.password,
 });
-if (session.did !== `did:web:${handle}` || session.handle !== handle) {
+if (!session.did?.startsWith("did:") || session.handle !== handle) {
   throw new Error(`unexpected createSession response ${JSON.stringify(session)}`);
 }
 
@@ -225,7 +225,7 @@ async function expectConfidentialTokenExchange(par) {
         !body.refresh_token ||
         body.token_type !== "DPoP" ||
         body.expires_in !== 900 ||
-        body.sub !== `did:web:${handle}` ||
+        body.sub !== session.did ||
         !String(body.scope ?? "").split(/\s+/).includes("atproto")
       ) {
         throw new Error(`unexpected confidential OAuth token response ${JSON.stringify(body)}`);
@@ -268,7 +268,7 @@ async function expectConfidentialRefresh(refreshToken, dpopNonce) {
     "/oauth/token",
     body,
     (body, response) => {
-      if (!body.access_token || !body.refresh_token || body.token_type !== "DPoP" || body.sub !== `did:web:${handle}`) {
+      if (!body.access_token || !body.refresh_token || body.token_type !== "DPoP" || body.sub !== session.did) {
         throw new Error(`unexpected confidential OAuth refresh response ${JSON.stringify(body)}`);
       }
       if (!response.headers.get("dpop-nonce")) {

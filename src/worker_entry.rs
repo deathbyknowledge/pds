@@ -53,8 +53,8 @@ use crate::oauth::{
     OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
 };
 use crate::plc::{
-    recommended_did_credentials_body, sign_plc_update_operation, validate_submitted_plc_operation,
-    PlcError, SignPlcOperationRequest,
+    create_plc_operation, recommended_did_credentials_body, sign_plc_update_operation,
+    validate_submitted_plc_operation, PlcError, SignPlcOperationRequest,
 };
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
@@ -125,6 +125,7 @@ const INTERNAL_REPO_CONTROL_ROOT: &str = "_pds_internal";
 const INTERNAL_REPO_CONTROL_REPOS: &str = "repos";
 const INTERNAL_REPO_CONTROL_STATUS: &str = "status";
 const INTERNAL_REPO_CONTROL_INIT: &str = "init";
+const INTERNAL_REPO_CONTROL_CLEAR: &str = "clear";
 const INTERNAL_REPO_CONTROL_IDENTITY: &str = "identity";
 const INTERNAL_REPO_CONTROL_SIGNING_KEY: &str = "signing-key";
 const INTERNAL_REPO_CONTROL_SERVICE_AUTH: &str = "service-auth";
@@ -870,9 +871,13 @@ impl PdsDirectoryObject {
             .invite_code
             .map(|code| code.trim().to_string())
             .filter(|code| !code.is_empty());
+        body.recovery_key = body
+            .recovery_key
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty());
         let request_host = request_host(req)?;
         if body.plc_op.is_some() {
-            return Err(HttpError::new(400, "PLC operations are not implemented"));
+            return Err(HttpError::new(400, "Unsupported input: `plcOp`"));
         }
         let password = body
             .password
@@ -894,26 +899,35 @@ impl PdsDirectoryObject {
             self.ensure_invite_code_usable(&store, invite_code)?;
         }
 
-        let (did, repo_name, validate_did_document) = account_identity_for_creation(
+        let signing_key_hex = generate_repo_signing_key_hex()?;
+        let signing_key =
+            RepoSigningKey::from_p256_hex(&signing_key_hex).map_err(HttpError::identity)?;
+        let public_key_multibase = signing_key
+            .public_key_multibase()
+            .map_err(HttpError::identity)?;
+        let signing_did_key = did_key_from_public_key_multibase(&public_key_multibase)?;
+        let identity = account_identity_for_creation(
             &self.env,
             &body.handle,
             body.did.as_deref(),
+            body.recovery_key.as_deref(),
             &request_host,
+            &request_origin(url),
+            &signing_did_key,
         )
         .await?;
         if store
-            .get_account_by_did(&did)
+            .get_account_by_did(&identity.did)
             .map_err(HttpError::worker)?
             .is_some()
         {
             return Err(HttpError::new(400, "DidNotAvailable"));
         }
-        let signing_key_hex = generate_repo_signing_key_hex()?;
         let init = match self
             .internal_initialize_account_repo(
                 url,
-                &repo_name,
-                did.as_str(),
+                &identity.repo_name,
+                identity.did.as_str(),
                 &body.handle,
                 &signing_key_hex,
             )
@@ -921,25 +935,47 @@ impl PdsDirectoryObject {
         {
             Ok(init) => init,
             Err(error) if is_repo_already_initialized_error(&error) => {
-                self.recover_initialized_account_repo(url, &repo_name, did.as_str(), &body.handle)
-                    .await?
+                self.recover_initialized_account_repo(
+                    url,
+                    &identity.repo_name,
+                    identity.did.as_str(),
+                    &body.handle,
+                )
+                .await?
             }
             Err(error) => return Err(error),
         };
-        if validate_did_document {
-            validate_account_did_document(&body.handle, did.as_str()).await?;
+        if let Some(plc_operation) = identity.plc_operation.as_ref() {
+            if let Err(error) =
+                submit_plc_operation(identity.did.as_str(), plc_operation, &self.env).await
+            {
+                let _ = self
+                    .internal_reset_account_repo(url, &identity.repo_name)
+                    .await;
+                return Err(error);
+            }
+            validate_plc_account_did_document(
+                &body.handle,
+                identity.did.as_str(),
+                &request_origin(url),
+                &public_key_multibase,
+                &self.env,
+            )
+            .await?;
+        } else if identity.validate_did_document {
+            validate_account_did_document(&body.handle, identity.did.as_str()).await?;
         }
 
         let salt = random_bytes::<PASSWORD_SALT_BYTES>()?;
         let account = DirectoryAccountRow {
-            did: did.clone(),
+            did: identity.did.clone(),
             handle: body.handle.clone(),
             email: body.email.clone(),
             email_confirmed: false,
             invites_disabled: false,
             invite_note: None,
             password_hash: hash_password(password, &salt),
-            repo_name: repo_name.clone(),
+            repo_name: identity.repo_name.clone(),
             public_key_multibase: init.public_key_multibase.clone(),
             active: true,
             status: None,
@@ -947,24 +983,24 @@ impl PdsDirectoryObject {
         };
         store.insert_account(&account).map_err(HttpError::worker)?;
         let repo = DirectoryRepoRow {
-            did: did.clone(),
+            did: identity.did.clone(),
             handle: body.handle.clone(),
-            repo_name,
+            repo_name: identity.repo_name,
             head: parse_cid(&init.latest_commit).map_err(HttpError::bad_request)?,
             rev: RepoRev::new(init.latest_rev).map_err(HttpError::bad_request)?,
             active: true,
         };
         store.upsert_repo(&repo).map_err(HttpError::worker)?;
         let identity_event = store
-            .append_identity_event(&did, &body.handle)
+            .append_identity_event(&identity.did, &body.handle)
             .map_err(HttpError::worker)?;
         self.broadcast_repo_event(&identity_event)?;
         let account_event = store
-            .append_account_event(&did, true, None)
+            .append_account_event(&identity.did, true, None)
             .map_err(HttpError::worker)?;
         self.broadcast_repo_event(&account_event)?;
         if let Some(invite_code) = body.invite_code.as_deref() {
-            self.consume_invite_code(&store, invite_code, &did)?;
+            self.consume_invite_code(&store, invite_code, &identity.did)?;
         }
 
         let session = self.create_session_for_account(&account)?;
@@ -2785,6 +2821,23 @@ impl PdsDirectoryObject {
         .await
     }
 
+    async fn internal_reset_account_repo(
+        &self,
+        url: &worker::Url,
+        repo_name: &str,
+    ) -> Result<(), HttpError> {
+        self.internal_repo_control_response(
+            url,
+            repo_name,
+            Method::Post,
+            InternalRepoControlAction::Clear,
+            None,
+            "failed to clear repo",
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn recover_initialized_account_repo(
         &self,
         url: &worker::Url,
@@ -3457,6 +3510,7 @@ impl RepoObject {
             return match (req.method(), action) {
                 (Method::Get, InternalRepoControlAction::Status) => self.status(),
                 (Method::Post, InternalRepoControlAction::Init) => self.init(req, repo_name).await,
+                (Method::Post, InternalRepoControlAction::Clear) => self.clear(req),
                 (Method::Put, InternalRepoControlAction::Identity) => {
                     self.update_identity(req).await
                 }
@@ -4192,6 +4246,12 @@ impl RepoObject {
             }),
         )
         .map_err(HttpError::worker)
+    }
+
+    fn clear(&self, req: &Request) -> Result<Response, HttpError> {
+        self.require_admin(req)?;
+        self.store().clear_all().map_err(HttpError::worker)?;
+        empty_response(200).map_err(HttpError::worker)
     }
 
     async fn update_identity(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -5289,6 +5349,8 @@ struct XrpcCreateAccountRequest {
     did: Option<String>,
     #[serde(default, rename = "inviteCode", alias = "invite_code")]
     invite_code: Option<String>,
+    #[serde(default, rename = "recoveryKey", alias = "recovery_key")]
+    recovery_key: Option<String>,
     #[serde(default, rename = "plcOp")]
     plc_op: Option<Value>,
 }
@@ -6508,6 +6570,31 @@ async fn fetch_did_document(did: &str) -> Result<Value, HttpError> {
     Ok(doc)
 }
 
+async fn fetch_plc_did_document(did: &str, env: &Env) -> Result<Value, HttpError> {
+    if !did.starts_with("did:plc:") {
+        return Err(HttpError::new(400, "DID is not a did:plc identity"));
+    }
+    let url = format!("{}/{}", plc_directory_url(env), encode_query_component(did));
+    let doc = fetch_json_url(&url).await?;
+    ensure_did_document_id(&doc, did).map_err(HttpError::bad_request)?;
+    Ok(doc)
+}
+
+fn did_document_has_verification_method(doc: &Value, fragment: &str, did_key: &str) -> bool {
+    doc.get("verificationMethod")
+        .and_then(Value::as_array)
+        .is_some_and(|methods| {
+            methods.iter().any(|method| {
+                method
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id.ends_with(&format!("#{fragment}")))
+                    && method.get("publicKeyMultibase").and_then(Value::as_str)
+                        == did_key.strip_prefix("did:key:")
+            })
+        })
+}
+
 async fn fetch_dns_txt_records(name: &str) -> Result<Vec<String>, HttpError> {
     let url = format!(
         "https://cloudflare-dns.com/dns-query?name={}&type=TXT",
@@ -6756,20 +6843,97 @@ async fn validate_account_did_document(handle: &str, did: &str) -> Result<(), Ht
     Ok(())
 }
 
+async fn validate_plc_account_did_document(
+    handle: &str,
+    did: &str,
+    origin: &str,
+    public_key_multibase: &str,
+    env: &Env,
+) -> Result<(), HttpError> {
+    let doc = fetch_plc_did_document(did, env).await?;
+    if !did_document_claims_handle(&doc, handle) {
+        return Err(HttpError::new(
+            400,
+            format!("HandleMismatch: DID document `{did}` does not claim at://{handle}"),
+        ));
+    }
+    if did_document_pds_endpoint(&doc).as_deref() != Some(origin.trim_end_matches('/')) {
+        return Err(HttpError::new(
+            400,
+            format!("InvalidDidDocument: DID document `{did}` does not point at this PDS"),
+        ));
+    }
+    let expected_signing_key = did_key_from_public_key_multibase(public_key_multibase)?;
+    if !did_document_has_verification_method(&doc, "atproto", &expected_signing_key) {
+        return Err(HttpError::new(
+            400,
+            format!(
+                "InvalidDidDocument: DID document `{did}` does not publish the repo signing key"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn account_identity_for_creation(
     env: &Env,
     handle: &str,
     requested_did: Option<&str>,
+    requested_recovery_key: Option<&str>,
     request_host: &str,
-) -> Result<(Did, String, bool), HttpError> {
+    pds_origin: &str,
+    signing_did_key: &str,
+) -> Result<AccountCreationIdentity, HttpError> {
     validate_handle_syntax(handle).map_err(HttpError::bad_request)?;
     let Some(requested_did) = requested_did else {
+        if let Some(rotation_signing_key) = plc_rotation_signing_key_from_env(env)? {
+            validate_local_account_handle_for_creation(env, handle, request_host)?;
+            let rotation_did_key = did_key_from_public_key_multibase(
+                &rotation_signing_key
+                    .public_key_multibase()
+                    .map_err(HttpError::identity)?,
+            )?;
+            let mut rotation_keys = Vec::new();
+            if let Some(recovery_key) = requested_recovery_key {
+                validate_did_key_syntax(recovery_key)?;
+                rotation_keys.push(recovery_key.to_string());
+            } else {
+                rotation_keys.extend(recommended_plc_recovery_keys(env)?);
+            }
+            rotation_keys.push(rotation_did_key);
+            let created = create_plc_operation(
+                handle,
+                pds_origin,
+                signing_did_key,
+                &rotation_keys,
+                &rotation_signing_key,
+            )
+            .map_err(HttpError::plc)?;
+            let did = Did::new(created.did).map_err(HttpError::bad_request)?;
+            return Ok(AccountCreationIdentity {
+                repo_name: repo_object_name_from_identifier(did.as_str()),
+                did,
+                validate_did_document: false,
+                plc_operation: Some(created.operation),
+            });
+        }
         let did = Did::new(format!("did:web:{handle}")).map_err(HttpError::bad_request)?;
         validate_account_handle_for_creation(env, handle, request_host, did.as_str()).await?;
-        return Ok((did, handle.to_string(), true));
+        return Ok(AccountCreationIdentity {
+            repo_name: handle.to_string(),
+            did,
+            validate_did_document: true,
+            plc_operation: None,
+        });
     };
 
     let did = Did::new(requested_did.to_string()).map_err(HttpError::bad_request)?;
+    if requested_recovery_key.is_some() {
+        return Err(HttpError::new(
+            400,
+            "Unsupported input: `recoveryKey` is only supported for locally-created did:plc accounts",
+        ));
+    }
     if !did.as_str().starts_with("did:gsv:") {
         return Err(HttpError::new(
             400,
@@ -6780,7 +6944,37 @@ async fn account_identity_for_creation(
     if repo_name.is_empty() {
         return Err(HttpError::new(400, "InvalidDid"));
     }
-    Ok((did, repo_name, false))
+    Ok(AccountCreationIdentity {
+        did,
+        repo_name,
+        validate_did_document: false,
+        plc_operation: None,
+    })
+}
+
+struct AccountCreationIdentity {
+    did: Did,
+    repo_name: String,
+    validate_did_document: bool,
+    plc_operation: Option<Value>,
+}
+
+fn validate_local_account_handle_for_creation(
+    env: &Env,
+    handle: &str,
+    request_host: &str,
+) -> Result<(), HttpError> {
+    validate_handle_syntax(handle).map_err(HttpError::bad_request)?;
+    if handle == request_host || configured_account_handle_allowed(env, handle) {
+        Ok(())
+    } else {
+        Err(HttpError::new(
+            400,
+            format!(
+                "UnsupportedDomain: `{handle}` is not the request host `{request_host}` and is not allowed by PDS_ALLOWED_ACCOUNT_HANDLES or PDS_ALLOWED_ACCOUNT_HANDLE_SUFFIXES"
+            ),
+        ))
+    }
 }
 
 fn configured_account_handle_allowed(env: &Env, handle: &str) -> bool {
@@ -6935,6 +7129,17 @@ fn identity_info_response_body(origin: &str, account: &DirectoryAccountRow) -> V
 }
 
 fn recommended_plc_rotation_keys(env: &Env) -> Result<Vec<String>, HttpError> {
+    let mut keys = recommended_plc_recovery_keys(env)?;
+    if let Some(did_key) = plc_rotation_did_key_from_env(env)? {
+        keys.push(did_key);
+    }
+    for key in &keys {
+        validate_did_key_syntax(key)?;
+    }
+    Ok(keys)
+}
+
+fn recommended_plc_recovery_keys(env: &Env) -> Result<Vec<String>, HttpError> {
     let mut keys = Vec::new();
     keys.extend(env_list(env, "PDS_PLC_RECOVERY_DID_KEYS"));
     if let Ok(value) = env.var("PDS_PLC_RECOVERY_DID_KEY") {
@@ -6942,9 +7147,6 @@ fn recommended_plc_rotation_keys(env: &Env) -> Result<Vec<String>, HttpError> {
         if !value.trim().is_empty() {
             keys.push(value.trim().to_string());
         }
-    }
-    if let Some(did_key) = plc_rotation_did_key_from_env(env)? {
-        keys.push(did_key);
     }
     let keys = keys
         .into_iter()
@@ -7786,6 +7988,7 @@ fn encode_query_component(value: &str) -> String {
 enum InternalRepoControlAction {
     Status,
     Init,
+    Clear,
     Identity,
     SigningKey,
     ServiceAuth,
@@ -7796,6 +7999,7 @@ impl InternalRepoControlAction {
         match self {
             Self::Status => INTERNAL_REPO_CONTROL_STATUS,
             Self::Init => INTERNAL_REPO_CONTROL_INIT,
+            Self::Clear => INTERNAL_REPO_CONTROL_CLEAR,
             Self::Identity => INTERNAL_REPO_CONTROL_IDENTITY,
             Self::SigningKey => INTERNAL_REPO_CONTROL_SIGNING_KEY,
             Self::ServiceAuth => INTERNAL_REPO_CONTROL_SERVICE_AUTH,
@@ -7806,6 +8010,7 @@ impl InternalRepoControlAction {
         match value {
             INTERNAL_REPO_CONTROL_STATUS => Some(Self::Status),
             INTERNAL_REPO_CONTROL_INIT => Some(Self::Init),
+            INTERNAL_REPO_CONTROL_CLEAR => Some(Self::Clear),
             INTERNAL_REPO_CONTROL_IDENTITY => Some(Self::Identity),
             INTERNAL_REPO_CONTROL_SIGNING_KEY => Some(Self::SigningKey),
             INTERNAL_REPO_CONTROL_SERVICE_AUTH => Some(Self::ServiceAuth),

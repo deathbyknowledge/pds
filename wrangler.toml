@@ -5,6 +5,7 @@ workers_dev = true
 
 [vars]
 PDS_LEXICON_AUTHORITY_DIDS = "gsv.app=did:web:gsv-pds.stevej.workers.dev"
+PDS_ALLOWED_ACCOUNT_HANDLE_SUFFIXES = "gsv.dev"
 
 [build]
 command = "worker-build --release ."
