@@ -76,21 +76,21 @@ use crate::xrpc::{
     IDENTITY_GET_RECOMMENDED_DID_CREDENTIALS, IDENTITY_REFRESH_IDENTITY,
     IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE, IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE,
     IDENTITY_RESOLVE_IDENTITY, IDENTITY_SIGN_PLC_OPERATION, IDENTITY_SUBMIT_PLC_OPERATION,
-    IDENTITY_UPDATE_HANDLE, REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD,
-    REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO, REPO_LIST_MISSING_BLOBS,
-    REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_ACTIVATE_ACCOUNT,
-    SERVER_CHANGE_PASSWORD, SERVER_CHECK_ACCOUNT_STATUS, SERVER_CONFIRM_EMAIL,
-    SERVER_CREATE_ACCOUNT, SERVER_CREATE_APP_PASSWORD, SERVER_CREATE_INVITE_CODE,
-    SERVER_CREATE_INVITE_CODES, SERVER_CREATE_SESSION, SERVER_DEACTIVATE_ACCOUNT,
-    SERVER_DELETE_ACCOUNT, SERVER_DELETE_SESSION, SERVER_DESCRIBE_SERVER,
-    SERVER_GET_ACCOUNT_INVITE_CODES, SERVER_GET_SERVICE_AUTH, SERVER_GET_SESSION,
-    SERVER_LIST_APP_PASSWORDS, SERVER_REFRESH_SESSION, SERVER_REQUEST_ACCOUNT_DELETE,
-    SERVER_REQUEST_EMAIL_CONFIRMATION, SERVER_REQUEST_EMAIL_UPDATE, SERVER_REQUEST_PASSWORD_RESET,
-    SERVER_RESERVE_SIGNING_KEY, SERVER_RESET_PASSWORD, SERVER_REVOKE_APP_PASSWORD,
-    SERVER_UPDATE_EMAIL, SYNC_GET_BLOB, SYNC_GET_BLOCKS, SYNC_GET_CHECKOUT, SYNC_GET_HEAD,
-    SYNC_GET_HOST_STATUS, SYNC_GET_LATEST_COMMIT, SYNC_GET_RECORD, SYNC_GET_REPO,
-    SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_REPOS, SYNC_LIST_REPOS_BY_COLLECTION,
-    SYNC_SUBSCRIBE_REPOS,
+    IDENTITY_UPDATE_HANDLE, LEXICON_RESOLVE_LEXICON, REPO_APPLY_WRITES, REPO_CREATE_RECORD,
+    REPO_DELETE_RECORD, REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO,
+    REPO_LIST_MISSING_BLOBS, REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB,
+    SERVER_ACTIVATE_ACCOUNT, SERVER_CHANGE_PASSWORD, SERVER_CHECK_ACCOUNT_STATUS,
+    SERVER_CONFIRM_EMAIL, SERVER_CREATE_ACCOUNT, SERVER_CREATE_APP_PASSWORD,
+    SERVER_CREATE_INVITE_CODE, SERVER_CREATE_INVITE_CODES, SERVER_CREATE_SESSION,
+    SERVER_DEACTIVATE_ACCOUNT, SERVER_DELETE_ACCOUNT, SERVER_DELETE_SESSION,
+    SERVER_DESCRIBE_SERVER, SERVER_GET_ACCOUNT_INVITE_CODES, SERVER_GET_SERVICE_AUTH,
+    SERVER_GET_SESSION, SERVER_LIST_APP_PASSWORDS, SERVER_REFRESH_SESSION,
+    SERVER_REQUEST_ACCOUNT_DELETE, SERVER_REQUEST_EMAIL_CONFIRMATION, SERVER_REQUEST_EMAIL_UPDATE,
+    SERVER_REQUEST_PASSWORD_RESET, SERVER_RESERVE_SIGNING_KEY, SERVER_RESET_PASSWORD,
+    SERVER_REVOKE_APP_PASSWORD, SERVER_UPDATE_EMAIL, SYNC_GET_BLOB, SYNC_GET_BLOCKS,
+    SYNC_GET_CHECKOUT, SYNC_GET_HEAD, SYNC_GET_HOST_STATUS, SYNC_GET_LATEST_COMMIT,
+    SYNC_GET_RECORD, SYNC_GET_REPO, SYNC_GET_REPO_STATUS, SYNC_LIST_BLOBS, SYNC_LIST_HOSTS,
+    SYNC_LIST_REPOS, SYNC_LIST_REPOS_BY_COLLECTION, SYNC_SUBSCRIBE_REPOS,
 };
 use crate::xrpc::{XrpcError, XrpcRoute};
 
@@ -269,6 +269,7 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcRequestPlcOperationSignature": "POST /xrpc/com.atproto.identity.requestPlcOperationSignature",
                 "xrpcSignPlcOperation": "POST /xrpc/com.atproto.identity.signPlcOperation",
                 "xrpcSubmitPlcOperation": "POST /xrpc/com.atproto.identity.submitPlcOperation",
+                "xrpcResolveLexicon": "GET /xrpc/com.atproto.lexicon.resolveLexicon?nsid=:nsid",
                 "xrpcCreateAccount": "POST /xrpc/com.atproto.server.createAccount",
                 "xrpcCreateSession": "POST /xrpc/com.atproto.server.createSession",
                 "xrpcGetSession": "GET /xrpc/com.atproto.server.getSession",
@@ -318,10 +319,11 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcApplyWrites": "POST /xrpc/com.atproto.repo.applyWrites",
                 "xrpcImportRepo": "POST /xrpc/com.atproto.repo.importRepo",
                 "xrpcUploadBlob": "POST /xrpc/com.atproto.repo.uploadBlob",
-                "xrpcListMissingBlobs": "GET /xrpc/com.atproto.repo.listMissingBlobs?repo=:repo",
+                "xrpcListMissingBlobs": "GET /xrpc/com.atproto.repo.listMissingBlobs",
                 "xrpcGetLatestCommit": "GET /xrpc/com.atproto.sync.getLatestCommit?did=:did",
                 "xrpcGetHead": "GET /xrpc/com.atproto.sync.getHead?did=:did",
                 "xrpcGetRepoStatus": "GET /xrpc/com.atproto.sync.getRepoStatus?did=:did",
+                "xrpcListHosts": "GET /xrpc/com.atproto.sync.listHosts",
                 "xrpcListRepos": "GET /xrpc/com.atproto.sync.listRepos",
                 "xrpcListReposByCollection": "GET /xrpc/com.atproto.sync.listReposByCollection?collection=:nsid",
                 "xrpcSubscribeRepos": "GET /xrpc/com.atproto.sync.subscribeRepos",
@@ -522,6 +524,13 @@ impl PdsDirectoryObject {
         if req.method() == Method::Get
             && parts.len() >= 2
             && parts[0] == "xrpc"
+            && parts[1] == SYNC_LIST_HOSTS
+        {
+            return self.xrpc_list_hosts(req, &url);
+        }
+        if req.method() == Method::Get
+            && parts.len() >= 2
+            && parts[0] == "xrpc"
             && parts[1] == SYNC_LIST_REPOS
         {
             return self.xrpc_list_repos(&url);
@@ -629,6 +638,7 @@ impl PdsDirectoryObject {
                 (Method::Get, IDENTITY_GET_RECOMMENDED_DID_CREDENTIALS) => {
                     self.xrpc_get_recommended_did_credentials(req, &url)
                 }
+                (Method::Get, LEXICON_RESOLVE_LEXICON) => self.xrpc_resolve_lexicon(&url).await,
                 (Method::Post, IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE) => {
                     self.xrpc_request_plc_operation_signature(req).await
                 }
@@ -712,6 +722,8 @@ impl PdsDirectoryObject {
                     | IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE
                     | IDENTITY_SIGN_PLC_OPERATION
                     | IDENTITY_SUBMIT_PLC_OPERATION
+                    | LEXICON_RESOLVE_LEXICON
+                    | SYNC_LIST_HOSTS
                     | ADMIN_DELETE_ACCOUNT
                     | ADMIN_DISABLE_ACCOUNT_INVITES
                     | ADMIN_DISABLE_INVITE_CODES
@@ -2020,6 +2032,24 @@ impl PdsDirectoryObject {
         json_response(200, &body).map_err(HttpError::worker)
     }
 
+    async fn xrpc_resolve_lexicon(&self, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let nsid = Nsid::new(required_param(&params, "nsid").map_err(HttpError::xrpc)?)
+            .map_err(HttpError::bad_request)?;
+        let Some(record) = fetch_published_lexicon_record(&self.env, nsid.as_str()).await? else {
+            return Err(HttpError::new(404, "LexiconNotFound"));
+        };
+        json_response(
+            200,
+            &json!({
+                "cid": record.cid,
+                "uri": record.uri,
+                "schema": record.schema,
+            }),
+        )
+        .map_err(HttpError::worker)
+    }
+
     async fn xrpc_request_plc_operation_signature(
         &self,
         req: &Request,
@@ -2150,6 +2180,26 @@ impl PdsDirectoryObject {
         }
 
         json_response(200, &body).map_err(HttpError::worker)
+    }
+
+    fn xrpc_list_hosts(&self, req: &Request, url: &worker::Url) -> Result<Response, HttpError> {
+        let params = query_pairs(url);
+        let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 500, 1000)?;
+        let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
+        let request_host = request_host(req)?;
+        let store = self.store();
+        let hosts = if cursor.is_none() && limit > 0 {
+            vec![json!({
+                "hostname": request_host,
+                "seq": store.max_event_seq().map_err(HttpError::worker)?,
+                "accountCount": store.account_count().map_err(HttpError::worker)?,
+                "status": "active",
+            })]
+        } else {
+            Vec::new()
+        };
+
+        json_response(200, &json!({ "hosts": hosts })).map_err(HttpError::worker)
     }
 
     fn xrpc_list_repos_by_collection(&self, url: &worker::Url) -> Result<Response, HttpError> {
@@ -4250,12 +4300,14 @@ impl RepoObject {
         url: &worker::Url,
     ) -> Result<Response, HttpError> {
         let params = query_pairs(url);
-        let repo = required_param(&params, "repo").map_err(HttpError::xrpc)?;
         let limit = parse_xrpc_limit(optional_param(&params, "limit").as_deref(), 500, 1000)?;
         let cursor = optional_param(&params, "cursor").filter(|value| !value.is_empty());
         let state = self.repo_state()?;
-        ensure_repo_identifier(&state, &self.repo_identity()?, &repo)?;
         self.require_repo_maintenance_auth(req, &state.did).await?;
+        if let Some(repo) = optional_param(&params, "repo").filter(|value| !value.trim().is_empty())
+        {
+            ensure_repo_identifier(&state, &self.repo_identity()?, &repo)?;
+        }
         let (refs, next_cursor) = self
             .store()
             .list_missing_blob_refs(limit, cursor.as_deref())
@@ -6747,7 +6799,23 @@ fn extra_lexicons_from_env(env: &Env) -> Result<Vec<Value>, HttpError> {
     }
 }
 
+struct PublishedLexiconRecord {
+    cid: String,
+    uri: String,
+    schema: Value,
+    normalized_schema: Value,
+}
+
 async fn fetch_published_lexicon(env: &Env, collection: &str) -> Result<Option<Value>, HttpError> {
+    Ok(fetch_published_lexicon_record(env, collection)
+        .await?
+        .map(|record| record.normalized_schema))
+}
+
+async fn fetch_published_lexicon_record(
+    env: &Env,
+    collection: &str,
+) -> Result<Option<PublishedLexiconRecord>, HttpError> {
     let Some(txt_name) = lexicon_txt_name(collection) else {
         return Ok(None);
     };
@@ -6777,21 +6845,38 @@ async fn fetch_published_lexicon(env: &Env, collection: &str) -> Result<Option<V
     let Some(record) = fetch_json_url_optional(&url).await? else {
         return Ok(None);
     };
-    let lexicon = record
+    let cid = record
+        .get("cid")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HttpError::new(502, "published Lexicon record did not contain `cid`"))?
+        .to_string();
+    let uri = record
+        .get("uri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| HttpError::new(502, "published Lexicon record did not contain `uri`"))?
+        .to_string();
+    let raw_lexicon = record
         .get("value")
         .cloned()
         .ok_or_else(|| HttpError::new(502, "published Lexicon record did not contain `value`"))?;
-    let lexicon = lexicon::normalize_schema_record(&lexicon)
+    let normalized_schema = lexicon::normalize_schema_record(&raw_lexicon)
         .map_err(|error| HttpError::new(502, error.to_string()))?;
-    if lexicon::schema_id(&lexicon) != Some(collection) {
+    if lexicon::schema_id(&normalized_schema) != Some(collection) {
         return Err(HttpError::new(
             502,
             format!("published Lexicon record value id did not match `{collection}`"),
         ));
     }
-    lexicon::validate_lexicon_schema(&lexicon)
+    lexicon::validate_lexicon_schema(&normalized_schema)
         .map_err(|error| HttpError::new(502, error.to_string()))?;
-    Ok(Some(lexicon))
+    let schema = lexicon::published_schema_record(&normalized_schema)
+        .map_err(|error| HttpError::new(502, error.to_string()))?;
+    Ok(Some(PublishedLexiconRecord {
+        cid,
+        uri,
+        schema,
+        normalized_schema,
+    }))
 }
 
 fn lexicon_authority_did_from_env(

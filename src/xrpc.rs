@@ -55,6 +55,7 @@ pub const IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE: &str =
     "com.atproto.identity.requestPlcOperationSignature";
 pub const IDENTITY_SIGN_PLC_OPERATION: &str = "com.atproto.identity.signPlcOperation";
 pub const IDENTITY_SUBMIT_PLC_OPERATION: &str = "com.atproto.identity.submitPlcOperation";
+pub const LEXICON_RESOLVE_LEXICON: &str = "com.atproto.lexicon.resolveLexicon";
 pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
 pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
@@ -68,6 +69,7 @@ pub const REPO_LIST_MISSING_BLOBS: &str = "com.atproto.repo.listMissingBlobs";
 pub const SYNC_GET_LATEST_COMMIT: &str = "com.atproto.sync.getLatestCommit";
 pub const SYNC_GET_HEAD: &str = "com.atproto.sync.getHead";
 pub const SYNC_GET_REPO_STATUS: &str = "com.atproto.sync.getRepoStatus";
+pub const SYNC_LIST_HOSTS: &str = "com.atproto.sync.listHosts";
 pub const SYNC_LIST_REPOS: &str = "com.atproto.sync.listRepos";
 pub const SYNC_LIST_REPOS_BY_COLLECTION: &str = "com.atproto.sync.listReposByCollection";
 pub const SYNC_SUBSCRIBE_REPOS: &str = "com.atproto.sync.subscribeRepos";
@@ -182,6 +184,8 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE
         | IDENTITY_SIGN_PLC_OPERATION
         | IDENTITY_SUBMIT_PLC_OPERATION
+        | LEXICON_RESOLVE_LEXICON
+        | SYNC_LIST_HOSTS
         | SYNC_LIST_REPOS
         | SYNC_LIST_REPOS_BY_COLLECTION
         | SYNC_GET_HOST_STATUS
@@ -189,12 +193,8 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         REPO_CREATE_RECORD | REPO_PUT_RECORD | REPO_DELETE_RECORD | REPO_APPLY_WRITES => {
             Ok(XrpcRoute::RepoObjectByJsonBodyRepo)
         }
-        REPO_IMPORT_REPO | REPO_UPLOAD_BLOB => Ok(XrpcRoute::RepoObjectByBearerSubject),
-        REPO_LIST_MISSING_BLOBS => {
-            let repo = required_param(query, "repo")?;
-            Ok(XrpcRoute::RepoObject {
-                name: repo_object_name_from_identifier(&repo),
-            })
+        REPO_IMPORT_REPO | REPO_UPLOAD_BLOB | REPO_LIST_MISSING_BLOBS => {
+            Ok(XrpcRoute::RepoObjectByBearerSubject)
         }
         REPO_DESCRIBE_REPO | REPO_GET_RECORD | REPO_LIST_RECORDS => {
             let repo = required_param(query, "repo")?;
@@ -423,6 +423,8 @@ mod tests {
             IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE,
             IDENTITY_SIGN_PLC_OPERATION,
             IDENTITY_SUBMIT_PLC_OPERATION,
+            LEXICON_RESOLVE_LEXICON,
+            SYNC_LIST_HOSTS,
             SYNC_LIST_REPOS,
             SYNC_LIST_REPOS_BY_COLLECTION,
             SYNC_GET_HOST_STATUS,
@@ -451,28 +453,13 @@ mod tests {
     }
 
     #[test]
-    fn routes_auth_scoped_write_methods_by_bearer_subject() {
-        for method in [REPO_IMPORT_REPO, REPO_UPLOAD_BLOB] {
+    fn routes_auth_scoped_repo_methods_by_bearer_subject() {
+        for method in [REPO_IMPORT_REPO, REPO_UPLOAD_BLOB, REPO_LIST_MISSING_BLOBS] {
             assert_eq!(
                 route_xrpc_method(method, &[]).unwrap(),
                 XrpcRoute::RepoObjectByBearerSubject
             );
         }
-    }
-
-    #[test]
-    fn routes_missing_blob_listing_by_repo_query() {
-        assert_eq!(
-            route_xrpc_method(
-                REPO_LIST_MISSING_BLOBS,
-                &query(&[("repo", "did:gsv:alice")])
-            )
-            .unwrap(),
-            XrpcRoute::RepoObject {
-                name: "alice".to_string()
-            }
-        );
-        assert!(route_xrpc_method(REPO_LIST_MISSING_BLOBS, &[]).is_err());
     }
 
     #[test]

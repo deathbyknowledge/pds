@@ -38,6 +38,8 @@ set workers_dev = true or pass a config that enables a public route.
 MSG
 fi
 
+npm run audit:xrpc
+
 printf '%s\n' "$PDS_ADMIN_TOKEN" | npx wrangler secret put PDS_ADMIN_TOKEN
 if [[ -n "${PDS_PLC_ROTATION_KEY_P256_HEX:-}" ]]; then
   printf '%s\n' "$PDS_PLC_ROTATION_KEY_P256_HEX" | npx wrangler secret put PDS_PLC_ROTATION_KEY_P256_HEX
@@ -58,8 +60,9 @@ if [[ -n "${PDS_BASE_URL:-}" ]]; then
     npm run smoke:firehose:cursor
     npm run smoke:firehose:oversize
     npm run smoke:client
+    npm run smoke:conformance
   else
-    echo "Skipping smoke:plc-account, smoke:migration, smoke:firehose, smoke:firehose:cursor, smoke:firehose:oversize, and smoke:client; set PDS_PLC_ROTATION_KEY_P256_HEX to enable did:plc account creation, migration, firehose, and official client tests."
+    echo "Skipping smoke:plc-account, smoke:migration, smoke:firehose, smoke:firehose:cursor, smoke:firehose:oversize, smoke:client, and smoke:conformance; set PDS_PLC_ROTATION_KEY_P256_HEX to enable did:plc account creation, migration, firehose, and official client tests."
   fi
   if [[ -n "${OAUTH_CONFIDENTIAL_CLIENT_ID:-}" && -n "${OAUTH_CONFIDENTIAL_CLIENT_PRIVATE_KEY_JWK:-}" ]]; then
     npm run smoke:oauth:confidential
@@ -90,7 +93,8 @@ Optional did:plc account smoke:
   npm run smoke:firehose && \
   npm run smoke:firehose:cursor && \
   npm run smoke:firehose:oversize && \
-  npm run smoke:client
+  npm run smoke:client && \
+  npm run smoke:conformance
 
 Optional confidential OAuth smoke:
   OAUTH_CONFIDENTIAL_CLIENT_ID=https://client.example.com/client.json \

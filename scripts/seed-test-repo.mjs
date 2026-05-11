@@ -433,7 +433,7 @@ const listBlobs = await expectJson(
 const missingBlobRefs = await expectJson(
   "list missing blobs",
   "GET",
-  `/xrpc/com.atproto.repo.listMissingBlobs?repo=${encodeQuery(did)}`,
+  "/xrpc/com.atproto.repo.listMissingBlobs",
   null,
   (body) => {
     if (!Array.isArray(body.blobs)) {

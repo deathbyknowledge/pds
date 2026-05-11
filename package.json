@@ -17,8 +17,10 @@
     "smoke:oauth:confidential": "node scripts/oauth-confidential-smoke.mjs",
     "smoke:oauth:client": "node scripts/oauth-official-client-smoke.mjs",
     "smoke:client": "node scripts/official-client-smoke.mjs",
+    "smoke:conformance": "node scripts/xrpc-conformance-smoke.mjs",
     "smoke:plc-account": "node scripts/plc-account-smoke.mjs",
     "smoke:public": "node scripts/public-smoke.mjs",
+    "audit:xrpc": "node scripts/xrpc-method-coverage.mjs",
     "build:worker": "worker-build --release .",
     "test:rust": "cargo test",
     "test": "cargo test"

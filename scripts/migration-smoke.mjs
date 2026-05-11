@@ -126,7 +126,7 @@ await expectStatus("import migrated repo", "POST", "/xrpc/com.atproto.repo.impor
 await expectJson(
   "list missing blobs before upload",
   "GET",
-  `/xrpc/com.atproto.repo.listMissingBlobs?repo=${encodeQuery(generated.did)}`,
+  "/xrpc/com.atproto.repo.listMissingBlobs",
   null,
   (body) => {
     const missing = body.blobs ?? [];
@@ -161,7 +161,7 @@ await expectJson(
 await expectJson(
   "list missing blobs after upload",
   "GET",
-  `/xrpc/com.atproto.repo.listMissingBlobs?repo=${encodeQuery(generated.did)}`,
+  "/xrpc/com.atproto.repo.listMissingBlobs",
   null,
   (body) => {
     if ((body.blobs ?? []).some((blob) => blob.cid === generated.blobCid)) {
