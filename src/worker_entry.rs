@@ -104,6 +104,8 @@ const BLOB_GC_BATCH_LIMIT: usize = 200;
 const MAX_IMPORT_REPO_BYTES: usize = 25 * 1024 * 1024;
 const MAX_APPLY_WRITES: usize = 200;
 const MAX_DYNAMIC_LEXICON_FETCHES: usize = 32;
+const DEFAULT_FIREHOSE_REPLAY_LIMIT: usize = 1024;
+const FIREHOSE_REPLAY_BATCH_LIMIT: usize = 500;
 const PASSWORD_SALT_BYTES: usize = 16;
 const SESSION_ID_BYTES: usize = 24;
 const APP_PASSWORD_BYTES: usize = 18;
@@ -2707,7 +2709,7 @@ impl PdsDirectoryObject {
         }
 
         let params = query_pairs(url);
-        let cursor = optional_param(&params, "cursor")
+        let requested_cursor = optional_param(&params, "cursor")
             .filter(|value| !value.is_empty())
             .map(|value| {
                 value.parse::<i64>().map_err(|_| {
@@ -2717,24 +2719,82 @@ impl PdsDirectoryObject {
                     )
                 })
             })
-            .transpose()?
-            .unwrap_or(self.store().max_event_seq().map_err(HttpError::worker)?);
+            .transpose()?;
+        if requested_cursor.is_some_and(|cursor| cursor < 0) {
+            return Err(HttpError::new(
+                400,
+                "cursor must be zero or a positive integer",
+            ));
+        }
+        let store = self.store();
+        let max_seq = store.max_event_seq().map_err(HttpError::worker)?;
+        let replay_limit = firehose_replay_limit_from_env(&self.env)?;
+        let oldest_replay_cursor = store
+            .oldest_event_replay_cursor(replay_limit)
+            .map_err(HttpError::worker)?;
 
         let pair = WebSocketPair::new().map_err(HttpError::worker)?;
         self.state.accept_web_socket(&pair.server);
 
-        let events = self
-            .store()
-            .list_events_after(cursor, 500)
-            .map_err(HttpError::worker)?;
-        for event in events {
-            let frame = subscribe_event_frame(&event)?;
-            pair.server
-                .send_with_bytes(frame)
-                .map_err(HttpError::worker)?;
+        if let Some(cursor) = requested_cursor {
+            if cursor > max_seq {
+                pair.server
+                    .send_with_bytes(subscribe_error_frame(
+                        "FutureCursor",
+                        Some("cursor is ahead of the current stream sequence"),
+                    )?)
+                    .map_err(HttpError::worker)?;
+                pair.server
+                    .close(Some(1008), Some("FutureCursor"))
+                    .map_err(HttpError::worker)?;
+                return Response::from_websocket(pair.client).map_err(HttpError::worker);
+            }
+            let mut replay_cursor = cursor;
+            if cursor == 0 {
+                replay_cursor = oldest_replay_cursor;
+            } else if cursor < oldest_replay_cursor {
+                pair.server
+                    .send_with_bytes(subscribe_info_frame(
+                        "OutdatedCursor",
+                        Some("cursor is older than the available replay window"),
+                    )?)
+                    .map_err(HttpError::worker)?;
+                replay_cursor = oldest_replay_cursor;
+            }
+            self.send_subscribe_replay(&pair.server, replay_cursor, max_seq, replay_limit)?;
         }
 
         Response::from_websocket(pair.client).map_err(HttpError::worker)
+    }
+
+    fn send_subscribe_replay(
+        &self,
+        socket: &WebSocket,
+        mut cursor: i64,
+        max_seq: i64,
+        replay_limit: usize,
+    ) -> Result<(), HttpError> {
+        let store = self.store();
+        let mut remaining = replay_limit;
+        while cursor < max_seq && remaining > 0 {
+            let events = store
+                .list_events_after_until(
+                    cursor,
+                    max_seq,
+                    remaining.min(FIREHOSE_REPLAY_BATCH_LIMIT),
+                )
+                .map_err(HttpError::worker)?;
+            if events.is_empty() {
+                break;
+            }
+            for event in events {
+                cursor = event.seq;
+                let frame = subscribe_event_frame(&event)?;
+                socket.send_with_bytes(frame).map_err(HttpError::worker)?;
+                remaining = remaining.saturating_sub(1);
+            }
+        }
+        Ok(())
     }
 
     async fn internal_upsert_repo(&self, req: &mut Request) -> Result<Response, HttpError> {
@@ -6592,6 +6652,35 @@ fn max_account_blob_bytes_from_env(env: &Env) -> Result<i64, HttpError> {
         })
 }
 
+fn firehose_replay_limit_from_env(env: &Env) -> Result<usize, HttpError> {
+    let Ok(value) = env.var("PDS_FIREHOSE_REPLAY_LIMIT") else {
+        return Ok(DEFAULT_FIREHOSE_REPLAY_LIMIT);
+    };
+    let value = value.to_string();
+    if value.trim().is_empty() {
+        return Ok(DEFAULT_FIREHOSE_REPLAY_LIMIT);
+    }
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| {
+            HttpError::new(
+                500,
+                "PDS_FIREHOSE_REPLAY_LIMIT must be a positive integer event count",
+            )
+        })
+        .and_then(|limit| {
+            if limit > 0 {
+                Ok(limit)
+            } else {
+                Err(HttpError::new(
+                    500,
+                    "PDS_FIREHOSE_REPLAY_LIMIT must be greater than zero",
+                ))
+            }
+        })
+}
+
 fn extra_lexicons_from_env(env: &Env) -> Result<Vec<Value>, HttpError> {
     let Ok(value) = env.var("PDS_LEXICONS_JSON") else {
         return Ok(Vec::new());
@@ -7823,6 +7912,25 @@ fn subscribe_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError
     Ok(frame)
 }
 
+fn subscribe_error_frame(error: &str, message: Option<&str>) -> Result<Vec<u8>, HttpError> {
+    let header = SubscribeReposErrorHeader { op: -1 };
+    let body = SubscribeReposError { error, message };
+    let mut frame = encode_dag_cbor(&header).map_err(HttpError::worker)?;
+    frame.extend(encode_dag_cbor(&body).map_err(HttpError::worker)?);
+    Ok(frame)
+}
+
+fn subscribe_info_frame(name: &str, message: Option<&str>) -> Result<Vec<u8>, HttpError> {
+    let header = SubscribeReposHeader {
+        op: 1,
+        kind: "#info",
+    };
+    let body = SubscribeReposInfo { name, message };
+    let mut frame = encode_dag_cbor(&header).map_err(HttpError::worker)?;
+    frame.extend(encode_dag_cbor(&body).map_err(HttpError::worker)?);
+    Ok(frame)
+}
+
 fn subscribe_sync_event_frame(event: &DirectoryEventRow) -> Result<Vec<u8>, HttpError> {
     let rev = event
         .rev
@@ -7889,6 +7997,25 @@ struct SubscribeReposHeader<'a> {
     op: i64,
     #[serde(rename = "t")]
     kind: &'a str,
+}
+
+#[derive(Serialize)]
+struct SubscribeReposErrorHeader {
+    op: i64,
+}
+
+#[derive(Serialize)]
+struct SubscribeReposError<'a> {
+    error: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct SubscribeReposInfo<'a> {
+    name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<&'a str>,
 }
 
 #[derive(Serialize)]

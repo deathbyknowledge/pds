@@ -2114,20 +2114,41 @@ impl SqlDirectoryStore {
         )
     }
 
-    pub fn list_events_after(
+    pub fn oldest_event_replay_cursor(&self, replay_limit: usize) -> worker::Result<i64> {
+        if replay_limit == 0 {
+            return self.max_event_seq();
+        }
+        let rows = self.sql.exec(
+            "SELECT seq
+             FROM directory_events
+             ORDER BY seq DESC
+             LIMIT 1 OFFSET ?",
+            vec![SqlStorageValue::from(replay_limit.saturating_sub(1) as i64)],
+        )?;
+        let Some(row) = rows.raw().next() else {
+            return Ok(0);
+        };
+        let mut values = row?.into_iter();
+        let seq = next_i64(&mut values, "seq")?;
+        Ok(seq.saturating_sub(1))
+    }
+
+    pub fn list_events_after_until(
         &self,
         cursor: i64,
+        max_seq: i64,
         limit: usize,
     ) -> worker::Result<Vec<DirectoryEventRow>> {
         let rows = self.sql.exec(
             "SELECT seq, did, event_type, commit_cid, rev, since, prev_data, blocks, ops_json, blobs_json,
                     strftime('%Y-%m-%dT%H:%M:%SZ', created_at, 'unixepoch') AS created_at
                  FROM directory_events
-                 WHERE seq > ?
+                 WHERE seq > ? AND seq <= ?
                  ORDER BY seq ASC
                  LIMIT ?",
             vec![
                 SqlStorageValue::from(cursor),
+                SqlStorageValue::from(max_seq),
                 SqlStorageValue::from(limit as i64),
             ],
         )?;

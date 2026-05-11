@@ -101,8 +101,9 @@ struct FinalizedFixture {
 #[derive(Debug, Deserialize)]
 struct SubscribeReposHeader {
     op: i64,
+    #[serde(default)]
     #[serde(rename = "t")]
-    kind: String,
+    kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +155,12 @@ struct SubscribeReposAccountFrame {
 #[derive(Debug, Deserialize)]
 struct SubscribeReposInfoFrame {
     name: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubscribeReposErrorFrame {
+    error: String,
     message: Option<String>,
 }
 
@@ -301,15 +308,31 @@ fn decode_subscribe_repos_frame(frame_base64: &str) -> Result<Value, AnyError> {
     let frame = BASE64_STANDARD.decode(frame_base64)?;
     let mut cursor = Cursor::new(frame);
     let header: SubscribeReposHeader = serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
+    if header.op == -1 {
+        let body: SubscribeReposErrorFrame = serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
+        if cursor.position() != cursor.get_ref().len() as u64 {
+            return Err("subscribeRepos error frame had trailing bytes".into());
+        }
+        return Ok(json!({
+            "op": header.op,
+            "kind": "#error",
+            "error": body.error,
+            "message": body.message,
+        }));
+    }
     if header.op != 1 {
         return Err(format!("unsupported subscribeRepos op {}", header.op).into());
     }
-    let body = match header.kind.as_str() {
+    let kind = header
+        .kind
+        .ok_or_else(|| "subscribeRepos event frame missing `t` kind".to_string())?;
+    let body = match kind.as_str() {
         "#commit" => {
             let body: SubscribeReposCommitFrame =
                 serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
             json!({
-                "kind": header.kind,
+                "op": header.op,
+                "kind": kind,
                 "seq": body.seq,
                 "rebase": body.rebase,
                 "tooBig": body.too_big,
@@ -328,7 +351,8 @@ fn decode_subscribe_repos_frame(frame_base64: &str) -> Result<Value, AnyError> {
             let body: SubscribeReposSyncFrame =
                 serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
             json!({
-                "kind": header.kind,
+                "op": header.op,
+                "kind": kind,
                 "seq": body.seq,
                 "did": body.did,
                 "blocksBase64": BASE64_STANDARD.encode(body.blocks),
@@ -340,7 +364,8 @@ fn decode_subscribe_repos_frame(frame_base64: &str) -> Result<Value, AnyError> {
             let body: SubscribeReposIdentityFrame =
                 serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
             json!({
-                "kind": header.kind,
+                "op": header.op,
+                "kind": kind,
                 "seq": body.seq,
                 "did": body.did,
                 "handle": body.handle,
@@ -351,7 +376,8 @@ fn decode_subscribe_repos_frame(frame_base64: &str) -> Result<Value, AnyError> {
             let body: SubscribeReposAccountFrame =
                 serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
             json!({
-                "kind": header.kind,
+                "op": header.op,
+                "kind": kind,
                 "seq": body.seq,
                 "did": body.did,
                 "active": body.active,
@@ -363,7 +389,8 @@ fn decode_subscribe_repos_frame(frame_base64: &str) -> Result<Value, AnyError> {
             let body: SubscribeReposInfoFrame =
                 serde_ipld_dagcbor::de::from_reader_once(&mut cursor)?;
             json!({
-                "kind": header.kind,
+                "op": header.op,
+                "kind": kind,
                 "name": body.name,
                 "message": body.message,
             })
@@ -569,5 +596,28 @@ mod tests {
         assert_eq!(decoded[0]["did"], "did:plc:abc123");
         assert_eq!(decoded[0]["active"], false);
         assert_eq!(decoded[0]["status"], "deactivated");
+    }
+
+    #[test]
+    fn decodes_subscribe_repos_error_frames() {
+        let mut frame = pds::cbor::encode_dag_cbor(&json!({
+            "op": -1,
+        }))
+        .unwrap();
+        frame.extend(
+            pds::cbor::encode_dag_cbor(&json!({
+                "error": "FutureCursor",
+                "message": "cursor is ahead of the current stream sequence",
+            }))
+            .unwrap(),
+        );
+        let decoded = decode_subscribe_repos_frames(DecodeSubscribeReposFramesRequest {
+            frames_base64: vec![BASE64_STANDARD.encode(frame)],
+        })
+        .unwrap();
+
+        assert_eq!(decoded[0]["op"], -1);
+        assert_eq!(decoded[0]["kind"], "#error");
+        assert_eq!(decoded[0]["error"], "FutureCursor");
     }
 }
