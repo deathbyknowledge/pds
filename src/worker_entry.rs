@@ -52,6 +52,10 @@ use crate::oauth::{
     OAUTH_AUTHORIZE_PATH, OAUTH_PAR_EXPIRES_IN_SECONDS, OAUTH_PAR_PATH,
     OAUTH_PROTECTED_RESOURCE_PATH, OAUTH_REQUEST_URI_PREFIX, OAUTH_TOKEN_PATH,
 };
+use crate::plc::{
+    recommended_did_credentials_body, sign_plc_update_operation, validate_submitted_plc_operation,
+    PlcError, SignPlcOperationRequest,
+};
 use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
 };
@@ -67,8 +71,10 @@ use crate::xrpc::{
     ADMIN_ENABLE_ACCOUNT_INVITES, ADMIN_GET_ACCOUNT_INFO, ADMIN_GET_ACCOUNT_INFOS,
     ADMIN_GET_INVITE_CODES, ADMIN_GET_SUBJECT_STATUS, ADMIN_SEARCH_ACCOUNTS, ADMIN_SEND_EMAIL,
     ADMIN_UPDATE_ACCOUNT_EMAIL, ADMIN_UPDATE_ACCOUNT_HANDLE, ADMIN_UPDATE_ACCOUNT_PASSWORD,
-    ADMIN_UPDATE_ACCOUNT_SIGNING_KEY, ADMIN_UPDATE_SUBJECT_STATUS, IDENTITY_REFRESH_IDENTITY,
-    IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE, IDENTITY_RESOLVE_IDENTITY,
+    ADMIN_UPDATE_ACCOUNT_SIGNING_KEY, ADMIN_UPDATE_SUBJECT_STATUS,
+    IDENTITY_GET_RECOMMENDED_DID_CREDENTIALS, IDENTITY_REFRESH_IDENTITY,
+    IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE, IDENTITY_RESOLVE_DID, IDENTITY_RESOLVE_HANDLE,
+    IDENTITY_RESOLVE_IDENTITY, IDENTITY_SIGN_PLC_OPERATION, IDENTITY_SUBMIT_PLC_OPERATION,
     IDENTITY_UPDATE_HANDLE, REPO_APPLY_WRITES, REPO_CREATE_RECORD, REPO_DELETE_RECORD,
     REPO_DESCRIBE_REPO, REPO_GET_RECORD, REPO_IMPORT_REPO, REPO_LIST_MISSING_BLOBS,
     REPO_LIST_RECORDS, REPO_PUT_RECORD, REPO_UPLOAD_BLOB, SERVER_ACTIVATE_ACCOUNT,
@@ -114,6 +120,7 @@ const ACTION_ACCOUNT_DELETE: &str = "account_delete";
 const ACTION_PASSWORD_RESET: &str = "password_reset";
 const ACTION_EMAIL_CONFIRMATION: &str = "email_confirmation";
 const ACTION_EMAIL_UPDATE: &str = "email_update";
+const ACTION_PLC_OPERATION: &str = "plc_operation";
 const INTERNAL_REPO_CONTROL_ROOT: &str = "_pds_internal";
 const INTERNAL_REPO_CONTROL_REPOS: &str = "repos";
 const INTERNAL_REPO_CONTROL_STATUS: &str = "status";
@@ -251,6 +258,10 @@ async fn fetch(req: Request, env: worker::Env, _ctx: Context) -> worker::Result<
                 "xrpcResolveHandle": "GET /xrpc/com.atproto.identity.resolveHandle?handle=:handle",
                 "xrpcResolveDid": "GET /xrpc/com.atproto.identity.resolveDid?did=:did",
                 "xrpcResolveIdentity": "GET /xrpc/com.atproto.identity.resolveIdentity?identifier=:handle_or_did",
+                "xrpcGetRecommendedDidCredentials": "GET /xrpc/com.atproto.identity.getRecommendedDidCredentials",
+                "xrpcRequestPlcOperationSignature": "POST /xrpc/com.atproto.identity.requestPlcOperationSignature",
+                "xrpcSignPlcOperation": "POST /xrpc/com.atproto.identity.signPlcOperation",
+                "xrpcSubmitPlcOperation": "POST /xrpc/com.atproto.identity.submitPlcOperation",
                 "xrpcCreateAccount": "POST /xrpc/com.atproto.server.createAccount",
                 "xrpcCreateSession": "POST /xrpc/com.atproto.server.createSession",
                 "xrpcGetSession": "GET /xrpc/com.atproto.server.getSession",
@@ -606,6 +617,18 @@ impl PdsDirectoryObject {
                 (Method::Post, IDENTITY_REFRESH_IDENTITY) => {
                     self.xrpc_refresh_identity(req, &url).await
                 }
+                (Method::Get, IDENTITY_GET_RECOMMENDED_DID_CREDENTIALS) => {
+                    self.xrpc_get_recommended_did_credentials(req, &url)
+                }
+                (Method::Post, IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE) => {
+                    self.xrpc_request_plc_operation_signature(req).await
+                }
+                (Method::Post, IDENTITY_SIGN_PLC_OPERATION) => {
+                    self.xrpc_sign_plc_operation(req).await
+                }
+                (Method::Post, IDENTITY_SUBMIT_PLC_OPERATION) => {
+                    self.xrpc_submit_plc_operation(req, &url).await
+                }
                 (Method::Post, ADMIN_DELETE_ACCOUNT) => self.xrpc_admin_delete_account(req).await,
                 (Method::Post, ADMIN_DISABLE_ACCOUNT_INVITES) => {
                     self.xrpc_admin_disable_account_invites(req).await
@@ -676,6 +699,10 @@ impl PdsDirectoryObject {
                     | IDENTITY_RESOLVE_IDENTITY
                     | IDENTITY_UPDATE_HANDLE
                     | IDENTITY_REFRESH_IDENTITY
+                    | IDENTITY_GET_RECOMMENDED_DID_CREDENTIALS
+                    | IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE
+                    | IDENTITY_SIGN_PLC_OPERATION
+                    | IDENTITY_SUBMIT_PLC_OPERATION
                     | ADMIN_DELETE_ACCOUNT
                     | ADMIN_DISABLE_ACCOUNT_INVITES
                     | ADMIN_DISABLE_INVITE_CODES
@@ -1826,6 +1853,97 @@ impl PdsDirectoryObject {
             &identity_info_response_body(&request_origin(url), &account),
         )
         .map_err(HttpError::worker)
+    }
+
+    fn xrpc_get_recommended_did_credentials(
+        &self,
+        req: &Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims_allow_inactive(&claims)?;
+        let rotation_keys = recommended_plc_rotation_keys(&self.env)?;
+        let body = recommended_did_credentials_body(
+            &request_origin(url),
+            &account.handle,
+            &account.public_key_multibase,
+            &rotation_keys,
+        )
+        .map_err(HttpError::plc)?;
+        json_response(200, &body).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_request_plc_operation_signature(
+        &self,
+        req: &Request,
+    ) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims_allow_inactive(&claims)?;
+        if account.email.is_none() && !is_admin_authorized(&self.env, req)? {
+            return Err(HttpError::new(
+                400,
+                "account does not have an email address",
+            ));
+        }
+        let token =
+            self.issue_action_token(&account.did, ACTION_PLC_OPERATION, account.email.as_deref())?;
+        action_token_response(&self.env, req, Some(&token)).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_sign_plc_operation(&self, req: &mut Request) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims_allow_inactive(&claims)?;
+        ensure_plc_did(&account.did)?;
+        let body: SignPlcOperationRequest = req.json().await.map_err(HttpError::worker)?;
+        let token = body
+            .token
+            .as_deref()
+            .ok_or_else(|| HttpError::new(400, "TokenRequired"))?;
+        let token = self.validate_action_token(ACTION_PLC_OPERATION, token)?;
+        if token.did != account.did {
+            return Err(HttpError::new(400, "InvalidToken"));
+        }
+        let rotation_key = plc_rotation_signing_key_from_env(&self.env)?
+            .ok_or_else(|| HttpError::new(501, "PLC rotation key is not configured"))?;
+        let rotation_did_key = did_key_from_public_key_multibase(
+            &rotation_key
+                .public_key_multibase()
+                .map_err(HttpError::identity)?,
+        )?;
+        let last_op = fetch_plc_last_operation(account.did.as_str(), &self.env).await?;
+        let operation = sign_plc_update_operation(&last_op, &rotation_key, &rotation_did_key, body)
+            .map_err(HttpError::plc)?;
+        self.consume_validated_action_token(&token)?;
+        json_response(200, &json!({ "operation": operation })).map_err(HttpError::worker)
+    }
+
+    async fn xrpc_submit_plc_operation(
+        &self,
+        req: &mut Request,
+        url: &worker::Url,
+    ) -> Result<Response, HttpError> {
+        let claims = self.require_bearer_claims(req, ACCESS_SCOPE)?;
+        let account = self.account_for_claims_allow_inactive(&claims)?;
+        ensure_plc_did(&account.did)?;
+        let body: XrpcSubmitPlcOperationRequest = req.json().await.map_err(HttpError::worker)?;
+        let Some(server_rotation_key) = plc_rotation_did_key_from_env(&self.env)? else {
+            return Err(HttpError::new(501, "PLC rotation key is not configured"));
+        };
+        validate_submitted_plc_operation(
+            &body.operation,
+            &request_origin(url),
+            &account.handle,
+            &account.public_key_multibase,
+            &server_rotation_key,
+        )
+        .map_err(HttpError::plc)?;
+        submit_plc_operation(account.did.as_str(), &body.operation, &self.env).await?;
+        let event = self
+            .store()
+            .append_identity_event(&account.did, &account.handle)
+            .map_err(HttpError::worker)?;
+        self.broadcast_repo_event(&event)?;
+        empty_response(200).map_err(HttpError::worker)
     }
 
     async fn ensure_handle_update_allowed(
@@ -5230,6 +5348,11 @@ struct XrpcRefreshIdentityRequest {
     identifier: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct XrpcSubmitPlcOperationRequest {
+    operation: Value,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct XrpcReserveSigningKeyRequest {
     #[serde(default)]
@@ -5647,6 +5770,14 @@ impl HttpError {
 
     fn identity(error: IdentityError) -> Self {
         Self::new(400, error.to_string())
+    }
+
+    fn plc(error: PlcError) -> Self {
+        match error {
+            PlcError::BadRequest(message) => Self::new(400, message),
+            PlcError::Cbor(error) => Self::worker(error),
+            PlcError::Identity(error) => Self::identity(error),
+        }
     }
 
     fn auth(error: crate::auth::AuthError) -> Self {
@@ -6418,6 +6549,24 @@ async fn fetch_json_url(url: &str) -> Result<Value, HttpError> {
         .ok_or_else(|| HttpError::new(404, "remote JSON document not found"))
 }
 
+async fn post_json_url(url: &str, body: &Value) -> Result<Response, HttpError> {
+    let headers = Headers::new();
+    headers
+        .set("content-type", "application/json")
+        .map_err(HttpError::worker)?;
+    let mut init = RequestInit::new();
+    init.with_method(Method::Post)
+        .with_headers(headers)
+        .with_body(Some(JsValue::from_str(
+            &to_string(body).map_err(HttpError::worker)?,
+        )));
+    let request = Request::new_with_init(url, &init).map_err(HttpError::worker)?;
+    Fetch::Request(request)
+        .send()
+        .await
+        .map_err(HttpError::worker)
+}
+
 async fn fetch_json_url_optional(url: &str) -> Result<Option<Value>, HttpError> {
     let url = ::url::Url::parse(url)
         .map_err(|error| HttpError::new(400, format!("invalid URL: {error}")))?;
@@ -6785,6 +6934,98 @@ fn identity_info_response_body(origin: &str, account: &DirectoryAccountRow) -> V
     })
 }
 
+fn recommended_plc_rotation_keys(env: &Env) -> Result<Vec<String>, HttpError> {
+    let mut keys = Vec::new();
+    keys.extend(env_list(env, "PDS_PLC_RECOVERY_DID_KEYS"));
+    if let Ok(value) = env.var("PDS_PLC_RECOVERY_DID_KEY") {
+        let value = value.to_string();
+        if !value.trim().is_empty() {
+            keys.push(value.trim().to_string());
+        }
+    }
+    if let Some(did_key) = plc_rotation_did_key_from_env(env)? {
+        keys.push(did_key);
+    }
+    let keys = keys
+        .into_iter()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .collect::<Vec<_>>();
+    for key in &keys {
+        validate_did_key_syntax(key)?;
+    }
+    Ok(keys)
+}
+
+fn plc_rotation_signing_key_from_env(env: &Env) -> Result<Option<RepoSigningKey>, HttpError> {
+    let Ok(value) = env.var("PDS_PLC_ROTATION_KEY_P256_HEX") else {
+        return Ok(None);
+    };
+    let value = value.to_string();
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    RepoSigningKey::from_p256_hex(value.trim())
+        .map(Some)
+        .map_err(HttpError::identity)
+}
+
+fn plc_rotation_did_key_from_env(env: &Env) -> Result<Option<String>, HttpError> {
+    let Some(key) = plc_rotation_signing_key_from_env(env)? else {
+        return Ok(None);
+    };
+    did_key_from_public_key_multibase(&key.public_key_multibase().map_err(HttpError::identity)?)
+        .map(Some)
+}
+
+fn ensure_plc_did(did: &Did) -> Result<(), HttpError> {
+    if did.as_str().starts_with("did:plc:") {
+        Ok(())
+    } else {
+        Err(HttpError::new(400, "DID is not a did:plc identity"))
+    }
+}
+
+async fn fetch_plc_last_operation(did: &str, env: &Env) -> Result<Value, HttpError> {
+    let url = format!(
+        "{}/{}/log/last",
+        plc_directory_url(env),
+        encode_query_component(did)
+    );
+    fetch_json_url(&url).await
+}
+
+async fn submit_plc_operation(did: &str, operation: &Value, env: &Env) -> Result<(), HttpError> {
+    let url = format!("{}/{}", plc_directory_url(env), encode_query_component(did));
+    let mut response = post_json_url(&url, operation).await?;
+    let status = response.status_code();
+    if !(200..300).contains(&status) {
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "failed to read PLC response".to_string());
+        return Err(HttpError::new(
+            502,
+            format!("PLC directory rejected operation with status {status}: {text}"),
+        ));
+    }
+    Ok(())
+}
+
+fn plc_directory_url(env: &Env) -> String {
+    env.var("PDS_PLC_DIRECTORY_URL")
+        .ok()
+        .map(|value| value.to_string())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "https://plc.directory".to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn validate_did_key_syntax(value: &str) -> Result<(), HttpError> {
+    crate::plc::validate_did_key_syntax(value).map_err(HttpError::plc)
+}
+
 fn did_from_admin_subject(subject: &Value) -> Result<Did, HttpError> {
     let Some(did) = subject.get("did").and_then(Value::as_str) else {
         return Err(HttpError::new(
@@ -6807,8 +7048,7 @@ where
 }
 
 fn did_key_from_public_key_multibase(public_key_multibase: &str) -> Result<String, HttpError> {
-    validate_public_key_multibase(public_key_multibase)?;
-    Ok(format!("did:key:{public_key_multibase}"))
+    crate::plc::did_key_from_public_key_multibase(public_key_multibase).map_err(HttpError::plc)
 }
 
 fn normalize_did_key(signing_key: &str) -> Result<String, HttpError> {
@@ -8137,20 +8377,7 @@ mod tests {
 
     #[test]
     fn builds_identity_info_response_body() {
-        let account = DirectoryAccountRow {
-            did: Did::new("did:web:gsv-pds.example.com").unwrap(),
-            handle: "gsv-pds.example.com".to_string(),
-            email: None,
-            email_confirmed: false,
-            invites_disabled: false,
-            invite_note: None,
-            password_hash: "hash".to_string(),
-            repo_name: "gsv-pds.example.com".to_string(),
-            public_key_multibase: "zPublicKey".to_string(),
-            active: true,
-            status: None,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-        };
+        let account = test_account("did:web:gsv-pds.example.com", "gsv-pds.example.com");
 
         let body = identity_info_response_body("https://gsv-pds.example.com", &account);
 
@@ -8429,6 +8656,31 @@ mod tests {
             records: 7,
             expected_blobs: 2,
             imported_blobs: 1,
+        }
+    }
+
+    fn test_account(did: &str, handle: &str) -> DirectoryAccountRow {
+        test_account_with_public_key(did, handle, "zPublicKey")
+    }
+
+    fn test_account_with_public_key(
+        did: &str,
+        handle: &str,
+        public_key_multibase: &str,
+    ) -> DirectoryAccountRow {
+        DirectoryAccountRow {
+            did: Did::new(did).unwrap(),
+            handle: handle.to_string(),
+            email: None,
+            email_confirmed: false,
+            invites_disabled: false,
+            invite_note: None,
+            password_hash: "hash".to_string(),
+            repo_name: repo_object_name_from_identifier(did),
+            public_key_multibase: public_key_multibase.to_string(),
+            active: true,
+            status: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
         }
     }
 

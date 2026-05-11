@@ -103,6 +103,52 @@ await expectJson(
   { authorization: `Bearer ${session.accessJwt}` },
 );
 
+await expectJson(
+  "recommended DID credentials",
+  "GET",
+  "/xrpc/com.atproto.identity.getRecommendedDidCredentials",
+  null,
+  (body) => {
+    if (
+      body.alsoKnownAs?.[0] !== `at://${handle}` ||
+      typeof body.verificationMethods?.atproto !== "string" ||
+      body.services?.atproto_pds?.type !== "AtprotoPersonalDataServer" ||
+      body.services?.atproto_pds?.endpoint !== baseOrigin
+    ) {
+      throw new Error(`unexpected recommended DID credentials ${JSON.stringify(body)}`);
+    }
+    if (body.rotationKeys && !Array.isArray(body.rotationKeys)) {
+      throw new Error(`recommended DID credentials returned bad rotationKeys ${JSON.stringify(body)}`);
+    }
+  },
+  { authorization: `Bearer ${session.accessJwt}` },
+);
+
+await expectJson(
+  "request PLC operation signature",
+  "POST",
+  "/xrpc/com.atproto.identity.requestPlcOperationSignature",
+  null,
+  (body) => {
+    if (typeof body.token !== "string" || body.token.length < 16) {
+      throw new Error(`unexpected requestPlcOperationSignature response ${JSON.stringify(body)}`);
+    }
+  },
+  {
+    authorization: `Bearer ${session.accessJwt}`,
+    "x-pds-admin-token": config.adminToken,
+  },
+);
+
+await expectStatus(
+  "sign PLC operation rejects did:web",
+  "POST",
+  "/xrpc/com.atproto.identity.signPlcOperation",
+  { token: "unused" },
+  400,
+  { authorization: `Bearer ${session.accessJwt}` },
+);
+
 await expectStatus(
   "update handle no-op",
   "POST",

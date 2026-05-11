@@ -39,6 +39,9 @@ MSG
 fi
 
 printf '%s' "$PDS_ADMIN_TOKEN" | npx wrangler secret put PDS_ADMIN_TOKEN
+if [[ -n "${PDS_PLC_ROTATION_KEY_P256_HEX:-}" ]]; then
+  printf '%s' "$PDS_PLC_ROTATION_KEY_P256_HEX" | npx wrangler secret put PDS_PLC_ROTATION_KEY_P256_HEX
+fi
 npx wrangler deploy "$@"
 
 if [[ -n "${PDS_BASE_URL:-}" ]]; then

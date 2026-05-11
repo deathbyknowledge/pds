@@ -15,6 +15,7 @@ pub mod lexicon;
 pub mod model;
 pub mod mst;
 pub mod oauth;
+pub mod plc;
 pub mod repo;
 pub mod repo_import;
 pub mod service;

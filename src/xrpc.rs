@@ -49,6 +49,12 @@ pub const IDENTITY_RESOLVE_DID: &str = "com.atproto.identity.resolveDid";
 pub const IDENTITY_RESOLVE_IDENTITY: &str = "com.atproto.identity.resolveIdentity";
 pub const IDENTITY_UPDATE_HANDLE: &str = "com.atproto.identity.updateHandle";
 pub const IDENTITY_REFRESH_IDENTITY: &str = "com.atproto.identity.refreshIdentity";
+pub const IDENTITY_GET_RECOMMENDED_DID_CREDENTIALS: &str =
+    "com.atproto.identity.getRecommendedDidCredentials";
+pub const IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE: &str =
+    "com.atproto.identity.requestPlcOperationSignature";
+pub const IDENTITY_SIGN_PLC_OPERATION: &str = "com.atproto.identity.signPlcOperation";
+pub const IDENTITY_SUBMIT_PLC_OPERATION: &str = "com.atproto.identity.submitPlcOperation";
 pub const REPO_DESCRIBE_REPO: &str = "com.atproto.repo.describeRepo";
 pub const REPO_GET_RECORD: &str = "com.atproto.repo.getRecord";
 pub const REPO_LIST_RECORDS: &str = "com.atproto.repo.listRecords";
@@ -172,6 +178,10 @@ pub fn route_xrpc_method(method: &str, query: &[(String, String)]) -> Result<Xrp
         | IDENTITY_RESOLVE_IDENTITY
         | IDENTITY_UPDATE_HANDLE
         | IDENTITY_REFRESH_IDENTITY
+        | IDENTITY_GET_RECOMMENDED_DID_CREDENTIALS
+        | IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE
+        | IDENTITY_SIGN_PLC_OPERATION
+        | IDENTITY_SUBMIT_PLC_OPERATION
         | SYNC_LIST_REPOS
         | SYNC_LIST_REPOS_BY_COLLECTION
         | SYNC_GET_HOST_STATUS
@@ -409,6 +419,10 @@ mod tests {
             IDENTITY_RESOLVE_IDENTITY,
             IDENTITY_UPDATE_HANDLE,
             IDENTITY_REFRESH_IDENTITY,
+            IDENTITY_GET_RECOMMENDED_DID_CREDENTIALS,
+            IDENTITY_REQUEST_PLC_OPERATION_SIGNATURE,
+            IDENTITY_SIGN_PLC_OPERATION,
+            IDENTITY_SUBMIT_PLC_OPERATION,
             SYNC_LIST_REPOS,
             SYNC_LIST_REPOS_BY_COLLECTION,
             SYNC_GET_HOST_STATUS,
