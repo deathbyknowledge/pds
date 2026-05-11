@@ -11,6 +11,7 @@
     "smoke:delete-account": "node scripts/delete-account-smoke.mjs",
     "smoke:firehose": "node scripts/firehose-smoke.mjs",
     "smoke:firehose:cursor": "node scripts/firehose-cursor-smoke.mjs",
+    "smoke:firehose:oversize": "node scripts/firehose-oversize-smoke.mjs",
     "smoke:lexicon": "node scripts/lexicon-cross-repo-smoke.mjs",
     "smoke:migration": "node scripts/migration-smoke.mjs",
     "smoke:oauth:confidential": "node scripts/oauth-confidential-smoke.mjs",

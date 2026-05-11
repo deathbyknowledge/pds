@@ -60,8 +60,8 @@ use crate::repo::{
     RepoError, RepoMutation, RepoOperation, RepoOperationAction, RepoWrite, SignedRepository,
 };
 use crate::repo_import::{
-    diff_imported_records, extract_record_blob_refs as extract_import_record_blob_refs,
-    validate_imported_repo, ImportRepoOp, RepoImportError,
+    extract_record_blob_refs as extract_import_record_blob_refs, validate_imported_repo,
+    RepoImportError,
 };
 use crate::service_auth::verify_service_auth_jwt;
 use crate::storage::{RepoBlockStore, RepoRecordIndex, StorageError};
@@ -104,6 +104,9 @@ const BLOB_GC_BATCH_LIMIT: usize = 200;
 const MAX_IMPORT_REPO_BYTES: usize = 25 * 1024 * 1024;
 const MAX_APPLY_WRITES: usize = 200;
 const MAX_DYNAMIC_LEXICON_FETCHES: usize = 32;
+const FIREHOSE_COMMIT_BLOCKS_MAX_BYTES: usize = 2_000_000;
+const FIREHOSE_COMMIT_OPS_MAX: usize = 200;
+const FIREHOSE_SYNC_BLOCKS_MAX_BYTES: usize = 10_000;
 const DEFAULT_FIREHOSE_REPLAY_LIMIT: usize = 1024;
 const FIREHOSE_REPLAY_BATCH_LIMIT: usize = 500;
 const PASSWORD_SALT_BYTES: usize = 16;
@@ -4360,7 +4363,7 @@ impl RepoObject {
         let car = if let Some(since) =
             optional_param(&params, "since").filter(|value| !value.is_empty())
         {
-            self.repo_diff_car_since(&state, &since)?
+            self.repo_diff_car_since(&state, &since).await?
         } else {
             let cids = repo.export_cids().await.map_err(HttpError::repo)?;
             encode_car_from_store(&[state.latest_commit], cids, repo.storage())
@@ -4849,7 +4852,7 @@ impl RepoObject {
 
     async fn xrpc_import_repo(&self, req: &mut Request) -> Result<Response, HttpError> {
         let request_host = request_host(req)?;
-        let (previous_state, identity, mut existing_repo) = self.open_repo_with_identity()?;
+        let (previous_state, identity, existing_repo) = self.open_repo_with_identity()?;
         let account_status = self
             .require_repo_maintenance_auth(req, &previous_state.did)
             .await?;
@@ -4858,13 +4861,6 @@ impl RepoObject {
             .ok_or_else(|| HttpError::new(411, "importRepo requires a content-length header"))?;
         ensure_import_repo_size_limit(content_length)?;
 
-        let existing_records = existing_repo
-            .entries()
-            .await
-            .map_err(HttpError::repo)?
-            .into_iter()
-            .map(|entry| (entry.path, entry.cid))
-            .collect::<Vec<_>>();
         let previous_blob_cids = existing_repo
             .storage()
             .list_referenced_blob_cids()
@@ -4875,15 +4871,7 @@ impl RepoObject {
         let imported = validate_imported_repo(decoded, &previous_state.did)
             .await
             .map_err(HttpError::import)?;
-        let ops = diff_imported_records(existing_records, &imported.records);
-        let event = DirectoryCommitEventPayload {
-            event_type: DirectoryCommitEventType::Sync,
-            since: Some(previous_state.latest_rev.clone()),
-            prev_data: Some(existing_repo.mst_root()),
-            blocks: imported.current_car.clone(),
-            ops: directory_import_ops(&ops),
-            blobs: imported_blob_strings(&imported.records),
-        };
+        let event = directory_sync_event_payload_from_blocks(imported.root, &imported.blocks)?;
         let state = RepoStateRow {
             did: previous_state.did.clone(),
             latest_commit: imported.root,
@@ -5248,6 +5236,11 @@ impl RepoObject {
     ) -> Result<DirectoryCommitEventPayload, HttpError> {
         let blocks =
             encode_car_from_store(&[commit_cid], cids, repo.storage()).map_err(HttpError::car)?;
+        if event_type == DirectoryCommitEventType::Commit
+            && firehose_commit_frame_exceeds_limits(blocks.len(), ops.len())
+        {
+            return directory_sync_event_payload_from_store(commit_cid, repo.storage());
+        }
         Ok(DirectoryCommitEventPayload {
             event_type,
             since,
@@ -5480,7 +5473,11 @@ impl RepoObject {
         Ok(())
     }
 
-    fn repo_diff_car_since(&self, state: &RepoStateRow, since: &str) -> Result<Vec<u8>, HttpError> {
+    async fn repo_diff_car_since(
+        &self,
+        state: &RepoStateRow,
+        since: &str,
+    ) -> Result<Vec<u8>, HttpError> {
         let since = RepoRev::new(since.to_string()).map_err(HttpError::bad_request)?;
         if since == state.latest_rev {
             return encode_car(&[state.latest_commit], Vec::<CarBlock>::new())
@@ -5501,6 +5498,13 @@ impl RepoObject {
             .map_err(HttpError::worker)?;
         if events.is_empty() {
             return encode_car(&[state.latest_commit], Vec::<CarBlock>::new())
+                .map_err(HttpError::car);
+        }
+        if events.iter().any(|event| event.since.is_none()) {
+            let mut repo = SignedRepository::open(self.store(), state.latest_commit)
+                .map_err(HttpError::repo)?;
+            let cids = repo.export_cids().await.map_err(HttpError::repo)?;
+            return encode_car_from_store(&[state.latest_commit], cids, repo.storage())
                 .map_err(HttpError::car);
         }
 
@@ -6265,25 +6269,60 @@ fn directory_commit_ops(ops: &[RepoOperation]) -> Vec<DirectoryCommitOp> {
         .collect()
 }
 
-fn directory_import_ops(ops: &[ImportRepoOp]) -> Vec<DirectoryCommitOp> {
-    ops.iter()
-        .map(|op| DirectoryCommitOp {
-            action: op.action.as_str().to_string(),
-            path: op.path.to_string(),
-            cid: op.cid.map(|cid| cid.to_string()),
-            prev: op.prev.map(|cid| cid.to_string()),
-        })
-        .collect()
+fn firehose_commit_frame_exceeds_limits(blocks_len: usize, ops_len: usize) -> bool {
+    blocks_len > FIREHOSE_COMMIT_BLOCKS_MAX_BYTES || ops_len > FIREHOSE_COMMIT_OPS_MAX
 }
 
-fn imported_blob_strings(records: &[crate::repo_import::ImportedRecord]) -> Vec<String> {
-    records
+fn directory_sync_event_payload_from_store<S>(
+    commit_cid: crate::cid::Cid,
+    storage: &S,
+) -> Result<DirectoryCommitEventPayload, HttpError>
+where
+    S: RepoBlockStore,
+{
+    let blocks =
+        encode_car_from_store(&[commit_cid], [commit_cid], storage).map_err(HttpError::car)?;
+    directory_sync_event_payload_from_car(blocks)
+}
+
+fn directory_sync_event_payload_from_blocks(
+    commit_cid: crate::cid::Cid,
+    blocks: &[CarBlock],
+) -> Result<DirectoryCommitEventPayload, HttpError> {
+    let commit_block = blocks
         .iter()
-        .flat_map(|record| record.blob_cids.iter().copied())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|cid| cid.to_string())
-        .collect()
+        .find(|block| block.cid == commit_cid)
+        .ok_or_else(|| {
+            HttpError::new(
+                400,
+                format!("imported repo missing root block `{commit_cid}`"),
+            )
+        })?
+        .clone();
+    let blocks = encode_car(&[commit_cid], [commit_block]).map_err(HttpError::car)?;
+    directory_sync_event_payload_from_car(blocks)
+}
+
+fn directory_sync_event_payload_from_car(
+    blocks: Vec<u8>,
+) -> Result<DirectoryCommitEventPayload, HttpError> {
+    if blocks.len() > FIREHOSE_SYNC_BLOCKS_MAX_BYTES {
+        return Err(HttpError::new(
+            500,
+            format!(
+                "sync event blocks exceed {FIREHOSE_SYNC_BLOCKS_MAX_BYTES} bytes: {}",
+                blocks.len()
+            ),
+        ));
+    }
+    Ok(DirectoryCommitEventPayload {
+        event_type: DirectoryCommitEventType::Sync,
+        since: None,
+        prev_data: None,
+        blocks,
+        ops: Vec::new(),
+        blobs: Vec::new(),
+    })
 }
 
 fn validate_repo_paths(paths: Vec<String>) -> Result<Vec<RepoPath>, HttpError> {
@@ -9296,6 +9335,78 @@ mod tests {
         assert!(ensure_app_password_name("").is_err());
         assert!(ensure_app_password_name("   ").is_err());
         assert!(ensure_app_password_name(&"x".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn detects_firehose_commit_frame_limits() {
+        assert!(!firehose_commit_frame_exceeds_limits(
+            FIREHOSE_COMMIT_BLOCKS_MAX_BYTES,
+            FIREHOSE_COMMIT_OPS_MAX,
+        ));
+        assert!(firehose_commit_frame_exceeds_limits(
+            FIREHOSE_COMMIT_BLOCKS_MAX_BYTES + 1,
+            1,
+        ));
+        assert!(firehose_commit_frame_exceeds_limits(
+            1,
+            FIREHOSE_COMMIT_OPS_MAX + 1,
+        ));
+    }
+
+    #[test]
+    fn builds_sync_event_payload_with_only_commit_block() {
+        use crate::storage::{MemoryRepoStore, RepoBlockStore};
+
+        let mut store = MemoryRepoStore::new();
+        let commit_bytes = encode_dag_cbor(&json!({"commit": "root"})).unwrap();
+        let commit_cid = store.put_block(commit_bytes.clone()).unwrap();
+        let extra_bytes = encode_dag_cbor(&json!({"record": "not included"})).unwrap();
+        let extra_cid = store.put_block(extra_bytes.clone()).unwrap();
+
+        let payload = directory_sync_event_payload_from_store(commit_cid, &store).unwrap();
+        assert_eq!(payload.event_type, DirectoryCommitEventType::Sync);
+        assert_eq!(payload.since, None);
+        assert_eq!(payload.prev_data, None);
+        assert!(payload.ops.is_empty());
+        assert!(payload.blobs.is_empty());
+
+        let decoded = decode_car(&payload.blocks).unwrap();
+        assert_eq!(decoded.roots, vec![commit_cid]);
+        assert_eq!(decoded.blocks.len(), 1);
+        assert_eq!(decoded.blocks[0].cid, commit_cid);
+
+        let payload = directory_sync_event_payload_from_blocks(
+            commit_cid,
+            &[
+                CarBlock {
+                    cid: extra_cid,
+                    bytes: extra_bytes,
+                },
+                CarBlock {
+                    cid: commit_cid,
+                    bytes: commit_bytes,
+                },
+            ],
+        )
+        .unwrap();
+        let decoded = decode_car(&payload.blocks).unwrap();
+        assert_eq!(decoded.roots, vec![commit_cid]);
+        assert_eq!(decoded.blocks.len(), 1);
+        assert_eq!(decoded.blocks[0].cid, commit_cid);
+    }
+
+    #[test]
+    fn rejects_sync_event_payloads_over_sync_block_limit() {
+        use crate::storage::{MemoryRepoStore, RepoBlockStore};
+
+        let mut store = MemoryRepoStore::new();
+        let cid = store
+            .put_block(encode_dag_cbor(&"x".repeat(FIREHOSE_SYNC_BLOCKS_MAX_BYTES)).unwrap())
+            .unwrap();
+
+        let error = directory_sync_event_payload_from_store(cid, &store).unwrap_err();
+        assert_eq!(error.status, 500);
+        assert!(error.message.contains("sync event blocks exceed"));
     }
 
     #[test]
