@@ -50,6 +50,7 @@ if [[ -n "${PDS_BASE_URL:-}" ]]; then
   npm run smoke:delete-account
   npm run smoke:public
   npm run smoke:lexicon
+  npm run smoke:oauth:client
   if [[ -n "${PDS_PLC_ROTATION_KEY_P256_HEX:-}" ]]; then
     npm run smoke:plc-account
     npm run smoke:migration
@@ -79,7 +80,8 @@ Run remote smokes with:
   npm run smoke:account && \
   npm run smoke:delete-account && \
   npm run smoke:public && \
-  npm run smoke:lexicon
+  npm run smoke:lexicon && \
+  npm run smoke:oauth:client
 
 Optional did:plc account smoke:
   PDS_PLC_ROTATION_KEY_P256_HEX=<server-rotation-p256-hex> \

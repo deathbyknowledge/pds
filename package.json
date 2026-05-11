@@ -15,6 +15,7 @@
     "smoke:lexicon": "node scripts/lexicon-cross-repo-smoke.mjs",
     "smoke:migration": "node scripts/migration-smoke.mjs",
     "smoke:oauth:confidential": "node scripts/oauth-confidential-smoke.mjs",
+    "smoke:oauth:client": "node scripts/oauth-official-client-smoke.mjs",
     "smoke:client": "node scripts/official-client-smoke.mjs",
     "smoke:plc-account": "node scripts/plc-account-smoke.mjs",
     "smoke:public": "node scripts/public-smoke.mjs",
@@ -24,6 +25,7 @@
   },
   "devDependencies": {
     "@atproto/api": "^0.19.16",
+    "@atproto/oauth-client-node": "^0.3.17",
     "wrangler": "^4.83.0"
   }
 }
