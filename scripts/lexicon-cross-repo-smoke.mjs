@@ -3,7 +3,7 @@
 const config = {
   baseUrl: requiredEnv("PDS_BASE_URL").replace(/\/+$/, ""),
   adminToken: requiredEnv("PDS_ADMIN_TOKEN"),
-  authorityDomain: optionalEnv("PDS_LEXICON_AUTHORITY_DOMAIN", "gsv.app"),
+  authorityDomain: optionalEnv("PDS_LEXICON_AUTHORITY_DOMAIN", "gsv.space"),
   sourceDid: optionalEnv("PDS_LEXICON_SOURCE_DID"),
   sourceHandle: optionalEnv("PDS_LEXICON_SOURCE_HANDLE"),
   sourcePassword: optionalEnv(

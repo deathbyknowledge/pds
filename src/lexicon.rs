@@ -202,6 +202,19 @@ mod tests {
     }
 
     #[test]
+    fn validates_space_gsv_lexicons_and_sample_records() {
+        for (collection, lexicon, sample) in space_gsv_samples() {
+            validate_lexicon_schema(&lexicon).unwrap();
+            validate_lexicon_schema(&published_schema_record(&lexicon).unwrap()).unwrap();
+            assert_eq!(schema_id(&lexicon), Some(collection));
+            assert_eq!(
+                validate_record_with_lexicons(collection, &sample, true, &[lexicon]).unwrap(),
+                RecordValidationStatus::Valid
+            );
+        }
+    }
+
+    #[test]
     fn normalizes_and_publishes_schema_records() {
         let published = published_schema_record(&test_note_lexicon()).unwrap();
         assert_eq!(
@@ -264,5 +277,93 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn space_gsv_samples() -> Vec<(&'static str, Value, Value)> {
+        vec![
+            (
+                "space.gsv.profile",
+                serde_json::from_str(include_str!("../lexicons/space.gsv.profile.json")).unwrap(),
+                json!({
+                    "$type": "space.gsv.profile",
+                    "createdAt": "2026-05-12T12:00:00Z",
+                    "updatedAt": "2026-05-12T12:01:00Z",
+                    "displayName": "Hank",
+                    "description": "GSV builder",
+                    "avatar": {
+                        "$type": "blob",
+                        "ref": {"$link": "bafkreibm6jgkwx5ztbnodjrbazecinj63znepv3izjrb6ztscgzaemkhti"},
+                        "mimeType": "image/png",
+                        "size": 67
+                    },
+                    "avatarAlt": "profile image",
+                    "links": [{"label": "GSV", "uri": "https://gsv.space"}]
+                }),
+            ),
+            (
+                "space.gsv.instance",
+                serde_json::from_str(include_str!("../lexicons/space.gsv.instance.json")).unwrap(),
+                json!({
+                    "$type": "space.gsv.instance",
+                    "createdAt": "2026-05-12T12:00:00Z",
+                    "endpoint": "https://gsv.example/social",
+                    "protocolVersion": 1,
+                    "serviceKey": {
+                        "id": "did:web:gsv.example#service-key",
+                        "type": "Multikey",
+                        "publicKeyMultibase": "z6MkiGSVServiceKey"
+                    },
+                    "acceptedSocialMethods": [
+                        "social.profile.read",
+                        "social.agent.card.read",
+                        "social.message.send"
+                    ]
+                }),
+            ),
+            (
+                "space.gsv.agent.card",
+                serde_json::from_str(include_str!("../lexicons/space.gsv.agent.card.json"))
+                    .unwrap(),
+                json!({
+                    "$type": "space.gsv.agent.card",
+                    "createdAt": "2026-05-12T12:00:00Z",
+                    "displayName": "Hank's GSV",
+                    "summary": "Can answer messages and triage requests.",
+                    "topics": ["coding", "planning"],
+                    "acceptsMessages": true,
+                    "acceptsRequests": true,
+                    "humanEscalation": "sometimes"
+                }),
+            ),
+            (
+                "space.gsv.package.like",
+                serde_json::from_str(include_str!("../lexicons/space.gsv.package.like.json"))
+                    .unwrap(),
+                json!({
+                    "$type": "space.gsv.package.like",
+                    "createdAt": "2026-05-12T12:00:00Z",
+                    "subject": {
+                        "kind": "gsv-package",
+                        "name": "notes",
+                        "repo": "theagentscompany/gsv",
+                        "ref": "main",
+                        "subdir": "builtin-packages/notes",
+                        "uri": "https://github.com/theagentscompany/gsv/tree/main/builtin-packages/notes"
+                    },
+                    "note": "Useful package."
+                }),
+            ),
+            (
+                "space.gsv.status",
+                serde_json::from_str(include_str!("../lexicons/space.gsv.status.json")).unwrap(),
+                json!({
+                    "$type": "space.gsv.status",
+                    "createdAt": "2026-05-12T12:00:00Z",
+                    "text": "Working on social sync.",
+                    "expiresAt": "2026-05-13T12:00:00Z",
+                    "tags": ["social", "pds"]
+                }),
+            ),
+        ]
     }
 }

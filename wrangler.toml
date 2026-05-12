@@ -1,10 +1,10 @@
 name = "gsv-pds"
-main = "build/index.js"
+main = "src/entrypoint.ts"
 compatibility_date = "2026-04-22"
 workers_dev = true
 
 [vars]
-PDS_LEXICON_AUTHORITY_DIDS = "gsv.app=did:web:gsv-pds.stevej.workers.dev"
+PDS_LEXICON_AUTHORITY_DIDS = "gsv.space=did:web:gsv-pds.stevej.workers.dev,agent.gsv.space=did:web:gsv-pds.stevej.workers.dev,package.gsv.space=did:web:gsv-pds.stevej.workers.dev"
 PDS_ALLOWED_ACCOUNT_HANDLE_SUFFIXES = "gsv.dev"
 PDS_FIREHOSE_REPLAY_LIMIT = "64"
 

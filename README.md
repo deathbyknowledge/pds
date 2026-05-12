@@ -88,7 +88,7 @@ defaults:
 
 ```toml
 [vars]
-PDS_LEXICON_AUTHORITY_DIDS = "gsv.app=did:web:gsv-pds.stevej.workers.dev"
+PDS_LEXICON_AUTHORITY_DIDS = "gsv.space=did:web:gsv-pds.stevej.workers.dev,agent.gsv.space=did:web:gsv-pds.stevej.workers.dev,package.gsv.space=did:web:gsv-pds.stevej.workers.dev"
 PDS_ALLOWED_ACCOUNT_HANDLE_SUFFIXES = "gsv.dev"
 PDS_FIREHOSE_REPLAY_LIMIT = "64"
 ```
@@ -214,6 +214,7 @@ Common commands:
 | `npm run smoke:firehose` | Live firehose event smoke. |
 | `npm run smoke:firehose:cursor` | Firehose replay cursor smoke. |
 | `npm run smoke:firehose:oversize` | Oversized firehose commit smoke. |
+| `npm run smoke:space-gsv-lexicons` | Publish `space.gsv.*` Lexicons and prove strict validation. |
 | `npm run smoke:client` | Broader official `@atproto/api` client smoke. |
 | `npm run smoke:conformance` | XRPC response conformance smoke for implemented official methods. |
 
