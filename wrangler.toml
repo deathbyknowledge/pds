@@ -9,7 +9,7 @@ PDS_ALLOWED_ACCOUNT_HANDLE_SUFFIXES = "gsv.dev"
 PDS_FIREHOSE_REPLAY_LIMIT = "64"
 
 [build]
-command = "worker-build --release ."
+command = "cd ${PDS_WORKER_ROOT:-.} && worker-build --release ."
 
 [durable_objects]
 bindings = [
